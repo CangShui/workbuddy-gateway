@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	version       = "1.2.0"
+	version       = "1.3.0"
 	upstreamBase  = "https://copilot.tencent.com"
 	clientUA      = "CLI/2.143.1 CodeBuddy/2.143.1"
 	originReferer = "https://www.codebuddy.cn"
@@ -107,11 +107,29 @@ type Config struct {
 
 // Account 表示一个 CodeBuddy 账号凭据及其运行时状态。
 type Account struct {
-	Path          string      // 凭据文件路径
-	Auth          *StoredAuth // 凭据内容
-	CooldownUntil time.Time   // 冷却截止时间（429 频率限制后自动屏蔽到该时间）
-	CooldownMsg   string      // 触发冷却的原因/上游提示
-	lock          sync.Mutex  // 单账号串行锁（防止同账号并发触发 11128）
+	Path           string      // 凭据文件路径
+	Auth           *StoredAuth // 凭据内容（失效标记恢复时可能为 nil）
+	CooldownUntil  time.Time   // 冷却截止时间（429 频率限制后自动屏蔽到该时间）
+	CooldownMsg    string      // 触发冷却的原因/上游提示
+	Disabled       bool        // 授权失效（token 过期且无法刷新/已撤销）：禁止调度
+	DisabledReason string      // 失效原因，用于控制台展示
+	Nickname       string      // 失效标记持久化字段：昵称（Auth 为 nil 时使用）
+	UID            string      // 失效标记持久化字段：UID
+	lock           sync.Mutex  // 单账号串行锁（防止同账号并发触发 11128）
+}
+
+// disabledMarker 是授权失效账号的持久化标记（凭据文件删除后用于控制台提示重新登录）。
+type disabledMarker struct {
+	Path       string `json:"path"`
+	Reason     string `json:"reason"`
+	DisabledAt int64  `json:"disabledAt"`
+	Nickname   string `json:"nickname,omitempty"`
+	UID        string `json:"uid,omitempty"`
+}
+
+// markerPath 返回与凭据文件同目录的失效标记文件路径。
+func markerPath(authPath string) string {
+	return authPath + ".disabled"
 }
 
 var (
@@ -293,10 +311,15 @@ func saveAuth(sa *StoredAuth) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cfg.AuthFile, data, 0600)
+	if err := os.WriteFile(cfg.AuthFile, data, 0600); err != nil {
+		return err
+	}
+	clearDisabledMarker(cfg.AuthFile)
+	return nil
 }
 
 // saveAuthTo 将凭据写入指定路径（多账号模式使用）。
+// 写入成功后清除该路径的失效标记（表示账号已重新登录）。
 func saveAuthTo(path string, sa *StoredAuth) error {
 	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
@@ -306,7 +329,11 @@ func saveAuthTo(path string, sa *StoredAuth) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	clearDisabledMarker(path)
+	return nil
 }
 
 // loadAccountFile 从指定路径读取并解析凭据（不修改全局缓存）。
@@ -369,14 +396,17 @@ func loadAccounts() error {
 		accounts = append(accounts, &Account{Path: p, Auth: sa})
 	}
 
+	// 恢复持久化的失效账号标记（凭据文件已删除，仅供控制台提示重新登录）
+	loadDisabledMarkers()
+
 	if len(accounts) == 0 {
 		return fmt.Errorf("未找到有效凭据，请先执行 login 命令扫码登录")
 	}
 	return nil
 }
 
-// nextAccount 轮询选择下一个未处于冷却状态的账号。
-// 若全部账号冷却，返回错误并附带最早解封时间。
+// nextAccount 轮询选择下一个未处于冷却状态且未被禁用的账号。
+// 若全部账号不可用，返回错误并附带说明。
 func nextAccount() (*Account, error) {
 	accountMu.Lock()
 	defer accountMu.Unlock()
@@ -385,14 +415,27 @@ func nextAccount() (*Account, error) {
 		return nil, fmt.Errorf("账号池为空")
 	}
 	now := time.Now()
+	disabledCount := 0
+	cooldownCount := 0
 	for i := 0; i < len(accounts); i++ {
 		idx := (rrIndex + i) % len(accounts)
 		acc := accounts[idx]
+		if acc.Disabled {
+			disabledCount++
+			continue
+		}
 		if acc.CooldownUntil.After(now) {
+			cooldownCount++
 			continue
 		}
 		rrIndex = (idx + 1) % len(accounts)
 		return acc, nil
+	}
+	// 全部不可用：优先报告失效账号
+	for _, a := range accounts {
+		if a.Disabled {
+			return nil, fmt.Errorf("账号 %s 已失效（授权过期或已撤销，凭据文件已删除），请重新执行 login 登录", a.Path)
+		}
 	}
 	// 全部冷却：返回最早解封时间
 	earliest := accounts[0].CooldownUntil
@@ -412,6 +455,129 @@ func markCooldown(acc *Account, until time.Time, msg string) {
 	accountMu.Unlock()
 	log.Printf("[Cooldown] 账号 %s 触发频率限制，自动屏蔽至 %s (提示: %s)",
 		acc.Path, until.Format("2006-01-02 15:04:05"), msg)
+}
+
+// disableAccount 将账号标记为失效（授权过期/撤销），禁止调度并删除凭据文件，
+// 同时写入持久化失效标记，便于控制台提示用户重新登录。
+func disableAccount(acc *Account, reason string) {
+	accountMu.Lock()
+	acc.Disabled = true
+	acc.DisabledReason = reason
+	acc.CooldownUntil = time.Time{}
+	path := acc.Path
+	nickname := ""
+	uid := ""
+	if acc.Auth != nil {
+		nickname = acc.Auth.Account.Nickname
+		uid = acc.Auth.Account.UID
+		acc.Nickname = nickname
+		acc.UID = uid
+	}
+	accountMu.Unlock()
+
+	// 写持久化失效标记（凭据删除后仍能在 status 中提示重新登录）
+	marker := disabledMarker{
+		Path:       path,
+		Reason:     reason,
+		DisabledAt: time.Now().Unix(),
+		Nickname:   nickname,
+		UID:        uid,
+	}
+	if data, err := json.MarshalIndent(marker, "", "  "); err == nil {
+		if werr := os.WriteFile(markerPath(path), data, 0600); werr != nil {
+			log.Printf("[Auth] 账号 %s 失效标记写入失败: %v", path, werr)
+		}
+	}
+
+	// 删除失效的凭据文件，方便用户下次重新登录
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Printf("[Auth] 账号 %s 凭据文件删除失败: %v", path, err)
+	}
+	log.Printf("[Auth] ⚠️ 账号 %s 授权失效，已禁止调度并删除凭据文件: %s", path, reason)
+}
+
+// loadDisabledMarkers 扫描失效标记文件，将其恢复为账号池中的失效账号（Auth 为 nil）。
+func loadDisabledMarkers() {
+	// 收集标记文件路径：
+	// - AuthDir 模式：目录下 *.json.disabled 即为标记文件
+	// - 单文件模式：<凭据路径>.disabled 为标记文件
+	var markerPaths []string
+	if cfg.AuthDir != "" {
+		entries, err := os.ReadDir(cfg.AuthDir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if strings.HasSuffix(name, ".json.disabled") {
+				markerPaths = append(markerPaths, filepath.Join(cfg.AuthDir, name))
+			}
+		}
+	} else {
+		for _, p := range strings.Split(cfg.AuthFile, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				markerPaths = append(markerPaths, markerPath(p))
+			}
+		}
+	}
+
+	for _, mp := range markerPaths {
+		data, err := os.ReadFile(mp)
+		if err != nil {
+			continue
+		}
+		var m disabledMarker
+		if err := json.Unmarshal(data, &m); err != nil {
+			continue
+		}
+		// 避免与已加载的有效账号重复
+		dup := false
+		for _, a := range accounts {
+			if a.Path == m.Path {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+		accounts = append(accounts, &Account{
+			Path:           m.Path,
+			Disabled:       true,
+			DisabledReason: m.Reason,
+			Nickname:       m.Nickname,
+			UID:            m.UID,
+		})
+	}
+}
+
+// clearDisabledMarker 在重新登录成功后清除失效标记。
+func clearDisabledMarker(path string) {
+	mp := markerPath(path)
+	if err := os.Remove(mp); err != nil && !os.IsNotExist(err) {
+		log.Printf("[Auth] 失效标记清除失败 (%s): %v", mp, err)
+	}
+}
+
+// isAuthFailure 判断上游响应是否为授权失效（401/403 / invalid token / 登录过期等）。
+func isAuthFailure(statusCode int, body string) bool {
+	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+		return true
+	}
+	low := strings.ToLower(body)
+	if strings.Contains(low, "invalid token") ||
+		strings.Contains(low, "unauthorized") ||
+		strings.Contains(low, "登录已过期") ||
+		strings.Contains(low, "登录失效") ||
+		strings.Contains(low, "token 已失效") ||
+		strings.Contains(low, "authentication required") {
+		return true
+	}
+	return false
 }
 
 var resetTimeRe = regexp.MustCompile(`将在\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s*(UTC[+-]\d+(?::\d{2})?)?`)
@@ -455,9 +621,10 @@ func isRateLimited(statusCode int, body string) bool {
 }
 
 // ensureValidTokenFor 对指定账号检查并刷新令牌（多账号版）。
+// 失效账号（Disabled 或 Auth 为 nil）直接跳过，不参与调度。
 func ensureValidTokenFor(acc *Account) error {
-	if acc == nil || acc.Auth == nil {
-		return fmt.Errorf("账号为空")
+	if acc == nil || acc.Disabled || acc.Auth == nil {
+		return nil
 	}
 	if time.Now().Unix() > acc.Auth.Auth.ExpiresAt-900 {
 		log.Printf("[Auth] 账号 %s 访问令牌即将/已经过期，正在自动刷新...", acc.Path)
@@ -483,7 +650,7 @@ func doRefreshToken(sa *StoredAuth) error {
 	if sa == nil || sa.Auth.RefreshToken == "" {
 		return fmt.Errorf("无法刷新：缺少 RefreshToken")
 	}
-	if err := refreshTokenPayload(sa); err != nil {
+	if _, err := refreshTokenPayload(sa); err != nil {
 		return err
 	}
 	if err := saveAuth(sa); err != nil {
@@ -494,11 +661,16 @@ func doRefreshToken(sa *StoredAuth) error {
 }
 
 // doRefreshTokenFor 刷新指定账号的令牌并保存回其凭据文件（多账号版）。
+// 若刷新因授权失效失败（401/403/refresh token 无效），自动禁用该账号并删除凭据文件。
 func doRefreshTokenFor(acc *Account) error {
-	if acc == nil || acc.Auth == nil || acc.Auth.Auth.RefreshToken == "" {
-		return fmt.Errorf("无法刷新：账号缺少 RefreshToken")
+	if acc == nil || acc.Disabled || acc.Auth == nil || acc.Auth.Auth.RefreshToken == "" {
+		return fmt.Errorf("无法刷新：账号缺少 RefreshToken 或已失效")
 	}
-	if err := refreshTokenPayload(acc.Auth); err != nil {
+	status, err := refreshTokenPayload(acc.Auth)
+	if err != nil {
+		if isAuthFailure(status, err.Error()) {
+			disableAccount(acc, fmt.Sprintf("令牌刷新失败 (HTTP %d): %v", status, err))
+		}
 		return err
 	}
 	if err := saveAuthTo(acc.Path, acc.Auth); err != nil {
@@ -509,7 +681,8 @@ func doRefreshTokenFor(acc *Account) error {
 }
 
 // refreshTokenPayload 调用上游刷新接口并更新内存中的令牌字段（不落盘）。
-func refreshTokenPayload(sa *StoredAuth) error {
+// 返回上游 HTTP 状态码（成功或失败时均为实际状态；网络错误为 0）。
+func refreshTokenPayload(sa *StoredAuth) (int, error) {
 	headers := func(r *http.Request) {
 		commonHeaders(r)
 		r.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
@@ -521,11 +694,11 @@ func refreshTokenPayload(sa *StoredAuth) error {
 
 	data, status, err := doJSON(cfg.HttpClient, http.MethodPost, endpointTokenRefresh, headers, nil)
 	if err != nil {
-		return fmt.Errorf("上游刷新拒绝 (HTTP %d): %w", status, err)
+		return status, fmt.Errorf("上游刷新拒绝 (HTTP %d): %w", status, err)
 	}
 	var tok tokenData
 	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
-		return fmt.Errorf("解析新 Token 失败: %w", err)
+		return status, fmt.Errorf("解析新 Token 失败: %w", err)
 	}
 
 	sa.Auth.AccessToken = tok.AccessToken
@@ -538,7 +711,7 @@ func refreshTokenPayload(sa *StoredAuth) error {
 	if tok.ExpiresIn > 0 {
 		sa.Auth.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
-	return nil
+	return status, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -558,9 +731,29 @@ func runStatus() {
 	fmt.Printf("账号总数: %d\n", len(accounts))
 	now := time.Now()
 	for i, acc := range accounts {
+		fmt.Printf("\n--- 账号 #%d ---\n", i+1)
+		fmt.Printf("凭据文件:     %s\n", acc.Path)
+
+		if acc.Disabled {
+			// 失效账号（Auth 可能为 nil：凭据文件已删除，信息来自失效标记）
+			nickname := acc.Nickname
+			uid := acc.UID
+			if acc.Auth != nil {
+				nickname = acc.Auth.Account.Nickname
+				uid = acc.Auth.Account.UID
+			}
+			fmt.Printf("用户昵称:     %s\n", ifEmpty(nickname, "(未知)"))
+			fmt.Printf("用户 UID:     %s\n", ifEmpty(uid, "(未知)"))
+			fmt.Printf("账号状态:     ❌ 授权失效（禁止调度）\n")
+			fmt.Printf("失效原因:     %s\n", truncate(acc.DisabledReason, 200))
+			fmt.Printf("处理建议:     ⚠️ 凭据文件已删除，请重新执行: workbuddy-gateway login -auth %s\n", acc.Path)
+			continue
+		}
+
 		if acc.Auth == nil {
 			continue
 		}
+
 		expTime := time.Unix(acc.Auth.Auth.ExpiresAt, 0)
 		remaining := time.Until(expTime)
 		statusStr := "有效"
@@ -568,8 +761,6 @@ func runStatus() {
 			statusStr = "已过期"
 		}
 
-		fmt.Printf("\n--- 账号 #%d ---\n", i+1)
-		fmt.Printf("凭据文件:     %s\n", acc.Path)
 		fmt.Printf("用户昵称:     %s\n", acc.Auth.Account.Nickname)
 		fmt.Printf("用户 UID:     %s\n", acc.Auth.Account.UID)
 		fmt.Printf("企业 ID:      %s\n", ifEmpty(acc.Auth.Account.EnterpriseID, "(个人账号)"))
@@ -601,8 +792,14 @@ func runRefresh() {
 	}
 	ok := 0
 	fail := 0
+	skipped := 0
 	for i, acc := range accounts {
 		fmt.Printf("正在刷新账号 #%d (%s)... ", i+1, acc.Path)
+		if acc.Disabled || acc.Auth == nil {
+			fmt.Printf("⏭️ 跳过（授权失效，请重新登录）\n")
+			skipped++
+			continue
+		}
 		if err := doRefreshTokenFor(acc); err != nil {
 			fmt.Printf("❌ %v\n", err)
 			fail++
@@ -611,7 +808,7 @@ func runRefresh() {
 			ok++
 		}
 	}
-	fmt.Printf("\n刷新完成: 成功 %d 个，失败 %d 个\n", ok, fail)
+	fmt.Printf("\n刷新完成: 成功 %d 个，失败 %d 个，跳过 %d 个（授权失效）\n", ok, fail, skipped)
 }
 
 func runLogin() {
@@ -716,13 +913,24 @@ func runServe() {
 	} else {
 		accountMu.Lock()
 		accCount := len(accounts)
+		activeCount := 0
+		disabledCount := 0
 		for _, acc := range accounts {
+			if acc.Disabled || acc.Auth == nil {
+				disabledCount++
+				continue
+			}
+			activeCount++
 			_ = ensureValidTokenFor(acc)
 		}
 		accountMu.Unlock()
-		fmt.Printf("已就绪账号池: %d 个账号\n", accCount)
+		fmt.Printf("已就绪账号池: %d 个账号 (有效 %d, 失效 %d)\n", accCount, activeCount, disabledCount)
 		for i, acc := range accounts {
-			fmt.Printf("  #%d %s (UID: %s, 有效期至: %s)\n",
+			if acc.Disabled || acc.Auth == nil {
+				fmt.Printf("  #%d ❌ %s (授权失效，凭据文件已删除，请重新登录)\n", i+1, acc.Path)
+				continue
+			}
+			fmt.Printf("  #%d ✅ %s (UID: %s, 有效期至: %s)\n",
 				i+1, acc.Auth.Account.Nickname, acc.Auth.Account.UID,
 				time.Unix(acc.Auth.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
 		}
@@ -898,19 +1106,31 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var lastRateErr string
+	var lastAuthErr string
 	for attempt := 0; attempt < poolSize; attempt++ {
 		acc, err := nextAccount()
 		if err != nil {
-			// 所有账号均处于冷却状态
-			msg := fmt.Sprintf("所有账号均处于冷却状态: %v", err)
+			// 所有账号均不可用（冷却或失效）
+			msg := fmt.Sprintf("无可用账号: %v", err)
+			if lastAuthErr != "" {
+				msg += " | 最近一次授权失效: " + truncate(lastAuthErr, 200)
+			}
 			if lastRateErr != "" {
-				msg += " | 最近一次限制: " + truncate(lastRateErr, 200)
+				msg += " | 最近一次频率限制: " + truncate(lastRateErr, 200)
 			}
 			log.Printf("[#%d] %s", reqID, msg)
-			writeOpenAIError(w, http.StatusTooManyRequests, "all_accounts_cooldown", msg)
+			writeOpenAIError(w, http.StatusServiceUnavailable, "no_available_account", msg)
 			return
 		}
 		_ = ensureValidTokenFor(acc)
+		// 令牌刷新时若发现授权失效会禁用账号；若被禁用则跳过换下一个
+		accountMu.Lock()
+		disabled := acc.Disabled
+		accountMu.Unlock()
+		if disabled {
+			lastAuthErr = acc.DisabledReason
+			continue
+		}
 
 		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, endpointChat, bytes.NewReader(upstreamBytes))
 		if err != nil {
@@ -945,6 +1165,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				markCooldown(acc, until, errStr)
 				lastRateErr = errStr
+				continue // 尝试下一个账号
+			}
+
+			if isAuthFailure(resp.StatusCode, errStr) {
+				// 授权失效（401/403 / token 无效 / 登录过期）：禁用该账号并删除凭据文件，
+				// 自动改用下一个可用账号，控制台提示用户重新登录
+				disableAccount(acc, fmt.Sprintf("上游鉴权失败 (HTTP %d): %s", resp.StatusCode, truncate(errStr, 200)))
+				lastAuthErr = errStr
 				continue // 尝试下一个账号
 			}
 

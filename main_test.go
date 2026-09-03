@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
 	"testing"
 	"time"
 )
@@ -115,4 +117,160 @@ func TestNextAccountCooldownExpiry(t *testing.T) {
 		t.Fatalf("expected a.json (cooldown expired), got %s", a.Path)
 	}
 	t.Logf("expired cooldown recovers, selected %s", a.Path)
+}
+
+// 验证授权失效识别（401/403 / invalid token / 登录过期等）
+func TestIsAuthFailure(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{401, "{}", true},
+		{403, "{}", true},
+		{400, `{"msg":"invalid token"}`, true},
+		{400, "unauthorized", true},
+		{400, "登录已过期", true},
+		{400, "登录失效，请重新登录", true},
+		{400, "some other error", false},
+		{429, "频率限制", false},
+		{500, "{}", false},
+	}
+	for _, c := range cases {
+		if got := isAuthFailure(c.status, c.body); got != c.want {
+			t.Errorf("isAuthFailure(%d, %q) = %v, want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// 验证轮询跳过已失效（Disabled）账号
+func TestNextAccountSkipsDisabled(t *testing.T) {
+	accountMu.Lock()
+	accounts = []*Account{
+		{Path: "a.json", Auth: &StoredAuth{}, Disabled: true, DisabledReason: "revoked"},
+		{Path: "b.json", Auth: &StoredAuth{}},
+	}
+	rrIndex = 0
+	accountMu.Unlock()
+
+	a, _ := nextAccount()
+	if a.Path != "b.json" {
+		t.Fatalf("expected b.json (only non-disabled), got %s", a.Path)
+	}
+	t.Logf("disabled skip works, selected %s", a.Path)
+}
+
+// 验证全部失效时返回错误并提示重新登录
+func TestNextAccountAllDisabled(t *testing.T) {
+	accountMu.Lock()
+	accounts = []*Account{
+		{Path: "a.json", Auth: &StoredAuth{}, Disabled: true, DisabledReason: "expired"},
+		{Path: "b.json", Auth: &StoredAuth{}, Disabled: true, DisabledReason: "revoked"},
+	}
+	rrIndex = 0
+	accountMu.Unlock()
+
+	_, err := nextAccount()
+	if err == nil {
+		t.Fatal("expected error when all accounts disabled")
+	}
+	t.Logf("all-disabled error: %v", err)
+}
+
+// 验证 disableAccount：标记失效、删除凭据文件、写入失效标记文件
+func TestDisableAccount(t *testing.T) {
+	dir := t.TempDir()
+	authPath := dir + "/workbuddy-test.json"
+	// 写一个假的凭据文件
+	if err := os.WriteFile(authPath, []byte(`{"auth":{"accessToken":"x"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	acc := &Account{Path: authPath, Auth: &StoredAuth{
+		Auth: StoredTokens{AccessToken: "x"},
+		Account: StoredAccount{Nickname: "tester", UID: "uid-1"},
+	}}
+
+	disableAccount(acc, "令牌刷新失败 (HTTP 401): invalid token")
+
+	accountMu.Lock()
+	disabled := acc.Disabled
+	reason := acc.DisabledReason
+	accountMu.Unlock()
+	if !disabled {
+		t.Fatal("account should be marked disabled")
+	}
+	if reason == "" {
+		t.Fatal("disabled reason should be recorded")
+	}
+	// 凭据文件应被删除
+	if _, err := os.Stat(authPath); !os.IsNotExist(err) {
+		t.Fatalf("credential file should be deleted, stat err=%v", err)
+	}
+	// 失效标记文件应存在
+	if _, err := os.Stat(markerPath(authPath)); err != nil {
+		t.Fatalf("marker file should exist: %v", err)
+	}
+	t.Logf("disableAccount works: disabled=%v reason=%q", disabled, reason)
+}
+
+// 验证失效标记文件可被恢复为失效账号（Auth 为 nil），并提示重新登录
+func TestLoadDisabledMarkers(t *testing.T) {
+	dir := t.TempDir()
+	authPath := dir + "/workbuddy-test.json"
+
+	// 构造失效标记文件
+	marker := disabledMarker{
+		Path:       authPath,
+		Reason:     "授权失效（令牌刷新失败 HTTP 401）",
+		DisabledAt: time.Now().Unix(),
+		Nickname:   "tester",
+		UID:        "uid-1",
+	}
+	data, _ := json.Marshal(marker)
+	if err := os.WriteFile(markerPath(authPath), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟 -auth 指定该路径
+	oldAuthFile := cfg.AuthFile
+	oldAuthDir := cfg.AuthDir
+	defer func() {
+		cfg.AuthFile = oldAuthFile
+		cfg.AuthDir = oldAuthDir
+	}()
+	cfg.AuthFile = authPath
+	cfg.AuthDir = ""
+
+	accounts = nil
+	loadDisabledMarkers()
+
+	if len(accounts) != 1 {
+		t.Fatalf("expected 1 disabled account, got %d", len(accounts))
+	}
+	acc := accounts[0]
+	if !acc.Disabled || acc.Auth != nil {
+		t.Fatalf("expected disabled account with nil Auth, got disabled=%v authNil=%v", acc.Disabled, acc.Auth == nil)
+	}
+	if acc.Nickname != "tester" || acc.UID != "uid-1" {
+		t.Fatalf("marker nickname/uid not restored: %+v", acc)
+	}
+	t.Logf("loadDisabledMarkers restores: %s (nickname=%s)", acc.Path, acc.Nickname)
+}
+
+// 验证登录成功后清除失效标记
+func TestClearDisabledMarker(t *testing.T) {
+	dir := t.TempDir()
+	authPath := dir + "/workbuddy-test.json"
+	marker := disabledMarker{Path: authPath, Reason: "revoked"}
+	data, _ := json.Marshal(marker)
+	if err := os.WriteFile(markerPath(authPath), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	clearDisabledMarker(authPath)
+	if _, err := os.Stat(markerPath(authPath)); !os.IsNotExist(err) {
+		t.Fatalf("marker file should be removed, stat err=%v", err)
+	}
+	t.Log("clearDisabledMarker works")
 }

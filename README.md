@@ -9,6 +9,7 @@
 - **纯 CLI 控制**：终端内嵌 ASCII 二维码，微信 / 企业微信扫码登录；`status` / `refresh` / `serve` 子命令完成全部管理。
 - **多账号池 + 轮询负载均衡**：支持同时挂载多个 CodeBuddy 账号（`-auth` 逗号分隔或 `-auth-dir` 目录），请求按轮询（round-robin）均匀分配到各账号，保持多账号额度使用一致。
 - **429 频率限制自动冷却**：任一账号触发上游频率限制（HTTP 429 / code 6004）时，自动解析消息中的重置时间（如 `将在 2026-09-04 07:48:15 UTC+8 重置`），将该账号屏蔽至重置时间；冷却期间自动改用其他账号代偿，冷却到期自动恢复。
+- **授权失效自动禁用**：账号授权过期、被撤销或令牌刷新失败（HTTP 401/403 / invalid token / 登录已过期）时，自动将该账号**禁止调度并删除凭据文件**，同时写入持久化失效标记；`status` / 启动日志会明确提示该账号失效原因与重新登录命令，重新 `login` 后自动恢复调度。
 - **后台自动续期**：运行期间每 5 分钟检查所有账号 Token，距过期不足 15 分钟自动刷新并持久化回各自凭据文件。
 - **OpenAI 兼容协议**：`POST /v1/chat/completions`（SSE 流式 + 非流式聚合）、`GET /v1/models`、`GET /health`。
 - **深度思考透传规则**：仅当客户端显式请求 `reasoning_effort` 时转发；绝不强制注入，避免触发上游内容安全策略。
@@ -89,6 +90,38 @@ workbuddy-gateway status
 
 # 手动刷新所有账号令牌
 workbuddy-gateway refresh
+```
+
+### 授权失效自动禁用
+
+当账号出现以下任一情况时，网关会**自动禁用该账号调度并删除其凭据文件**：
+
+- 令牌刷新失败且返回授权类错误（HTTP 401/403、`invalid token`、`unauthorized`、`登录已过期` 等）；
+- 上游请求返回 401/403（token 被撤销或已过期）；
+- 凭据缺少 RefreshToken 且已无法刷新。
+
+处理流程：
+
+1. 将该账号标记为 **❌ 授权失效**，立即移出轮询调度；
+2. **删除对应的凭据文件**（如 `workbuddy.json`），并写入持久化失效标记（`workbuddy.json.disabled`）；
+3. 控制台（`status` / 启动日志 / 运行日志）明确显示失效原因，并给出重新登录命令；
+4. 失效期间其余账号正常代偿；**重新执行 login 后自动清除失效标记并恢复调度**。
+
+```bash
+# 查看失效账号与原因
+workbuddy-gateway status
+# 输出示例：
+# --- 账号 #1 ---
+# 凭据文件:     workbuddy-2.json
+# 用户昵称:     tester
+# 用户 UID:     uid-xxx
+# 账号状态:     ❌ 授权失效（禁止调度）
+# 失效原因:     令牌刷新失败 (HTTP 401): invalid token
+# 处理建议:     ⚠️ 凭据文件已删除，请重新执行: workbuddy-gateway login -auth workbuddy-2.json
+
+# 失效账号重新登录后自动恢复
+workbuddy-gateway login -auth workbuddy-2.json
+workbuddy-gateway status   # 该账号恢复为 ✅ 可用
 ```
 
 ### 与单账号模式的兼容性

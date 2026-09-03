@@ -5,6 +5,8 @@ dist/workbuddy.json
 dist/*.json
 last-*.json
 *.json.bak
+*.json.disabled
+.workbuddy-*.json
 
 # 本地编译产物
 workbuddy-gateway.exe
