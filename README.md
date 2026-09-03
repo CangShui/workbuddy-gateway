@@ -7,11 +7,13 @@
 
 - **模型完全透传**：客户端（OpenAI SDK、Cursor、Claude Code、DSH 等）传什么 `model`（如 `hy4-preview`、`hy3-preview-agent`、`hy3`、`deepseek-v4-pro`、`glm-5.2`…），网关原样透传至腾讯上游，无白名单限制。
 - **纯 CLI 控制**：终端内嵌 ASCII 二维码，微信 / 企业微信扫码登录；`status` / `refresh` / `serve` 子命令完成全部管理。
-- **后台自动续期**：运行期间每 5 分钟检查 Token，距过期不足 15 分钟自动刷新并持久化到 `workbuddy.json`。
+- **多账号池 + 轮询负载均衡**：支持同时挂载多个 CodeBuddy 账号（`-auth` 逗号分隔或 `-auth-dir` 目录），请求按轮询（round-robin）均匀分配到各账号，保持多账号额度使用一致。
+- **429 频率限制自动冷却**：任一账号触发上游频率限制（HTTP 429 / code 6004）时，自动解析消息中的重置时间（如 `将在 2026-09-04 07:48:15 UTC+8 重置`），将该账号屏蔽至重置时间；冷却期间自动改用其他账号代偿，冷却到期自动恢复。
+- **后台自动续期**：运行期间每 5 分钟检查所有账号 Token，距过期不足 15 分钟自动刷新并持久化回各自凭据文件。
 - **OpenAI 兼容协议**：`POST /v1/chat/completions`（SSE 流式 + 非流式聚合）、`GET /v1/models`、`GET /health`。
 - **深度思考透传规则**：仅当客户端显式请求 `reasoning_effort` 时转发；绝不强制注入，避免触发上游内容安全策略。
 - **反审查净化**：自动改写 Claude Code 等框架被上游逐字拉黑的固定 Prompt 语句。
-- **单并发串行化**：同一账号请求自动排队，避免并发双发触发上游风控。
+- **单账号串行化**：同一账号请求自动排队，避免并发双发触发上游风控；不同账号之间可并行。
 
 ## 快速上手
 
@@ -53,6 +55,47 @@ workbuddy-gateway serve -proxy http://127.0.0.1:7890
 # 开启客户端鉴权
 workbuddy-gateway serve -api-key sk-localsecret
 ```
+
+## 多账号池与 429 自动冷却
+
+### 配置多个账号
+
+网关支持同时挂载多个 CodeBuddy 账号，请求按**轮询（round-robin）**方式均匀分发，保持各账号额度消耗一致。两种配置方式：
+
+```bash
+# 方式一：-auth 逗号分隔多个凭据文件
+workbuddy-gateway serve -auth workbuddy.json,workbuddy-2.json,workbuddy-3.json
+
+# 方式二：-auth-dir 指定凭据目录（自动加载目录下所有 workbuddy*.json）
+mkdir -p auths
+workbuddy-gateway login -auth auths/workbuddy-1.json   # 依次为每个账号扫码登录
+workbuddy-gateway login -auth auths/workbuddy-2.json
+workbuddy-gateway serve -auth-dir ./auths
+```
+
+### 429 频率限制自动冷却
+
+当某个账号触发上游频率限制（HTTP 429，消息形如 `您的使用量已超出频率限制，将在 2026-09-04 07:48:15 UTC+8 重置`）时，网关会：
+
+1. **自动解析消息中的重置时间**，立即将该账号屏蔽（冷却）至该时间点；
+2. **自动改用下一个可用账号重试**当前请求（代偿），无需客户端干预；
+3. 冷却期间该账号不参与轮询，**冷却到期后自动恢复**；
+4. 若消息中无法解析重置时间，默认冷却 60 秒后重试；
+5. 当所有账号均处于冷却状态时，返回 HTTP 429 并附上最早解封时间。
+
+```bash
+# 查看各账号状态（含冷却状态与解封时间）
+workbuddy-gateway status
+
+# 手动刷新所有账号令牌
+workbuddy-gateway refresh
+```
+
+### 与单账号模式的兼容性
+
+- 不传 `-auth` 时默认使用 `./workbuddy.json`，行为与旧版完全一致；
+- 只有一个账号时，请求始终使用该账号，429 冷却逻辑同样生效（冷却期间请求将返回 429 提示）；
+- 账号之间使用独立的串行锁：同一账号请求严格排队，不同账号可并行，兼顾风控与吞吐。
 
 ## 客户端接入
 

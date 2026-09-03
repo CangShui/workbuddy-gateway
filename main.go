@@ -16,6 +16,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,7 +29,7 @@ import (
 )
 
 const (
-	version       = "1.1.0"
+	version       = "1.2.0"
 	upstreamBase  = "https://copilot.tencent.com"
 	clientUA      = "CLI/2.143.1 CodeBuddy/2.143.1"
 	originReferer = "https://www.codebuddy.cn"
@@ -96,18 +98,31 @@ type Config struct {
 	Addr       string
 	Port       int
 	AuthFile   string
+	AuthDir    string
 	APIKey     string
 	ProxyURL   string
 	Verbose    bool
 	HttpClient *http.Client
 }
 
+// Account 表示一个 CodeBuddy 账号凭据及其运行时状态。
+type Account struct {
+	Path          string      // 凭据文件路径
+	Auth          *StoredAuth // 凭据内容
+	CooldownUntil time.Time   // 冷却截止时间（429 频率限制后自动屏蔽到该时间）
+	CooldownMsg   string      // 触发冷却的原因/上游提示
+	lock          sync.Mutex  // 单账号串行锁（防止同账号并发触发 11128）
+}
+
 var (
-	cfg           Config
-	authLock      sync.RWMutex
-	currAuth      *StoredAuth
-	reqCounter    uint64
-	upstreamMutex sync.Mutex // 限制同一账号到腾讯上游的单并发排队，杜绝触发 11128 风控
+	cfg        Config
+	authLock   sync.RWMutex
+	currAuth   *StoredAuth
+	reqCounter uint64
+
+	accountMu sync.Mutex // 账号池保护锁
+	accounts  []*Account // 多账号池（单账号时长度为 1，行为与旧版完全一致）
+	rrIndex   int        // 轮询游标
 )
 
 // -----------------------------------------------------------------------------
@@ -137,7 +152,8 @@ func main() {
 	fs := flag.NewFlagSet(command, flag.ExitOnError)
 	fs.StringVar(&cfg.Addr, "addr", "127.0.0.1", "网关监听地址")
 	fs.IntVar(&cfg.Port, "port", 8317, "网关监听端口")
-	fs.StringVar(&cfg.AuthFile, "auth", "workbuddy.json", "凭据存储文件路径")
+	fs.StringVar(&cfg.AuthFile, "auth", "workbuddy.json", "凭据存储文件路径（支持逗号分隔多个文件实现多账号）")
+	fs.StringVar(&cfg.AuthDir, "auth-dir", "", "凭据目录：自动加载目录下所有 workbuddy*.json 作为多账号池")
 	fs.StringVar(&cfg.APIKey, "api-key", "", "可选：访问网关所需的 API Key (客户端 Bearer 校验)")
 	fs.StringVar(&cfg.ProxyURL, "proxy", "", "可选：上游请求代理 (如 http://127.0.0.1:7890)")
 	fs.BoolVar(&cfg.Verbose, "verbose", false, "输出详细调试日志")
@@ -167,6 +183,8 @@ func main() {
 func printHelp() {
 	fmt.Println(`WorkBuddy Local Gateway - 轻量化跨平台本地 AI 网关
 将腾讯 CodeBuddy / 混元反代为标准 OpenAI 协议，支持直接透传任意模型到上游。
+支持多账号池：轮询使用多个账号均衡额度；账号触发 429 频率限制后自动冷却屏蔽，
+由其余账号代偿，冷却到期自动恢复。
 
 用法:
   workbuddy-gateway [command] [options]
@@ -174,18 +192,30 @@ func printHelp() {
 命令:
   serve       启动本地网关 (默认操作)
   login       微信/企业微信扫码登录，获取/更新凭据
-  status      查看当前账号凭据状态与过期时间
-  refresh     手动立即刷新访问令牌 (Access Token)
+  status      查看账号池状态（含冷却状态与过期时间）
+  refresh     手动立即刷新所有账号访问令牌 (Access Token)
   version     查看版本信息
   help        查看帮助说明
 
 参数选项:
   -addr <ip>        网关监听地址 (默认: 127.0.0.1)
   -port <port>      网关监听端口 (默认: 8317)
-  -auth <path>      凭据存储文件路径 (默认: ./workbuddy.json)
+  -auth <path>      凭据文件路径；支持逗号分隔多个文件实现多账号
+                    (默认: ./workbuddy.json)
+  -auth-dir <dir>   凭据目录：自动加载目录下所有 workbuddy*.json 作为账号池
   -api-key <key>    设置后，调用网关必须携带 Bearer <key> 鉴权
   -proxy <url>      设置上游转发代理 (例如 http://127.0.0.1:7890 或 socks5://...)
   -verbose          输出详细调试日志 (请求/响应体)
+
+多账号说明:
+  # 登录第二个账号（保存到不同文件）
+  workbuddy-gateway login -auth workbuddy-2.json
+
+  # 启动时指定多个凭据文件（轮询 + 429 自动冷却代偿）
+  workbuddy-gateway serve -auth workbuddy.json,workbuddy-2.json
+
+  # 或使用目录模式：目录内所有 workbuddy*.json 自动组成账号池
+  workbuddy-gateway serve -auth-dir ./auths
 
 示例:
   # 首次使用扫码登录
@@ -266,6 +296,176 @@ func saveAuth(sa *StoredAuth) error {
 	return os.WriteFile(cfg.AuthFile, data, 0600)
 }
 
+// saveAuthTo 将凭据写入指定路径（多账号模式使用）。
+func saveAuthTo(path string, sa *StoredAuth) error {
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0755)
+	}
+	data, err := json.MarshalIndent(sa, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+// loadAccountFile 从指定路径读取并解析凭据（不修改全局缓存）。
+func loadAccountFile(path string) (*StoredAuth, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取凭据文件失败 (%s): %w", path, err)
+	}
+	var sa StoredAuth
+	if err := json.Unmarshal(data, &sa); err != nil {
+		return nil, fmt.Errorf("解析凭据文件失败 (%s): %w", path, err)
+	}
+	if sa.Auth.AccessToken == "" {
+		return nil, fmt.Errorf("凭据文件缺少 AccessToken (%s)", path)
+	}
+	return &sa, nil
+}
+
+// loadAccounts 根据 -auth / -auth-dir 配置构建账号池。
+// -auth 支持逗号分隔多个凭据文件；-auth-dir 自动加载目录下所有 workbuddy*.json。
+// 单账号时池长度为 1，行为与旧版完全一致。
+func loadAccounts() error {
+	accountMu.Lock()
+	defer accountMu.Unlock()
+
+	accounts = nil
+	rrIndex = 0
+
+	var paths []string
+	if cfg.AuthDir != "" {
+		entries, err := os.ReadDir(cfg.AuthDir)
+		if err != nil {
+			return fmt.Errorf("读取凭据目录失败 (%s): %w", cfg.AuthDir, err)
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if strings.HasPrefix(name, "workbuddy") && strings.HasSuffix(name, ".json") {
+				paths = append(paths, filepath.Join(cfg.AuthDir, name))
+			}
+		}
+		sort.Strings(paths)
+	} else {
+		for _, p := range strings.Split(cfg.AuthFile, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				paths = append(paths, p)
+			}
+		}
+	}
+
+	for _, p := range paths {
+		sa, err := loadAccountFile(p)
+		if err != nil {
+			log.Printf("[Auth] 跳过无效凭据文件 %s: %v", p, err)
+			continue
+		}
+		accounts = append(accounts, &Account{Path: p, Auth: sa})
+	}
+
+	if len(accounts) == 0 {
+		return fmt.Errorf("未找到有效凭据，请先执行 login 命令扫码登录")
+	}
+	return nil
+}
+
+// nextAccount 轮询选择下一个未处于冷却状态的账号。
+// 若全部账号冷却，返回错误并附带最早解封时间。
+func nextAccount() (*Account, error) {
+	accountMu.Lock()
+	defer accountMu.Unlock()
+
+	if len(accounts) == 0 {
+		return nil, fmt.Errorf("账号池为空")
+	}
+	now := time.Now()
+	for i := 0; i < len(accounts); i++ {
+		idx := (rrIndex + i) % len(accounts)
+		acc := accounts[idx]
+		if acc.CooldownUntil.After(now) {
+			continue
+		}
+		rrIndex = (idx + 1) % len(accounts)
+		return acc, nil
+	}
+	// 全部冷却：返回最早解封时间
+	earliest := accounts[0].CooldownUntil
+	for _, a := range accounts {
+		if a.CooldownUntil.Before(earliest) {
+			earliest = a.CooldownUntil
+		}
+	}
+	return nil, fmt.Errorf("所有账号均处于冷却状态，最早解封时间: %s", earliest.Format("2006-01-02 15:04:05"))
+}
+
+// markCooldown 将账号屏蔽至指定时间。
+func markCooldown(acc *Account, until time.Time, msg string) {
+	accountMu.Lock()
+	acc.CooldownUntil = until
+	acc.CooldownMsg = msg
+	accountMu.Unlock()
+	log.Printf("[Cooldown] 账号 %s 触发频率限制，自动屏蔽至 %s (提示: %s)",
+		acc.Path, until.Format("2006-01-02 15:04:05"), msg)
+}
+
+var resetTimeRe = regexp.MustCompile(`将在\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s*(UTC[+-]\d+(?::\d{2})?)?`)
+
+// parseResetTime 从上游 429 错误消息中解析频率限制重置时间。
+// 示例: "您的使用量已超出频率限制，将在 2026-09-04 07:48:15 UTC+8 重置"
+func parseResetTime(s string) (time.Time, bool) {
+	m := resetTimeRe.FindStringSubmatch(s)
+	if m == nil {
+		return time.Time{}, false
+	}
+	offset := 8 * 3600 // 默认按 UTC+8 解析
+	if m[3] != "" {
+		zone := m[3]
+		zone = strings.TrimPrefix(zone, "UTC")
+		zone = strings.TrimPrefix(zone, "utc")
+		var h, mi int
+		if _, err := fmt.Sscanf(zone, "%d:%d", &h, &mi); err == nil {
+			offset = h*3600 + mi*60
+		} else if _, err := fmt.Sscanf(zone, "%d", &h); err == nil {
+			offset = h * 3600
+		}
+	}
+	loc := time.FixedZone("UTC", offset)
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", m[1]+" "+m[2], loc)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// isRateLimited 判断上游响应是否属于频率限制（429 或 code 6004 / 频率限制提示）。
+func isRateLimited(statusCode int, body string) bool {
+	if statusCode == http.StatusTooManyRequests {
+		return true
+	}
+	if strings.Contains(body, `"code":6004`) || strings.Contains(body, "频率限制") || strings.Contains(body, "frequency limit") {
+		return true
+	}
+	return false
+}
+
+// ensureValidTokenFor 对指定账号检查并刷新令牌（多账号版）。
+func ensureValidTokenFor(acc *Account) error {
+	if acc == nil || acc.Auth == nil {
+		return fmt.Errorf("账号为空")
+	}
+	if time.Now().Unix() > acc.Auth.Auth.ExpiresAt-900 {
+		log.Printf("[Auth] 账号 %s 访问令牌即将/已经过期，正在自动刷新...", acc.Path)
+		return doRefreshTokenFor(acc)
+	}
+	return nil
+}
+
 func ensureValidToken() error {
 	sa, err := loadAuth()
 	if err != nil {
@@ -280,9 +480,36 @@ func ensureValidToken() error {
 }
 
 func doRefreshToken(sa *StoredAuth) error {
-	if sa.Auth.RefreshToken == "" {
+	if sa == nil || sa.Auth.RefreshToken == "" {
 		return fmt.Errorf("无法刷新：缺少 RefreshToken")
 	}
+	if err := refreshTokenPayload(sa); err != nil {
+		return err
+	}
+	if err := saveAuth(sa); err != nil {
+		return fmt.Errorf("写回凭据失败: %w", err)
+	}
+	log.Printf("[Auth] Token 刷新成功！新过期时间: %s", time.Unix(sa.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
+	return nil
+}
+
+// doRefreshTokenFor 刷新指定账号的令牌并保存回其凭据文件（多账号版）。
+func doRefreshTokenFor(acc *Account) error {
+	if acc == nil || acc.Auth == nil || acc.Auth.Auth.RefreshToken == "" {
+		return fmt.Errorf("无法刷新：账号缺少 RefreshToken")
+	}
+	if err := refreshTokenPayload(acc.Auth); err != nil {
+		return err
+	}
+	if err := saveAuthTo(acc.Path, acc.Auth); err != nil {
+		return fmt.Errorf("写回凭据失败: %w", err)
+	}
+	log.Printf("[Auth] 账号 %s Token 刷新成功！新过期时间: %s", acc.Path, time.Unix(acc.Auth.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
+	return nil
+}
+
+// refreshTokenPayload 调用上游刷新接口并更新内存中的令牌字段（不落盘）。
+func refreshTokenPayload(sa *StoredAuth) error {
 	headers := func(r *http.Request) {
 		commonHeaders(r)
 		r.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
@@ -311,11 +538,6 @@ func doRefreshToken(sa *StoredAuth) error {
 	if tok.ExpiresIn > 0 {
 		sa.Auth.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
-
-	if err := saveAuth(sa); err != nil {
-		return fmt.Errorf("写回凭据失败: %w", err)
-	}
-	log.Printf("[Auth] Token 刷新成功！新过期时间: %s", time.Unix(sa.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
 	return nil
 }
 
@@ -324,41 +546,72 @@ func doRefreshToken(sa *StoredAuth) error {
 // -----------------------------------------------------------------------------
 
 func runStatus() {
-	sa, err := loadAuth()
-	if err != nil {
+	if err := loadAccounts(); err != nil {
 		fmt.Printf("未找到有效凭据: %v\n请先执行: workbuddy-gateway login 扫码登录。\n", err)
 		return
 	}
-	expTime := time.Unix(sa.Auth.ExpiresAt, 0)
-	remaining := time.Until(expTime)
-	statusStr := "有效"
-	if remaining <= 0 {
-		statusStr = "已过期"
-	}
 
-	fmt.Println("================== WorkBuddy 凭据状态 ==================")
-	fmt.Printf("凭据存储文件: %s\n", cfg.AuthFile)
-	fmt.Printf("用户昵称:     %s\n", sa.Account.Nickname)
-	fmt.Printf("用户 UID:     %s\n", sa.Account.UID)
-	fmt.Printf("企业 ID:      %s\n", ifEmpty(sa.Account.EnterpriseID, "(个人账号)"))
-	fmt.Printf("认证域名:     %s\n", ifEmpty(sa.Auth.Domain, "www.codebuddy.cn"))
-	fmt.Printf("Token 状态:   %s\n", statusStr)
-	fmt.Printf("过期时间:     %s (剩余 %v)\n", expTime.Format("2006-01-02 15:04:05"), remaining.Round(time.Minute))
-	fmt.Println("=======================================================")
+	accountMu.Lock()
+	defer accountMu.Unlock()
+
+	fmt.Println("================== WorkBuddy 账号池状态 ==================")
+	fmt.Printf("账号总数: %d\n", len(accounts))
+	now := time.Now()
+	for i, acc := range accounts {
+		if acc.Auth == nil {
+			continue
+		}
+		expTime := time.Unix(acc.Auth.Auth.ExpiresAt, 0)
+		remaining := time.Until(expTime)
+		statusStr := "有效"
+		if remaining <= 0 {
+			statusStr = "已过期"
+		}
+
+		fmt.Printf("\n--- 账号 #%d ---\n", i+1)
+		fmt.Printf("凭据文件:     %s\n", acc.Path)
+		fmt.Printf("用户昵称:     %s\n", acc.Auth.Account.Nickname)
+		fmt.Printf("用户 UID:     %s\n", acc.Auth.Account.UID)
+		fmt.Printf("企业 ID:      %s\n", ifEmpty(acc.Auth.Account.EnterpriseID, "(个人账号)"))
+		fmt.Printf("认证域名:     %s\n", ifEmpty(acc.Auth.Auth.Domain, "www.codebuddy.cn"))
+		if acc.CooldownUntil.After(now) {
+			fmt.Printf("冷却状态:     🔒 冷却中 (解封: %s, 剩余 %v)\n",
+				acc.CooldownUntil.Format("2006-01-02 15:04:05"),
+				time.Until(acc.CooldownUntil).Round(time.Minute))
+			fmt.Printf("冷却原因:     %s\n", truncate(acc.CooldownMsg, 120))
+		} else {
+			fmt.Printf("冷却状态:     ✅ 可用\n")
+		}
+		fmt.Printf("Token 状态:   %s\n", statusStr)
+		fmt.Printf("过期时间:     %s (剩余 %v)\n", expTime.Format("2006-01-02 15:04:05"), remaining.Round(time.Minute))
+	}
+	fmt.Println("\n=======================================================")
 }
 
 func runRefresh() {
-	sa, err := loadAuth()
-	if err != nil {
+	if err := loadAccounts(); err != nil {
 		fmt.Printf("读取凭据失败: %v\n", err)
 		return
 	}
-	fmt.Println("正在向上游请求刷新令牌...")
-	if err := doRefreshToken(sa); err != nil {
-		fmt.Printf("刷新失败: %v\n", err)
-	} else {
-		fmt.Println("刷新成功并已持久化保存！")
+	accountMu.Lock()
+	defer accountMu.Unlock()
+	if len(accounts) == 0 {
+		fmt.Println("账号池为空")
+		return
 	}
+	ok := 0
+	fail := 0
+	for i, acc := range accounts {
+		fmt.Printf("正在刷新账号 #%d (%s)... ", i+1, acc.Path)
+		if err := doRefreshTokenFor(acc); err != nil {
+			fmt.Printf("❌ %v\n", err)
+			fail++
+		} else {
+			fmt.Println("✅")
+			ok++
+		}
+	}
+	fmt.Printf("\n刷新完成: 成功 %d 个，失败 %d 个\n", ok, fail)
 }
 
 func runLogin() {
@@ -458,13 +711,21 @@ func runLogin() {
 // -----------------------------------------------------------------------------
 
 func runServe() {
-	sa, err := loadAuth()
-	if err != nil {
-		fmt.Printf("警告: 未检测到有效凭据 (%v)。\n请先执行: workbuddy-gateway login 扫码登录，或确保 %s 存在。\n\n", err, cfg.AuthFile)
+	if err := loadAccounts(); err != nil {
+		fmt.Printf("警告: 未检测到有效凭据 (%v)。\n请先执行: workbuddy-gateway login 扫码登录，或确保凭据文件存在。\n\n", err)
 	} else {
-		_ = ensureValidToken()
-		fmt.Printf("已就绪账号: %s (UID: %s, 有效期至: %s)\n",
-			sa.Account.Nickname, sa.Account.UID, time.Unix(sa.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
+		accountMu.Lock()
+		accCount := len(accounts)
+		for _, acc := range accounts {
+			_ = ensureValidTokenFor(acc)
+		}
+		accountMu.Unlock()
+		fmt.Printf("已就绪账号池: %d 个账号\n", accCount)
+		for i, acc := range accounts {
+			fmt.Printf("  #%d %s (UID: %s, 有效期至: %s)\n",
+				i+1, acc.Auth.Account.Nickname, acc.Auth.Account.UID,
+				time.Unix(acc.Auth.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
+		}
 	}
 
 	// 启动后台自动刷新协程
@@ -525,8 +786,14 @@ func backgroundTokenRefresher() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
-		if err := ensureValidToken(); err != nil {
-			log.Printf("[BackgroundAuth] 自动检查/续期令牌异常: %v", err)
+		accountMu.Lock()
+		accs := make([]*Account, len(accounts))
+		copy(accs, accounts)
+		accountMu.Unlock()
+		for _, acc := range accs {
+			if err := ensureValidTokenFor(acc); err != nil {
+				log.Printf("[BackgroundAuth] 账号 %s 自动检查/续期令牌异常: %v", acc.Path, err)
+			}
 		}
 	}
 }
@@ -575,13 +842,6 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	reqID := atomic.AddUint64(&reqCounter, 1)
 	startTime := time.Now()
 
-	sa, err := loadAuth()
-	if err != nil {
-		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
-		return
-	}
-	_ = ensureValidToken()
-
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "read_error", "读取请求体失败")
@@ -626,83 +886,127 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[#%d] POST /v1/chat/completions -> Upstream [Model: %s, Stream: %v]", reqID, modelName, isStream)
 	}
 
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, endpointChat, bytes.NewReader(upstreamBytes))
-	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "req_create_error", err.Error())
+	// 多账号轮询 + 429 自动冷却代偿：
+	// 按轮询顺序尝试账号；命中 429 频率限制时立即将当前账号屏蔽到重置时间，
+	// 并自动改用下一个可用账号重试（代偿），直至成功或所有账号均不可用。
+	accountMu.Lock()
+	poolSize := len(accounts)
+	accountMu.Unlock()
+	if poolSize == 0 {
+		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
 		return
 	}
 
-	// 注入 CodeBuddy 凭据与指纹 Header
-	backendHeaders(upstreamReq, sa)
-
-	// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止 DSH 同时发起标题生成+主对话触发腾讯 11128 风控
-	upstreamMutex.Lock()
-	defer upstreamMutex.Unlock()
-
-	resp, err := cfg.HttpClient.Do(upstreamReq)
-	if err != nil {
-		log.Printf("[#%d] 上游请求失败: %v", reqID, err)
-		writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
-		return
-	}
-	defer resp.Body.Close()
-
-	// 上游非 200 响应处理
-	if resp.StatusCode >= 400 {
-		errBody, _ := io.ReadAll(resp.Body)
-		errStr := string(errBody)
-		log.Printf("[#%d] 上游返回 HTTP %d: %s (耗时 %v)", reqID, resp.StatusCode, errStr, time.Since(startTime))
-		writeOpenAIError(w, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
-		return
-	}
-
-	if isStream {
-		// 客户端需要流式响应
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			writeOpenAIError(w, http.StatusInternalServerError, "streaming_unsupported", "服务器不支持流式响应 Flush")
-			return
-		}
-
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-
-		for scanner.Scan() {
-			line := scanner.Text()
-			cleanData := stripDataPrefix(line)
-			if cleanData == "" {
-				continue
-			}
-			if cleanData == "[DONE]" {
-				_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
-				break
-			}
-			cleanedChunk := cleanChunkJSON(cleanData)
-			if cleanedChunk != "" {
-				_, _ = fmt.Fprintf(w, "data: %s\n\n", cleanedChunk)
-				flusher.Flush()
-			}
-		}
-		log.Printf("[#%d] 流式输出完成 (耗时 %v)", reqID, time.Since(startTime))
-	} else {
-		// 客户端需要完整 JSON 响应，聚合 SSE 数据流
-		completionJSON, err := aggregateCompletion(resp.Body, modelName)
+	var lastRateErr string
+	for attempt := 0; attempt < poolSize; attempt++ {
+		acc, err := nextAccount()
 		if err != nil {
-			log.Printf("[#%d] 聚合响应失败: %v", reqID, err)
-			writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
+			// 所有账号均处于冷却状态
+			msg := fmt.Sprintf("所有账号均处于冷却状态: %v", err)
+			if lastRateErr != "" {
+				msg += " | 最近一次限制: " + truncate(lastRateErr, 200)
+			}
+			log.Printf("[#%d] %s", reqID, msg)
+			writeOpenAIError(w, http.StatusTooManyRequests, "all_accounts_cooldown", msg)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(completionJSON)
-		log.Printf("[#%d] 非流式响应完成 (耗时 %v)", reqID, time.Since(startTime))
+		_ = ensureValidTokenFor(acc)
+
+		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, endpointChat, bytes.NewReader(upstreamBytes))
+		if err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "req_create_error", err.Error())
+			return
+		}
+		// 注入 CodeBuddy 凭据与指纹 Header
+		backendHeaders(upstreamReq, acc.Auth)
+
+		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止 DSH 同时发起标题生成+主对话触发腾讯 11128 风控
+		acc.lock.Lock()
+		resp, err := cfg.HttpClient.Do(upstreamReq)
+		acc.lock.Unlock()
+		if err != nil {
+			log.Printf("[#%d] 账号 %s 上游请求失败: %v", reqID, acc.Path, err)
+			writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
+			return
+		}
+
+		// 上游非 200 响应处理
+		if resp.StatusCode >= 400 {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			errStr := string(errBody)
+			log.Printf("[#%d] 账号 %s 上游返回 HTTP %d: %s (耗时 %v)", reqID, acc.Path, resp.StatusCode, errStr, time.Since(startTime))
+
+			if isRateLimited(resp.StatusCode, errStr) {
+				// 429 频率限制：解析重置时间并屏蔽该账号，交由其他账号代偿
+				until, ok := parseResetTime(errStr)
+				if !ok {
+					until = time.Now().Add(60 * time.Second) // 无法解析时默认冷却 60 秒
+				}
+				markCooldown(acc, until, errStr)
+				lastRateErr = errStr
+				continue // 尝试下一个账号
+			}
+
+			writeOpenAIError(w, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
+			return
+		}
+
+		if isStream {
+			// 客户端需要流式响应
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("X-Accel-Buffering", "no")
+
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				resp.Body.Close()
+				writeOpenAIError(w, http.StatusInternalServerError, "streaming_unsupported", "服务器不支持流式响应 Flush")
+				return
+			}
+
+			scanner := bufio.NewScanner(resp.Body)
+			scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+
+			for scanner.Scan() {
+				line := scanner.Text()
+				cleanData := stripDataPrefix(line)
+				if cleanData == "" {
+					continue
+				}
+				if cleanData == "[DONE]" {
+					_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+					flusher.Flush()
+					break
+				}
+				cleanedChunk := cleanChunkJSON(cleanData)
+				if cleanedChunk != "" {
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", cleanedChunk)
+					flusher.Flush()
+				}
+			}
+			resp.Body.Close()
+			log.Printf("[#%d] 流式输出完成 (账号 %s, 耗时 %v)", reqID, acc.Path, time.Since(startTime))
+		} else {
+			// 客户端需要完整 JSON 响应，聚合 SSE 数据流
+			completionJSON, err := aggregateCompletion(resp.Body, modelName)
+			resp.Body.Close()
+			if err != nil {
+				log.Printf("[#%d] 聚合响应失败: %v", reqID, err)
+				writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(completionJSON)
+			log.Printf("[#%d] 非流式响应完成 (账号 %s, 耗时 %v)", reqID, acc.Path, time.Since(startTime))
+		}
+		return
 	}
+
+	// 理论上不可达（poolSize 次尝试后未成功即已在循环内返回）
+	writeOpenAIError(w, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
 }
 
 // -----------------------------------------------------------------------------

@@ -1,0 +1,118 @@
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+// 验证 429 消息中的重置时间解析
+func TestParseResetTime(t *testing.T) {
+	msg := `{"code":429,"message":"upstream 429: {\"code\":6004,\"msg\":\"您的使用量已超出频率限制，将在 2026-09-04 07:48:15 UTC+8 重置，您也可以切换其他模型继续使用。\",\"requestId\":\"149e3299-ddf3-4ad1-aaa8-cc752c37630a\"}","type":"upstream_error"}`
+	got, ok := parseResetTime(msg)
+	if !ok {
+		t.Fatal("parseResetTime should succeed")
+	}
+	want := time.Date(2026, 9, 4, 7, 48, 15, 0, time.FixedZone("UTC+8", 8*3600))
+	if !got.Equal(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	t.Logf("parsed reset time: %v", got)
+}
+
+// 验证无法解析时返回 false
+func TestParseResetTimeInvalid(t *testing.T) {
+	if _, ok := parseResetTime("some random error"); ok {
+		t.Fatal("should not parse random string")
+	}
+}
+
+// 验证限流识别（429 状态码 / code 6004 / 频率限制关键词）
+func TestIsRateLimited(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{429, "{}", true},
+		{400, `{"code":6004,"msg":"x"}`, true},
+		{400, "频率限制", true},
+		{400, "frequency limit", true},
+		{400, "some other error", false},
+		{500, "{}", false},
+	}
+	for _, c := range cases {
+		if got := isRateLimited(c.status, c.body); got != c.want {
+			t.Errorf("isRateLimited(%d, %q) = %v, want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// 验证轮询选择：两个账号交替返回
+func TestNextAccountRoundRobin(t *testing.T) {
+	accountMu.Lock()
+	accounts = []*Account{
+		{Path: "a.json", Auth: &StoredAuth{}},
+		{Path: "b.json", Auth: &StoredAuth{}},
+	}
+	rrIndex = 0
+	accountMu.Unlock()
+
+	a1, _ := nextAccount()
+	a2, _ := nextAccount()
+	a3, _ := nextAccount()
+	if a1.Path != "a.json" || a2.Path != "b.json" || a3.Path != "a.json" {
+		t.Fatalf("round robin failed: %s %s %s", a1.Path, a2.Path, a3.Path)
+	}
+	t.Logf("round-robin order: %s %s %s", a1.Path, a2.Path, a3.Path)
+}
+
+// 验证冷却屏蔽：冷却中的账号被跳过，由另一账号代偿
+func TestNextAccountSkipsCooldown(t *testing.T) {
+	accountMu.Lock()
+	accounts = []*Account{
+		{Path: "a.json", Auth: &StoredAuth{}, CooldownUntil: time.Now().Add(time.Hour)},
+		{Path: "b.json", Auth: &StoredAuth{}},
+	}
+	rrIndex = 0
+	accountMu.Unlock()
+
+	a, _ := nextAccount()
+	if a.Path != "b.json" {
+		t.Fatalf("expected b.json (only non-cooldown), got %s", a.Path)
+	}
+	t.Logf("cooldown skip works, selected %s", a.Path)
+}
+
+// 验证全部冷却时返回错误
+func TestNextAccountAllCooldown(t *testing.T) {
+	accountMu.Lock()
+	accounts = []*Account{
+		{Path: "a.json", Auth: &StoredAuth{}, CooldownUntil: time.Now().Add(time.Hour)},
+		{Path: "b.json", Auth: &StoredAuth{}, CooldownUntil: time.Now().Add(2 * time.Hour)},
+	}
+	rrIndex = 0
+	accountMu.Unlock()
+
+	_, err := nextAccount()
+	if err == nil {
+		t.Fatal("expected error when all accounts in cooldown")
+	}
+	t.Logf("all-cooldown error: %v", err)
+}
+
+// 验证冷却到期后自动恢复
+func TestNextAccountCooldownExpiry(t *testing.T) {
+	accountMu.Lock()
+	accounts = []*Account{
+		{Path: "a.json", Auth: &StoredAuth{}, CooldownUntil: time.Now().Add(-time.Minute)},
+		{Path: "b.json", Auth: &StoredAuth{}, CooldownUntil: time.Now().Add(time.Hour)},
+	}
+	rrIndex = 0
+	accountMu.Unlock()
+
+	a, _ := nextAccount()
+	if a.Path != "a.json" {
+		t.Fatalf("expected a.json (cooldown expired), got %s", a.Path)
+	}
+	t.Logf("expired cooldown recovers, selected %s", a.Path)
+}
