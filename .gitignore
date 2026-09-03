@@ -1,0 +1,19 @@
+# 凭据与敏感数据（切勿提交！）
+workbuddy.json
+workbuddy-console.json
+dist/workbuddy.json
+dist/*.json
+last-*.json
+*.json.bak
+
+# 本地编译产物
+workbuddy-gateway.exe
+dist/*.exe
+dist/workbuddy-gateway-linux-*
+dist/workbuddy-gateway-darwin-*
+
+# 日志与临时文件
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
