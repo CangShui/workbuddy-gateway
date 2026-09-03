@@ -96,7 +96,7 @@ llm-pi-ai:
 
 ### Windows
 
-1. 下载 `dist/workbuddy-gateway-windows-amd64.exe`。
+1. 从 [Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载 `workbuddy-gateway-windows-amd64.exe`。
 2. 在 PowerShell / CMD 中进入文件所在目录：
    ```powershell
    .\workbuddy-gateway-windows-amd64.exe login
@@ -106,11 +106,13 @@ llm-pi-ai:
 
 ### Linux (amd64 / arm64)
 
-1. 下载对应架构二进制，赋执行权限并放入 PATH：
+1. 从 [Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载对应架构二进制，赋执行权限并放入 PATH：
    ```bash
    # x86_64
+   wget https://github.com/CangShui/workbuddy-gateway/releases/latest/download/workbuddy-gateway-linux-amd64
    sudo install -m 755 workbuddy-gateway-linux-amd64 /usr/local/bin/workbuddy-gateway
    # ARM64 (树莓派 / 飞腾 / Apple silicon 云主机等)
+   wget https://github.com/CangShui/workbuddy-gateway/releases/latest/download/workbuddy-gateway-linux-arm64
    sudo install -m 755 workbuddy-gateway-linux-arm64 /usr/local/bin/workbuddy-gateway
    ```
 2. 登录并启动：
@@ -179,7 +181,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 
 ### macOS (Apple Silicon / Intel)
 
-1. 下载 `workbuddy-gateway-darwin-arm64`（M 系列）或 `workbuddy-gateway-darwin-amd64`（Intel）。
+1. 从 [Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载 `workbuddy-gateway-darwin-arm64`（M 系列）或 `workbuddy-gateway-darwin-amd64`（Intel）。
 2. 首次运行需移除隔离属性：
    ```bash
    chmod +x workbuddy-gateway-darwin-arm64
