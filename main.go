@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	version       = "1.3.0"
+	version       = "1.4.0"
 	upstreamBase  = "https://copilot.tencent.com"
 	clientUA      = "CLI/2.143.1 CodeBuddy/2.143.1"
 	originReferer = "https://www.codebuddy.cn"
@@ -95,14 +95,15 @@ type authStateData struct {
 // -----------------------------------------------------------------------------
 
 type Config struct {
-	Addr       string
-	Port       int
-	AuthFile   string
-	AuthDir    string
-	APIKey     string
-	ProxyURL   string
-	Verbose    bool
-	HttpClient *http.Client
+	Addr         string
+	Port         int
+	AuthFile     string
+	AuthDir      string
+	AuthExplicit bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
+	APIKey       string
+	ProxyURL     string
+	Verbose      bool
+	HttpClient   *http.Client
 }
 
 // Account 表示一个 CodeBuddy 账号凭据及其运行时状态。
@@ -177,6 +178,15 @@ func main() {
 	fs.BoolVar(&cfg.Verbose, "verbose", false, "输出详细调试日志")
 	_ = fs.Parse(args)
 
+	// 检测 -auth 是否被显式指定：
+	// 若未指定 -auth 且未指定 -auth-dir，则自动扫描当前目录下所有 workbuddy*.json 组成账号池，
+	// 这样把多个凭据文件放进工作目录即可自动多账号，无需手写参数。
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "auth" {
+			cfg.AuthExplicit = true
+		}
+	})
+
 	// 初始化 HTTP 客户端
 	initHTTPClient()
 
@@ -219,7 +229,7 @@ func printHelp() {
   -addr <ip>        网关监听地址 (默认: 127.0.0.1)
   -port <port>      网关监听端口 (默认: 8317)
   -auth <path>      凭据文件路径；支持逗号分隔多个文件实现多账号
-                    (默认: ./workbuddy.json)
+                    (默认: 自动发现当前目录下所有 workbuddy*.json)
   -auth-dir <dir>   凭据目录：自动加载目录下所有 workbuddy*.json 作为账号池
   -api-key <key>    设置后，调用网关必须携带 Bearer <key> 鉴权
   -proxy <url>      设置上游转发代理 (例如 http://127.0.0.1:7890 或 socks5://...)
@@ -227,10 +237,13 @@ func printHelp() {
 
 多账号说明:
   # 登录第二个账号（保存到不同文件）
-  workbuddy-gateway login -auth workbuddy-2.json
+  workbuddy-gateway login -auth workbuddy2.json
+
+  # 自动发现：把多个凭据文件放进工作目录即可自动多账号（无需任何参数）
+  workbuddy-gateway serve        # 自动加载 ./workbuddy*.json
 
   # 启动时指定多个凭据文件（轮询 + 429 自动冷却代偿）
-  workbuddy-gateway serve -auth workbuddy.json,workbuddy-2.json
+  workbuddy-gateway serve -auth workbuddy.json,workbuddy2.json
 
   # 或使用目录模式：目录内所有 workbuddy*.json 自动组成账号池
   workbuddy-gateway serve -auth-dir ./auths
@@ -352,9 +365,65 @@ func loadAccountFile(path string) (*StoredAuth, error) {
 	return &sa, nil
 }
 
-// loadAccounts 根据 -auth / -auth-dir 配置构建账号池。
-// -auth 支持逗号分隔多个凭据文件；-auth-dir 自动加载目录下所有 workbuddy*.json。
-// 单账号时池长度为 1，行为与旧版完全一致。
+// collectConfiguredAuthPaths 解析应加载的凭据路径列表：
+//  1) -auth-dir 指定目录 → 目录下所有 workbuddy*.json
+//  2) 显式 -auth → 逗号分隔的凭据文件列表（保持用户顺序）
+//  3) 均未指定（自动发现模式）→ 扫描当前目录下所有 workbuddy*.json，
+//     这样把多个凭据文件放进工作目录即可自动组成多账号池；若一个都没有则回退默认 cfg.AuthFile
+func collectConfiguredAuthPaths() []string {
+	var paths []string
+
+	if cfg.AuthDir != "" {
+		entries, err := os.ReadDir(cfg.AuthDir)
+		if err == nil {
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				name := e.Name()
+				if strings.HasPrefix(name, "workbuddy") && strings.HasSuffix(name, ".json") {
+					paths = append(paths, filepath.Join(cfg.AuthDir, name))
+				}
+			}
+			sort.Strings(paths)
+		}
+		return paths
+	}
+
+	if cfg.AuthExplicit {
+		for _, p := range strings.Split(cfg.AuthFile, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				paths = append(paths, p)
+			}
+		}
+		return paths
+	}
+
+	// 自动发现模式：扫描当前工作目录（systemd WorkingDirectory 即凭据目录）
+	entries, err := os.ReadDir(".")
+	if err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if strings.HasPrefix(name, "workbuddy") && strings.HasSuffix(name, ".json") {
+				paths = append(paths, name)
+			}
+		}
+		sort.Strings(paths)
+	}
+	if len(paths) == 0 {
+		// 无任何凭据文件时回退默认路径，便于给出"请先 login"的友好提示
+		paths = append(paths, cfg.AuthFile)
+	}
+	return paths
+}
+
+// loadAccounts 构建账号池。
+// -auth 支持逗号分隔多个凭据文件；-auth-dir 自动加载目录下所有 workbuddy*.json；
+// 两者都未指定时自动发现当前目录下所有 workbuddy*.json（多账号免参数）。
 func loadAccounts() error {
 	accountMu.Lock()
 	defer accountMu.Unlock()
@@ -362,32 +431,7 @@ func loadAccounts() error {
 	accounts = nil
 	rrIndex = 0
 
-	var paths []string
-	if cfg.AuthDir != "" {
-		entries, err := os.ReadDir(cfg.AuthDir)
-		if err != nil {
-			return fmt.Errorf("读取凭据目录失败 (%s): %w", cfg.AuthDir, err)
-		}
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			name := e.Name()
-			if strings.HasPrefix(name, "workbuddy") && strings.HasSuffix(name, ".json") {
-				paths = append(paths, filepath.Join(cfg.AuthDir, name))
-			}
-		}
-		sort.Strings(paths)
-	} else {
-		for _, p := range strings.Split(cfg.AuthFile, ",") {
-			p = strings.TrimSpace(p)
-			if p != "" {
-				paths = append(paths, p)
-			}
-		}
-	}
-
-	for _, p := range paths {
+	for _, p := range collectConfiguredAuthPaths() {
 		sa, err := loadAccountFile(p)
 		if err != nil {
 			log.Printf("[Auth] 跳过无效凭据文件 %s: %v", p, err)
@@ -500,7 +544,8 @@ func disableAccount(acc *Account, reason string) {
 func loadDisabledMarkers() {
 	// 收集标记文件路径：
 	// - AuthDir 模式：目录下 *.json.disabled 即为标记文件
-	// - 单文件模式：<凭据路径>.disabled 为标记文件
+	// - 显式 -auth 模式：<凭据路径>.disabled 为标记文件
+	// - 自动发现模式：扫描当前目录下所有 *.json.disabled 标记文件
 	var markerPaths []string
 	if cfg.AuthDir != "" {
 		entries, err := os.ReadDir(cfg.AuthDir)
@@ -516,12 +561,27 @@ func loadDisabledMarkers() {
 				markerPaths = append(markerPaths, filepath.Join(cfg.AuthDir, name))
 			}
 		}
-	} else {
+	} else if cfg.AuthExplicit {
 		for _, p := range strings.Split(cfg.AuthFile, ",") {
 			p = strings.TrimSpace(p)
 			if p != "" {
 				markerPaths = append(markerPaths, markerPath(p))
 			}
+		}
+	} else {
+		// 自动发现模式：扫描当前工作目录
+		entries, err := os.ReadDir(".")
+		if err == nil {
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				name := e.Name()
+				if strings.HasPrefix(name, "workbuddy") && strings.HasSuffix(name, ".json.disabled") {
+					markerPaths = append(markerPaths, name)
+				}
+			}
+			sort.Strings(markerPaths)
 		}
 	}
 

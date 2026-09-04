@@ -232,15 +232,18 @@ func TestLoadDisabledMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 模拟 -auth 指定该路径
+	// 模拟 -auth 显式指定该路径
 	oldAuthFile := cfg.AuthFile
 	oldAuthDir := cfg.AuthDir
+	oldAuthExplicit := cfg.AuthExplicit
 	defer func() {
 		cfg.AuthFile = oldAuthFile
 		cfg.AuthDir = oldAuthDir
+		cfg.AuthExplicit = oldAuthExplicit
 	}()
 	cfg.AuthFile = authPath
 	cfg.AuthDir = ""
+	cfg.AuthExplicit = true
 
 	accounts = nil
 	loadDisabledMarkers()
@@ -273,4 +276,81 @@ func TestClearDisabledMarker(t *testing.T) {
 		t.Fatalf("marker file should be removed, stat err=%v", err)
 	}
 	t.Log("clearDisabledMarker works")
+}
+
+// 验证自动发现模式：未指定 -auth/-auth-dir 时，扫描当前目录下所有 workbuddy*.json
+func TestCollectConfiguredAuthPathsAutoDiscover(t *testing.T) {
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟目录内多个凭据文件 + 非凭据文件 + 失效标记
+	for _, name := range []string{"workbuddy.json", "workbuddy2.json", "workbuddy-3.json", "other.json", "workbuddy.json.disabled"} {
+		if err := os.WriteFile(name, []byte(`{"auth":{"accessToken":"x"}}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	oldAuthFile := cfg.AuthFile
+	oldAuthDir := cfg.AuthDir
+	oldAuthExplicit := cfg.AuthExplicit
+	defer func() {
+		cfg.AuthFile = oldAuthFile
+		cfg.AuthDir = oldAuthDir
+		cfg.AuthExplicit = oldAuthExplicit
+	}()
+	cfg.AuthFile = "workbuddy.json"
+	cfg.AuthDir = ""
+	cfg.AuthExplicit = false
+
+	paths := collectConfiguredAuthPaths()
+	if len(paths) != 3 {
+		t.Fatalf("expected 3 workbuddy json files, got %d: %v", len(paths), paths)
+	}
+	want := []string{"workbuddy-3.json", "workbuddy.json", "workbuddy2.json"} // sort.Strings 排序结果
+	for i, p := range want {
+		if paths[i] != p {
+			t.Fatalf("paths[%d] = %s, want %s (all: %v)", i, paths[i], p, paths)
+		}
+	}
+	t.Logf("auto-discover paths: %v", paths)
+}
+
+// 验证自动发现模式：目录内没有任何凭据文件时回退到默认路径
+func TestCollectConfiguredAuthPathsAutoDiscoverFallback(t *testing.T) {
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	// 目录为空
+
+	oldAuthFile := cfg.AuthFile
+	oldAuthDir := cfg.AuthDir
+	oldAuthExplicit := cfg.AuthExplicit
+	defer func() {
+		cfg.AuthFile = oldAuthFile
+		cfg.AuthDir = oldAuthDir
+		cfg.AuthExplicit = oldAuthExplicit
+	}()
+	cfg.AuthFile = "workbuddy.json"
+	cfg.AuthDir = ""
+	cfg.AuthExplicit = false
+
+	paths := collectConfiguredAuthPaths()
+	if len(paths) != 1 || paths[0] != "workbuddy.json" {
+		t.Fatalf("expected fallback to default workbuddy.json, got %v", paths)
+	}
+	t.Logf("fallback path: %v", paths)
 }

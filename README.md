@@ -61,13 +61,19 @@ workbuddy-gateway serve -api-key sk-localsecret
 
 ### 配置多个账号
 
-网关支持同时挂载多个 CodeBuddy 账号，请求按**轮询（round-robin）**方式均匀分发，保持各账号额度消耗一致。两种配置方式：
+网关支持同时挂载多个 CodeBuddy 账号，请求按**轮询（round-robin）**方式均匀分发，保持各账号额度消耗一致。三种配置方式：
 
 ```bash
-# 方式一：-auth 逗号分隔多个凭据文件
+# 方式一（推荐）：自动发现 — 把多个凭据文件放进工作目录即可，无需任何参数
+# 网关启动时自动加载当前目录下所有 workbuddy*.json（如 workbuddy.json、workbuddy2.json…）
+cd /opt/workbuddy-gateway
+workbuddy-gateway serve -addr 0.0.0.0 -port 8317
+# 启动日志会显示: 已就绪账号池: 2 个账号 (有效 2, 失效 0)
+
+# 方式二：-auth 逗号分隔多个凭据文件
 workbuddy-gateway serve -auth workbuddy.json,workbuddy-2.json,workbuddy-3.json
 
-# 方式二：-auth-dir 指定凭据目录（自动加载目录下所有 workbuddy*.json）
+# 方式三：-auth-dir 指定凭据目录（自动加载目录下所有 workbuddy*.json）
 mkdir -p auths
 workbuddy-gateway login -auth auths/workbuddy-1.json   # 依次为每个账号扫码登录
 workbuddy-gateway login -auth auths/workbuddy-2.json
@@ -126,7 +132,7 @@ workbuddy-gateway status   # 该账号恢复为 ✅ 可用
 
 ### 与单账号模式的兼容性
 
-- 不传 `-auth` 时默认使用 `./workbuddy.json`，行为与旧版完全一致；
+- 不传 `-auth` / `-auth-dir` 时，自动发现当前工作目录下所有 `workbuddy*.json`；目录中只有一个凭据文件时行为与旧版完全一致；
 - 只有一个账号时，请求始终使用该账号，429 冷却逻辑同样生效（冷却期间请求将返回 429 提示）；
 - 账号之间使用独立的串行锁：同一账号请求严格排队，不同账号可并行，兼顾风控与吞吐。
 
@@ -230,7 +236,17 @@ sudo mkdir -p /opt/workbuddy-gateway
 sudo cp workbuddy-gateway /opt/workbuddy-gateway/      # 对应架构的二进制
 # 首次登录（会生成 workbuddy.json）
 sudo /opt/workbuddy-gateway/workbuddy-gateway login
+# 登录第二个账号（可选）：生成 workbuddy2.json
+sudo /opt/workbuddy-gateway/workbuddy-gateway login -auth /opt/workbuddy-gateway/workbuddy2.json
 ```
+
+> 💡 **多账号自动发现**：服务通过 `WorkingDirectory` 固定在 `/opt/workbuddy-gateway`，
+> 无需修改 ExecStart——把多个凭据文件（`workbuddy.json`、`workbuddy2.json`…）放进该目录，
+> 重启服务即自动加载全部账号组成轮询池。确认方式：
+> ```bash
+> sudo journalctl -u workbuddy-gateway | grep 账号池
+> # 输出示例: 已就绪账号池: 2 个账号 (有效 2, 失效 0)
+> ```
 
 启用并启动服务：
 
