@@ -354,3 +354,70 @@ func TestCollectConfiguredAuthPathsAutoDiscoverFallback(t *testing.T) {
 	}
 	t.Logf("fallback path: %v", paths)
 }
+
+// 验证 tailLines 读取文件末尾 N 行
+func TestTailLines(t *testing.T) {
+	dir := t.TempDir()
+	f := dir + "/test.log"
+	content := "line1\nline2\nline3\nline4\nline5\n"
+	if err := os.WriteFile(f, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	lines, err := tailLines(f, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 2 || lines[0] != "line4" || lines[1] != "line5" {
+		t.Fatalf("tailLines got %v", lines)
+	}
+	t.Logf("tailLines(2) = %v", lines)
+}
+
+// 验证状态快照写入：含 active / cooldown / disabled 三种状态
+func TestWriteStatusSnapshot(t *testing.T) {
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	accountMu.Lock()
+	accounts = []*Account{
+		{Path: "a.json", Auth: &StoredAuth{
+			Auth:    StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+			Account: StoredAccount{Nickname: "alice", UID: "u1"},
+		}},
+		{Path: "b.json", Auth: &StoredAuth{
+			Auth:    StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+			Account: StoredAccount{Nickname: "bob", UID: "u2"},
+		}, CooldownUntil: time.Now().Add(30 * time.Minute), CooldownMsg: "频率限制"},
+		{Path: "c.json", Disabled: true, DisabledReason: "revoked", Nickname: "carol", UID: "u3"},
+	}
+	accountMu.Unlock()
+
+	writeStatusSnapshot()
+
+	data, err := os.ReadFile(statusSnapshotFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snap statusSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Accounts) != 3 {
+		t.Fatalf("expected 3 accounts in snapshot, got %d", len(snap.Accounts))
+	}
+	states := map[string]bool{}
+	for _, a := range snap.Accounts {
+		states[a.State] = true
+	}
+	if !states["active"] || !states["cooldown"] || !states["disabled"] {
+		t.Fatalf("expected all three states in snapshot, got %v", states)
+	}
+	t.Logf("snapshot states: %v", states)
+}

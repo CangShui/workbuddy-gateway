@@ -14,10 +14,12 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,7 +31,7 @@ import (
 )
 
 const (
-	version       = "1.4.2"
+	version       = "1.5.0"
 	upstreamBase  = "https://copilot.tencent.com"
 	clientUA      = "CLI/2.143.1 CodeBuddy/2.143.1"
 	originReferer = "https://www.codebuddy.cn"
@@ -41,6 +43,9 @@ const (
 	endpointChat         = upstreamBase + "/v2/chat/completions"
 
 	loginTTL = 5 * time.Minute
+
+	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
+	statusSnapshotFile = "workbuddy-status.json"
 )
 
 // -----------------------------------------------------------------------------
@@ -95,15 +100,19 @@ type authStateData struct {
 // -----------------------------------------------------------------------------
 
 type Config struct {
-	Addr         string
-	Port         int
-	AuthFile     string
-	AuthDir      string
-	AuthExplicit bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
-	APIKey       string
-	ProxyURL     string
-	Verbose      bool
-	HttpClient   *http.Client
+	Addr            string
+	Port            int
+	AuthFile        string
+	AuthDir         string
+	AuthExplicit    bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
+	APIKey          string
+	ProxyURL        string
+	Verbose         bool
+	MonitorInterval int    // monitor 状态刷新间隔（秒）
+	LogFile         string // monitor 附加展示的日志文件路径
+	JournalService  string // monitor 附加展示的 systemd 服务名（journalctl -u）
+	LogLines        int    // monitor 展示的最近日志行数
+	HttpClient      *http.Client
 }
 
 // Account 表示一个 CodeBuddy 账号凭据及其运行时状态。
@@ -176,6 +185,10 @@ func main() {
 	fs.StringVar(&cfg.APIKey, "api-key", "", "可选：访问网关所需的 API Key (客户端 Bearer 校验)")
 	fs.StringVar(&cfg.ProxyURL, "proxy", "", "可选：上游请求代理 (如 http://127.0.0.1:7890)")
 	fs.BoolVar(&cfg.Verbose, "verbose", false, "输出详细调试日志")
+	fs.IntVar(&cfg.MonitorInterval, "interval", 3, "monitor 状态刷新间隔（秒）")
+	fs.StringVar(&cfg.LogFile, "logfile", "", "monitor 附加跟随的日志文件路径（如 -logfile /var/log/workbuddy-gateway.log）")
+	fs.StringVar(&cfg.JournalService, "journal", "", "monitor 附加跟随的 systemd 服务名（Linux 下用 journalctl -u <服务> -f 跟随）")
+	fs.IntVar(&cfg.LogLines, "lines", 5, "monitor 每次刷新展示的最近日志行数")
 	_ = fs.Parse(args)
 
 	// 检测 -auth 是否被显式指定：
@@ -199,6 +212,8 @@ func main() {
 		runStatus()
 	case "refresh":
 		runRefresh()
+	case "monitor":
+		runMonitor()
 	case "version", "-v", "--version":
 		fmt.Printf("WorkBuddy Local Gateway v%s\n", version)
 	default:
@@ -222,6 +237,7 @@ func printHelp() {
   login       微信/企业微信扫码登录，获取/更新凭据
   status      查看账号池状态（含冷却状态与过期时间）
   refresh     手动立即刷新所有账号访问令牌 (Access Token)
+  monitor     前台实时监控：周期刷新展示账号状态 + 最近日志 (Ctrl+C 退出)
   version     查看版本信息
   help        查看帮助说明
 
@@ -234,6 +250,12 @@ func printHelp() {
   -api-key <key>    设置后，调用网关必须携带 Bearer <key> 鉴权
   -proxy <url>      设置上游转发代理 (例如 http://127.0.0.1:7890 或 socks5://...)
   -verbose          输出详细调试日志 (请求/响应体)
+
+monitor 选项:
+  -interval <sec>   状态刷新间隔秒数 (默认: 3)
+  -journal <svc>    同时展示 systemd 服务最近日志 (Linux, 如 -journal workbuddy-gateway)
+  -logfile <path>   同时展示指定日志文件最近内容 (如 -logfile /var/log/wb.log)
+  -lines <n>        每次刷新展示的最近日志行数 (默认: 5)
 
 多账号说明:
   # 登录第二个账号（保存到不同文件）
@@ -499,6 +521,7 @@ func markCooldown(acc *Account, until time.Time, msg string) {
 	accountMu.Unlock()
 	log.Printf("[Cooldown] 账号 %s 触发频率限制，自动屏蔽至 %s (提示: %s)",
 		acc.Path, until.Format("2006-01-02 15:04:05"), msg)
+	writeStatusSnapshot()
 }
 
 // disableAccount 将账号标记为失效（授权过期/撤销），禁止调度并删除凭据文件，
@@ -538,6 +561,7 @@ func disableAccount(acc *Account, reason string) {
 		log.Printf("[Auth] 账号 %s 凭据文件删除失败: %v", path, err)
 	}
 	log.Printf("[Auth] ⚠️ 账号 %s 授权失效，已禁止调度并删除凭据文件: %s", path, reason)
+	writeStatusSnapshot()
 }
 
 // loadDisabledMarkers 扫描失效标记文件，将其恢复为账号池中的失效账号（Auth 为 nil）。
@@ -737,6 +761,7 @@ func doRefreshTokenFor(acc *Account) error {
 		return fmt.Errorf("写回凭据失败: %w", err)
 	}
 	log.Printf("[Auth] 账号 %s Token 刷新成功！新过期时间: %s", acc.Path, time.Unix(acc.Auth.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
+	writeStatusSnapshot()
 	return nil
 }
 
@@ -879,6 +904,260 @@ func runRefresh() {
 	fmt.Printf("\n刷新完成: 成功 %d 个，失败 %d 个，跳过 %d 个（授权失效）\n", ok, fail, skipped)
 }
 
+// -----------------------------------------------------------------------------
+// 状态快照与前台实时监控 (monitor)
+// -----------------------------------------------------------------------------
+
+// accountSnapshot 是写入状态快照文件的单个账号状态。
+type accountSnapshot struct {
+	Path           string `json:"path"`
+	Nickname       string `json:"nickname"`
+	UID            string `json:"uid"`
+	State          string `json:"state"` // active | cooldown | disabled
+	CooldownUntil  int64  `json:"cooldownUntil,omitempty"`
+	CooldownMsg    string `json:"cooldownMsg,omitempty"`
+	DisabledReason string `json:"disabledReason,omitempty"`
+	TokenExpiresAt int64  `json:"tokenExpiresAt,omitempty"`
+}
+
+// statusSnapshot 是写入 workbuddy-status.json 的完整快照。
+type statusSnapshot struct {
+	UpdatedAt int64             `json:"updatedAt"`
+	Accounts  []accountSnapshot `json:"accounts"`
+}
+
+// writeStatusSnapshot 将账号池实时状态（含冷却/失效）原子写入状态快照文件。
+// serve 后台周期调用；monitor 命令前台读取展示。
+func writeStatusSnapshot() {
+	accountMu.Lock()
+	snap := statusSnapshot{UpdatedAt: time.Now().Unix()}
+	now := time.Now()
+	for _, acc := range accounts {
+		as := accountSnapshot{Path: acc.Path}
+		switch {
+		case acc.Disabled:
+			as.State = "disabled"
+			as.DisabledReason = acc.DisabledReason
+			if acc.Auth != nil {
+				as.Nickname = acc.Auth.Account.Nickname
+				as.UID = acc.Auth.Account.UID
+			} else {
+				as.Nickname = acc.Nickname
+				as.UID = acc.UID
+			}
+		case acc.CooldownUntil.After(now):
+			as.State = "cooldown"
+			as.CooldownUntil = acc.CooldownUntil.Unix()
+			as.CooldownMsg = acc.CooldownMsg
+			if acc.Auth != nil {
+				as.Nickname = acc.Auth.Account.Nickname
+				as.UID = acc.Auth.Account.UID
+				as.TokenExpiresAt = acc.Auth.Auth.ExpiresAt
+			}
+		default:
+			as.State = "active"
+			if acc.Auth != nil {
+				as.Nickname = acc.Auth.Account.Nickname
+				as.UID = acc.Auth.Account.UID
+				as.TokenExpiresAt = acc.Auth.Auth.ExpiresAt
+			}
+		}
+		snap.Accounts = append(snap.Accounts, as)
+	}
+	accountMu.Unlock()
+
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return
+	}
+	// 原子写：先写临时文件再改名，避免 monitor 读到半截内容
+	tmp := statusSnapshotFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, statusSnapshotFile)
+}
+
+// statusSnapshotLoop serve 后台每 3 秒刷新一次状态快照。
+func statusSnapshotLoop() {
+	writeStatusSnapshot()
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		writeStatusSnapshot()
+	}
+}
+
+// tailLines 读取文件末尾 n 行（用于 monitor 展示最近日志）。
+func tailLines(path string, n int) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	// 先定位到文件末尾，从后向前扫描 n 个换行符
+	const chunk = 4096
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := fi.Size()
+	var lines []string
+	buf := make([]byte, chunk)
+	pos := size
+	lineBuf := make([]byte, 0, chunk)
+	newlines := 0
+	for pos > 0 && newlines <= n {
+		read := int64(chunk)
+		if pos < chunk {
+			read = pos
+		}
+		pos -= read
+		if _, err := f.Seek(pos, io.SeekStart); err != nil {
+			break
+		}
+		rn, err := f.Read(buf[:read])
+		if err != nil && rn == 0 {
+			break
+		}
+		for i := rn - 1; i >= 0; i-- {
+			if buf[i] == '\n' {
+				if len(lineBuf) > 0 {
+					lines = append([]string{string(lineBuf)}, lines...)
+					lineBuf = lineBuf[:0]
+					newlines++
+					if newlines > n {
+						break
+					}
+				}
+			} else {
+				lineBuf = append([]byte{buf[i]}, lineBuf...)
+			}
+		}
+		if newlines > n {
+			break
+		}
+	}
+	if len(lineBuf) > 0 && newlines <= n {
+		lines = append([]string{string(lineBuf)}, lines...)
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return lines, nil
+}
+
+// journalLines 获取 systemd 服务最近 n 行日志（Linux journalctl）。
+func journalLines(service string, n int) ([]string, error) {
+	cmd := exec.Command("journalctl", "-u", service, "-n", strconv.Itoa(n), "--no-pager", "-o", "short")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	s := strings.TrimSpace(string(out))
+	if s == "" {
+		return nil, nil
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return lines, nil
+}
+
+// runMonitor 前台实时监控：周期刷新展示账号池状态 + 最近日志（Ctrl+C 退出）。
+func runMonitor() {
+	interval := time.Duration(cfg.MonitorInterval) * time.Second
+	if interval <= 0 {
+		interval = 3 * time.Second
+	}
+	logN := cfg.LogLines
+	if logN <= 0 {
+		logN = 5
+	}
+
+	// 判断 stdout 是否为终端（是则用 ANSI 清屏重绘，否则滚动输出）
+	isTTY := false
+	if fi, err := os.Stdout.Stat(); err == nil {
+		isTTY = fi.Mode()&os.ModeCharDevice != 0
+	}
+
+	fmt.Println("================ WorkBuddy 实时监控 ================")
+	fmt.Println("按 Ctrl+C 退出 | 状态文件: " + statusSnapshotFile)
+	fmt.Println("---------------------------------------------------------------")
+
+	for {
+		if isTTY {
+			fmt.Print("\033[H\033[2J") // 清屏
+		} else {
+			fmt.Println()
+		}
+		fmt.Printf("🕐 更新时间: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+
+		data, err := os.ReadFile(statusSnapshotFile)
+		if err != nil {
+			fmt.Printf("⚠️ 未找到状态文件 %s（服务是否在运行？请确认已在服务工作目录执行 monitor）\n", statusSnapshotFile)
+		} else {
+			var snap statusSnapshot
+			if err := json.Unmarshal(data, &snap); err == nil {
+				active, cooldown, disabled := 0, 0, 0
+				for _, a := range snap.Accounts {
+					switch a.State {
+					case "active":
+						active++
+					case "cooldown":
+						cooldown++
+					case "disabled":
+						disabled++
+					}
+				}
+				fmt.Printf("📊 账号池: 共 %d 个 | ✅ 可用 %d | 🔒 冷却 %d | ❌ 失效 %d\n",
+					len(snap.Accounts), active, cooldown, disabled)
+				for i, a := range snap.Accounts {
+					fmt.Printf("  #%d %s (%s)\n", i+1, a.Path, ifEmpty(a.Nickname, "?"))
+					switch a.State {
+					case "active":
+						fmt.Printf("     ✅ 可用 | Token 有效期至: %s\n",
+							time.Unix(a.TokenExpiresAt, 0).Format("01-02 15:04"))
+					case "cooldown":
+						fmt.Printf("     🔒 冷却中 至 %s (剩余 %v)\n",
+							time.Unix(a.CooldownUntil, 0).Format("01-02 15:04:05"),
+							time.Until(time.Unix(a.CooldownUntil, 0)).Round(time.Minute))
+						if a.CooldownMsg != "" {
+							fmt.Printf("     原因: %s\n", truncate(a.CooldownMsg, 100))
+						}
+					case "disabled":
+						fmt.Printf("     ❌ 授权失效: %s\n", truncate(a.DisabledReason, 100))
+						fmt.Printf("     ⚠️ 请重新执行: workbuddy-gateway login -auth %s\n", a.Path)
+					}
+				}
+			} else {
+				fmt.Println("⚠️ 状态文件解析失败")
+			}
+		}
+
+		// 最近日志
+		if cfg.JournalService != "" {
+			if lines, err := journalLines(cfg.JournalService, logN); err == nil && len(lines) > 0 {
+				fmt.Printf("\n📜 最近日志 (journalctl -u %s):\n", cfg.JournalService)
+				for _, l := range lines {
+					fmt.Println("  " + l)
+				}
+			}
+		} else if cfg.LogFile != "" {
+			if lines, err := tailLines(cfg.LogFile, logN); err == nil && len(lines) > 0 {
+				fmt.Printf("\n📜 最近日志 (%s):\n", cfg.LogFile)
+				for _, l := range lines {
+					fmt.Println("  " + l)
+				}
+			}
+		}
+
+		fmt.Println("---------------------------------------------------------------")
+		time.Sleep(interval)
+	}
+}
+
 func runLogin() {
 	fmt.Println("================ WorkBuddy 扫码登录 ================")
 	fmt.Println("正在生成登录凭据与二维码...")
@@ -991,6 +1270,9 @@ func runServe() {
 
 	// 启动后台自动刷新协程
 	go backgroundTokenRefresher()
+
+	// 启动状态快照协程（monitor 命令实时读取展示）
+	go statusSnapshotLoop()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", handleChatCompletions)

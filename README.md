@@ -136,6 +136,48 @@ workbuddy-gateway status   # 该账号恢复为 ✅ 可用
 - 只有一个账号时，请求始终使用该账号，429 冷却逻辑同样生效（冷却期间请求将返回 429 提示）；
 - 账号之间使用独立的串行锁：同一账号请求严格排队，不同账号可并行，兼顾风控与吞吐。
 
+## 前台实时监控 (monitor)
+
+网关以 systemd / 后台方式运行时，可用 **`monitor` 命令在前台实时查看所有账号的最新状态与最近日志**（Ctrl+C 退出）：
+
+```bash
+# 基本用法：每 3 秒刷新展示账号池状态（可用/冷却/失效 + Token 有效期）
+cd /opt/workbuddy-gateway        # 必须与 serve 同一工作目录（读取 workbuddy-status.json）
+workbuddy-gateway monitor
+
+# 自定义刷新间隔（秒）
+workbuddy-gateway monitor -interval 2
+
+# 同时展示 systemd 服务最近日志（Linux）
+workbuddy-gateway monitor -journal workbuddy-gateway
+
+# 或展示指定日志文件最近内容
+workbuddy-gateway monitor -logfile /var/log/workbuddy-gateway.log
+
+# 控制每次展示的日志行数
+workbuddy-gateway monitor -journal workbuddy-gateway -lines 8
+```
+
+展示内容（实时刷新）：
+
+```text
+================ WorkBuddy 实时监控 ================
+按 Ctrl+C 退出 | 状态文件: workbuddy-status.json
+---------------------------------------------------------------
+🕐 更新时间: 2026-09-04 09:35:12
+📊 账号池: 共 2 个 | ✅ 可用 1 | 🔒 冷却 1 | ❌ 失效 0
+  #1 workbuddy.json (Abandon)
+     ✅ 可用 | Token 有效期至: 09-10 20:43
+  #2 workbuddy2.json (啊水)
+     🔒 冷却中 至 09-05 01:57 (剩余 16h)
+     原因: 您的使用量已超出频率限制...
+📜 最近日志 (journalctl -u workbuddy-gateway):
+  9月 04 09:34:31 ... [Cooldown] 账号 workbuddy2.json 触发频率限制...
+---------------------------------------------------------------
+```
+
+> 原理：`serve` 后台每 3 秒（及状态变化时）将账号池实时状态原子写入同目录 `workbuddy-status.json`，`monitor` 前台读取该文件并周期刷新展示；日志通过 `journalctl` 或日志文件补充展示。
+
 ## 客户端接入
 
 网关启动后服务地址为 `http://127.0.0.1:8317/v1`。
@@ -316,8 +358,9 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 ## 命令行速查
 
 ```
-命令:  serve | login | status | refresh | version | help
-选项:  -addr <ip> · -port <port> · -auth <path> · -api-key <key> · -proxy <url> · -verbose
+命令:  serve | login | status | refresh | monitor | version | help
+选项:  -addr <ip> · -port <port> · -auth <path> · -auth-dir <dir> · -api-key <key> · -proxy <url> · -verbose
+monitor: -interval <sec> · -journal <svc> · -logfile <path> · -lines <n>
 ```
 
 ## 从源码构建
