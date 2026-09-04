@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	version       = "1.4.0"
+	version       = "1.4.1"
 	upstreamBase  = "https://copilot.tencent.com"
 	clientUA      = "CLI/2.143.1 CodeBuddy/2.143.1"
 	originReferer = "https://www.codebuddy.cn"
@@ -778,6 +778,57 @@ func refreshTokenPayload(sa *StoredAuth) (int, error) {
 // CLI 子命令实现: login, status, refresh
 // -----------------------------------------------------------------------------
 
+// formatAccountStatus 生成单个账号的完整状态文本（status 命令与 serve 启动横幅共用）。
+// idx 从 1 开始的账号序号；now 为当前时间（用于冷却/过期判定）。
+func formatAccountStatus(acc *Account, idx int, now time.Time) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("\n--- 账号 #%d ---\n", idx))
+	sb.WriteString(fmt.Sprintf("凭据文件:     %s\n", acc.Path))
+
+	if acc.Disabled {
+		// 失效账号（Auth 可能为 nil：凭据文件已删除，信息来自失效标记）
+		nickname := acc.Nickname
+		uid := acc.UID
+		if acc.Auth != nil {
+			nickname = acc.Auth.Account.Nickname
+			uid = acc.Auth.Account.UID
+		}
+		sb.WriteString(fmt.Sprintf("用户昵称:     %s\n", ifEmpty(nickname, "(未知)")))
+		sb.WriteString(fmt.Sprintf("用户 UID:     %s\n", ifEmpty(uid, "(未知)")))
+		sb.WriteString("账号状态:     ❌ 授权失效（禁止调度）\n")
+		sb.WriteString(fmt.Sprintf("失效原因:     %s\n", truncate(acc.DisabledReason, 200)))
+		sb.WriteString(fmt.Sprintf("处理建议:     ⚠️ 凭据文件已删除，请重新执行: workbuddy-gateway login -auth %s\n", acc.Path))
+		return sb.String()
+	}
+
+	if acc.Auth == nil {
+		return sb.String()
+	}
+
+	expTime := time.Unix(acc.Auth.Auth.ExpiresAt, 0)
+	remaining := time.Until(expTime)
+	statusStr := "有效"
+	if remaining <= 0 {
+		statusStr = "已过期"
+	}
+
+	sb.WriteString(fmt.Sprintf("用户昵称:     %s\n", acc.Auth.Account.Nickname))
+	sb.WriteString(fmt.Sprintf("用户 UID:     %s\n", acc.Auth.Account.UID))
+	sb.WriteString(fmt.Sprintf("企业 ID:      %s\n", ifEmpty(acc.Auth.Account.EnterpriseID, "(个人账号)")))
+	sb.WriteString(fmt.Sprintf("认证域名:     %s\n", ifEmpty(acc.Auth.Auth.Domain, "www.codebuddy.cn")))
+	if acc.CooldownUntil.After(now) {
+		sb.WriteString(fmt.Sprintf("冷却状态:     🔒 冷却中 (解封: %s, 剩余 %v)\n",
+			acc.CooldownUntil.Format("2006-01-02 15:04:05"),
+			time.Until(acc.CooldownUntil).Round(time.Minute)))
+		sb.WriteString(fmt.Sprintf("冷却原因:     %s\n", truncate(acc.CooldownMsg, 120)))
+	} else {
+		sb.WriteString("冷却状态:     ✅ 可用\n")
+	}
+	sb.WriteString(fmt.Sprintf("Token 状态:   %s\n", statusStr))
+	sb.WriteString(fmt.Sprintf("过期时间:     %s (剩余 %v)\n", expTime.Format("2006-01-02 15:04:05"), remaining.Round(time.Minute)))
+	return sb.String()
+}
+
 func runStatus() {
 	if err := loadAccounts(); err != nil {
 		fmt.Printf("未找到有效凭据: %v\n请先执行: workbuddy-gateway login 扫码登录。\n", err)
@@ -791,50 +842,7 @@ func runStatus() {
 	fmt.Printf("账号总数: %d\n", len(accounts))
 	now := time.Now()
 	for i, acc := range accounts {
-		fmt.Printf("\n--- 账号 #%d ---\n", i+1)
-		fmt.Printf("凭据文件:     %s\n", acc.Path)
-
-		if acc.Disabled {
-			// 失效账号（Auth 可能为 nil：凭据文件已删除，信息来自失效标记）
-			nickname := acc.Nickname
-			uid := acc.UID
-			if acc.Auth != nil {
-				nickname = acc.Auth.Account.Nickname
-				uid = acc.Auth.Account.UID
-			}
-			fmt.Printf("用户昵称:     %s\n", ifEmpty(nickname, "(未知)"))
-			fmt.Printf("用户 UID:     %s\n", ifEmpty(uid, "(未知)"))
-			fmt.Printf("账号状态:     ❌ 授权失效（禁止调度）\n")
-			fmt.Printf("失效原因:     %s\n", truncate(acc.DisabledReason, 200))
-			fmt.Printf("处理建议:     ⚠️ 凭据文件已删除，请重新执行: workbuddy-gateway login -auth %s\n", acc.Path)
-			continue
-		}
-
-		if acc.Auth == nil {
-			continue
-		}
-
-		expTime := time.Unix(acc.Auth.Auth.ExpiresAt, 0)
-		remaining := time.Until(expTime)
-		statusStr := "有效"
-		if remaining <= 0 {
-			statusStr = "已过期"
-		}
-
-		fmt.Printf("用户昵称:     %s\n", acc.Auth.Account.Nickname)
-		fmt.Printf("用户 UID:     %s\n", acc.Auth.Account.UID)
-		fmt.Printf("企业 ID:      %s\n", ifEmpty(acc.Auth.Account.EnterpriseID, "(个人账号)"))
-		fmt.Printf("认证域名:     %s\n", ifEmpty(acc.Auth.Auth.Domain, "www.codebuddy.cn"))
-		if acc.CooldownUntil.After(now) {
-			fmt.Printf("冷却状态:     🔒 冷却中 (解封: %s, 剩余 %v)\n",
-				acc.CooldownUntil.Format("2006-01-02 15:04:05"),
-				time.Until(acc.CooldownUntil).Round(time.Minute))
-			fmt.Printf("冷却原因:     %s\n", truncate(acc.CooldownMsg, 120))
-		} else {
-			fmt.Printf("冷却状态:     ✅ 可用\n")
-		}
-		fmt.Printf("Token 状态:   %s\n", statusStr)
-		fmt.Printf("过期时间:     %s (剩余 %v)\n", expTime.Format("2006-01-02 15:04:05"), remaining.Round(time.Minute))
+		fmt.Print(formatAccountStatus(acc, i+1, now))
 	}
 	fmt.Println("\n=======================================================")
 }
@@ -972,28 +980,13 @@ func runServe() {
 		fmt.Printf("警告: 未检测到有效凭据 (%v)。\n请先执行: workbuddy-gateway login 扫码登录，或确保凭据文件存在。\n\n", err)
 	} else {
 		accountMu.Lock()
-		accCount := len(accounts)
-		activeCount := 0
-		disabledCount := 0
 		for _, acc := range accounts {
 			if acc.Disabled || acc.Auth == nil {
-				disabledCount++
 				continue
 			}
-			activeCount++
 			_ = ensureValidTokenFor(acc)
 		}
 		accountMu.Unlock()
-		fmt.Printf("已就绪账号池: %d 个账号 (有效 %d, 失效 %d)\n", accCount, activeCount, disabledCount)
-		for i, acc := range accounts {
-			if acc.Disabled || acc.Auth == nil {
-				fmt.Printf("  #%d ❌ %s (授权失效，凭据文件已删除，请重新登录)\n", i+1, acc.Path)
-				continue
-			}
-			fmt.Printf("  #%d ✅ %s (UID: %s, 有效期至: %s)\n",
-				i+1, acc.Auth.Account.Nickname, acc.Auth.Account.UID,
-				time.Unix(acc.Auth.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
-		}
 	}
 
 	// 启动后台自动刷新协程
@@ -1030,6 +1023,30 @@ func runServe() {
 	if cfg.ProxyURL != "" {
 		fmt.Printf("   上游出口代理:  %s\n", cfg.ProxyURL)
 	}
+
+	// 启动时展示所有账号状态（与 status 命令一致）
+	accountMu.Lock()
+	accCount := len(accounts)
+	activeCount := 0
+	disabledCount := 0
+	now := time.Now()
+	for _, acc := range accounts {
+		if acc.Disabled || acc.Auth == nil {
+			disabledCount++
+		} else {
+			activeCount++
+		}
+	}
+	fmt.Printf("   账号池:        %d 个账号 (有效 %d, 失效 %d)\n", accCount, activeCount, disabledCount)
+	if accCount > 0 {
+		fmt.Println("   ----------------------------------------------------------")
+		for i, acc := range accounts {
+			fmt.Print(formatAccountStatus(acc, i+1, now))
+		}
+		fmt.Println("   ----------------------------------------------------------")
+	}
+	accountMu.Unlock()
+
 	fmt.Println("================================================================")
 	fmt.Println("等待客户端请求中 (按 Ctrl+C 安全停止)...")
 
