@@ -29,6 +29,9 @@
 # Linux / macOS
 ./workbuddy-gateway-linux-amd64 login
 ./workbuddy-gateway-darwin-arm64 login
+
+#指定保存凭据到某个目录（多账号模式下建议使用）
+workbuddy-gateway login -auth /opt/workbuddy-gateway/workbuddy001.json
 ```
 
 终端将打印 ASCII 二维码与浏览器直达链接，扫码后凭据自动保存到当前目录 `workbuddy.json`（请勿提交到代码仓库）。
