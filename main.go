@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	version       = "1.4.1"
+	version       = "1.4.2"
 	upstreamBase  = "https://copilot.tencent.com"
 	clientUA      = "CLI/2.143.1 CodeBuddy/2.143.1"
 	originReferer = "https://www.codebuddy.cn"
@@ -1044,6 +1044,16 @@ func runServe() {
 			fmt.Print(formatAccountStatus(acc, i+1, now))
 		}
 		fmt.Println("   ----------------------------------------------------------")
+	}
+	// 末尾汇总：加载到的凭据文件清单（即使上方日志被截断也能确认）
+	fileList := make([]string, 0, len(accounts))
+	for _, acc := range accounts {
+		fileList = append(fileList, acc.Path)
+	}
+	if len(fileList) > 0 {
+		fmt.Printf("   ✅ 已加载凭据文件 (%d): %s\n", len(fileList), strings.Join(fileList, ", "))
+	} else {
+		fmt.Println("   ⚠️ 未加载到任何凭据文件，请先执行 login 命令扫码登录")
 	}
 	accountMu.Unlock()
 
