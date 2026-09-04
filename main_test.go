@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -28,7 +29,99 @@ func TestParseResetTimeInvalid(t *testing.T) {
 	}
 }
 
-// 验证限流识别（429 状态码 / code 6004 / 频率限制关键词）
+// 验证国际站英文限流消息的重置时间解析（通用兜底正则）
+func TestParseResetTimeEnglish(t *testing.T) {
+	cases := []string{
+		`{"code":6004,"msg":"Your usage has exceeded the rate limit. It will reset at 2026-09-05 01:57:00 UTC+8."}`,
+		`upstream 429: rate limit exceeded, reset at 2026-09-05 01:57:00`,
+		`{"msg":"quota exceeded, will reset on 2026-09-05T01:57:00 UTC+8"}`,
+	}
+	want := time.Date(2026, 9, 5, 1, 57, 0, 0, time.FixedZone("UTC+8", 8*3600))
+	for _, msg := range cases {
+		got, ok := parseResetTime(msg)
+		if !ok {
+			t.Fatalf("parseResetTime(%q) should succeed", msg)
+		}
+		if !got.Equal(want) {
+			t.Fatalf("parseResetTime(%q) = %v, want %v", msg, got, want)
+		}
+	}
+}
+
+// 验证站点 Profile 选择：空值/未知回退国内站，intl 系列值命中国际站
+func TestProfileForEdition(t *testing.T) {
+	cases := []struct {
+		edition string
+		wantKey string
+	}{
+		{"", "cn"},
+		{"cn", "cn"},
+		{"unknown", "cn"},
+		{"intl", "intl"},
+		{"INTL", "intl"},
+		{" workbuddy.ai ", "intl"},
+		{"international", "intl"},
+	}
+	for _, c := range cases {
+		if got := profileForEdition(c.edition).Key; got != c.wantKey {
+			t.Errorf("profileForEdition(%q).Key = %s, want %s", c.edition, got, c.wantKey)
+		}
+	}
+	if p := profileForEdition("intl"); p.Base != "https://www.workbuddy.ai" || p.Origin != "https://www.workbuddy.ai" {
+		t.Errorf("intl profile base/origin unexpected: %+v", p)
+	}
+	if p := profileForEdition("cn"); p.Base != "https://copilot.tencent.com" || p.Platform != "VSCode" {
+		t.Errorf("cn profile base/platform unexpected: %+v", p)
+	}
+}
+
+// 验证各站点上游 URL 构建与旧版常量完全一致（国内站回归）+ 国际站正确
+func TestUpstreamProfileURLs(t *testing.T) {
+	cn := profileForEdition("cn")
+	if got := cn.authStateURL(); got != "https://copilot.tencent.com/v2/plugin/auth/state?platform=VSCode" {
+		t.Errorf("cn authStateURL = %s", got)
+	}
+	if got := cn.chatURL(); got != "https://copilot.tencent.com/v2/chat/completions" {
+		t.Errorf("cn chatURL = %s", got)
+	}
+	if got := cn.tokenRefreshURL(); got != "https://copilot.tencent.com/v2/plugin/auth/token/refresh" {
+		t.Errorf("cn tokenRefreshURL = %s", got)
+	}
+
+	itl := profileForEdition("intl")
+	if got := itl.authStateURL(); got != "https://www.workbuddy.ai/v2/plugin/auth/state?platform=workbuddy-ai" {
+		t.Errorf("intl authStateURL = %s", got)
+	}
+	if got := itl.authTokenURL("abc-123"); got != "https://www.workbuddy.ai/v2/plugin/auth/token?state=abc-123" {
+		t.Errorf("intl authTokenURL = %s", got)
+	}
+	if got := itl.loginAcctURL("abc-123"); got != "https://www.workbuddy.ai/v2/plugin/login/account?state=abc-123" {
+		t.Errorf("intl loginAcctURL = %s", got)
+	}
+	if got := itl.chatURL(); got != "https://www.workbuddy.ai/v2/chat/completions" {
+		t.Errorf("intl chatURL = %s", got)
+	}
+}
+
+// 验证账号站点路由：优先取凭据内 edition；失效标记恢复（Auth 为 nil）时取账号上的 edition
+func TestAccountProfile(t *testing.T) {
+	acc := &Account{Auth: &StoredAuth{Edition: "intl"}}
+	if acc.Profile().Key != "intl" {
+		t.Fatalf("expected intl via Auth.Edition, got %s", acc.Profile().Key)
+	}
+	// 失效标记恢复场景：凭据文件已删除
+	acc2 := &Account{Edition: "intl"}
+	if acc2.Profile().Key != "intl" {
+		t.Fatalf("expected intl via Account.Edition, got %s", acc2.Profile().Key)
+	}
+	// 旧版凭据（无 edition 字段）回退国内站
+	acc3 := &Account{Auth: &StoredAuth{}}
+	if acc3.Profile().Key != "cn" {
+		t.Fatalf("expected cn fallback, got %s", acc3.Profile().Key)
+	}
+}
+
+// 验证限流识别（429 状态码 / code 6004 / 频率限制关键词，含中英文）
 func TestIsRateLimited(t *testing.T) {
 	cases := []struct {
 		status int
@@ -39,6 +132,10 @@ func TestIsRateLimited(t *testing.T) {
 		{400, `{"code":6004,"msg":"x"}`, true},
 		{400, "频率限制", true},
 		{400, "frequency limit", true},
+		{400, "rate limit exceeded", true},
+		{400, "Rate Limit Exceeded", true},
+		{400, "ratelimit", true},
+		{400, "Too Many Requests", true},
 		{400, "some other error", false},
 		{500, "{}", false},
 	}
@@ -290,8 +387,8 @@ func TestCollectConfiguredAuthPathsAutoDiscover(t *testing.T) {
 	if err := os.Chdir(dir); err != nil {
 		t.Fatal(err)
 	}
-	// 模拟目录内多个凭据文件 + 非凭据文件 + 失效标记
-	for _, name := range []string{"workbuddy.json", "workbuddy2.json", "workbuddy-3.json", "other.json", "workbuddy.json.disabled"} {
+	// 模拟目录内多个凭据文件 + 非凭据文件 + 失效标记 + 运行时状态快照（应被排除）
+	for _, name := range []string{"workbuddy.json", "workbuddy2.json", "workbuddy-3.json", "other.json", "workbuddy.json.disabled", "workbuddy-status.json"} {
 		if err := os.WriteFile(name, []byte(`{"auth":{"accessToken":"x"}}`), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -353,6 +450,89 @@ func TestCollectConfiguredAuthPathsAutoDiscoverFallback(t *testing.T) {
 		t.Fatalf("expected fallback to default workbuddy.json, got %v", paths)
 	}
 	t.Logf("fallback path: %v", paths)
+}
+
+// 验证凭据热加载：新增 / 更新 / 删除凭据文件均原地收敛账号池，无需重启
+func TestReloadAccounts(t *testing.T) {
+	dir := t.TempDir()
+
+	oldAuthFile := cfg.AuthFile
+	oldAuthDir := cfg.AuthDir
+	oldAuthExplicit := cfg.AuthExplicit
+	defer func() {
+		cfg.AuthFile = oldAuthFile
+		cfg.AuthDir = oldAuthDir
+		cfg.AuthExplicit = oldAuthExplicit
+		accountMu.Lock()
+		accounts = nil
+		rrIndex = 0
+		accountMu.Unlock()
+	}()
+	cfg.AuthFile = "workbuddy.json"
+	cfg.AuthDir = dir
+	cfg.AuthExplicit = false
+
+	accountMu.Lock()
+	accounts = nil
+	rrIndex = 0
+	accountMu.Unlock()
+
+	pa := filepath.Join(dir, "workbuddy-a.json")
+
+	// 1) 新增凭据文件 → 自动入池
+	if err := os.WriteFile(pa, []byte(`{"auth":{"accessToken":"a1"},"account":{"nickname":"A"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !reloadAccounts() {
+		t.Fatal("expected changed=true after adding new credential file")
+	}
+	if len(accounts) != 1 || accounts[0].Auth.Auth.AccessToken != "a1" {
+		t.Fatalf("expected 1 account with a1, got %+v", accounts)
+	}
+	t.Logf("hot-add works: %s joined the pool", accounts[0].Path)
+
+	// 2) 内容变更（含站点切换 cn -> intl）→ 原地替换凭据
+	if err := os.WriteFile(pa, []byte(`{"auth":{"accessToken":"a2-longer"},"account":{"nickname":"A2"},"edition":"intl"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !reloadAccounts() {
+		t.Fatal("expected changed=true after credential content change")
+	}
+	if len(accounts) != 1 || accounts[0].Auth.Auth.AccessToken != "a2-longer" {
+		t.Fatalf("expected hot-reloaded a2 credential, got %+v", accounts)
+	}
+	if accounts[0].Profile().Key != "intl" {
+		t.Fatalf("expected intl profile after reload, got %s", accounts[0].Profile().Key)
+	}
+	t.Logf("hot-update works: edition now %s", accounts[0].Profile().Key)
+
+	// 3) 失效幻影账号：文件被删但账号 Disabled → 保留（用于提示重新登录）
+	accountMu.Lock()
+	accounts[0].Disabled = true
+	accountMu.Unlock()
+	if err := os.Remove(pa); err != nil {
+		t.Fatal(err)
+	}
+	if reloadAccounts() {
+		t.Fatal("disabled phantom account should be kept, expected no change")
+	}
+	if len(accounts) != 1 || !accounts[0].Disabled {
+		t.Fatalf("disabled phantom should be kept, got %d accounts", len(accounts))
+	}
+	t.Log("disabled phantom kept after file deletion")
+
+	// 4) 非失效账号文件被删 → 移出账号池
+	accountMu.Lock()
+	accounts[0].Disabled = false
+	accounts[0].Auth = &StoredAuth{Auth: StoredTokens{AccessToken: "x"}}
+	accountMu.Unlock()
+	if !reloadAccounts() {
+		t.Fatal("expected changed=true after credential file deletion")
+	}
+	if len(accounts) != 0 {
+		t.Fatalf("expected empty pool after deletion, got %d", len(accounts))
+	}
+	t.Log("hot-remove works: pool emptied after file deletion")
 }
 
 // 验证 tailLines 读取文件末尾 N 行

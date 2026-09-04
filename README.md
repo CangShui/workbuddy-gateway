@@ -2,14 +2,23 @@
 <img width="797" height="231" alt="image" src="https://github.com/user-attachments/assets/b179efab-1caa-4bf6-a679-d6b6f299cbd6" />
 
 
-基于腾讯 **CodeBuddy / 混元（Hunyuan）** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。无 Web UI，仅通过命令行（CLI）完成扫码登录、凭据续期与服务控制。
+基于腾讯 **CodeBuddy / 混元（Hunyuan）** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。无 Web UI，仅通过命令行（CLI）完成登录、凭据续期与服务控制。
+
+**同时支持两个上游站点**（同一套协议，凭据按站点隔离，账号池可混挂轮询）：
+
+| 站点 | 上游 | 登录方式 | 登录命令 |
+|---|---|---|---|
+| 国内站 | `copilot.tencent.com` | 微信 / 企业微信扫码 | `login` |
+| 国际站 | `www.workbuddy.ai` | 浏览器内登录（邮箱 / 验证码 / SSO 等） | `login -intl` |
 
 ## 核心特性
 
+- **国内 / 国际双站反代**：国际站 `www.workbuddy.ai` 与国内站走同一套 `/v2/plugin/*` 协议，凭据文件通过 `edition` 字段区分站点，刷新 / 对话自动路由到各自上游。
 - **模型完全透传**：客户端（OpenAI SDK、Cursor、Claude Code、DSH 等）传什么 `model`（如 `hy4-preview`、`hy3-preview-agent`、`hy3`、`deepseek-v4-pro`、`glm-5.2`…），网关原样透传至腾讯上游，无白名单限制。
-- **纯 CLI 控制**：终端内嵌 ASCII 二维码，微信 / 企业微信扫码登录；`status` / `refresh` / `serve` 子命令完成全部管理。
-- **多账号池 + 轮询负载均衡**：支持同时挂载多个 CodeBuddy 账号（`-auth` 逗号分隔或 `-auth-dir` 目录），请求按轮询（round-robin）均匀分配到各账号，保持多账号额度使用一致。
-- **429 频率限制自动冷却**：任一账号触发上游频率限制（HTTP 429 / code 6004）时，自动解析消息中的重置时间（如 `将在 2026-09-04 07:48:15 UTC+8 重置`），将该账号屏蔽至重置时间；冷却期间自动改用其他账号代偿，冷却到期自动恢复。
+- **纯 CLI 控制**：终端内嵌 ASCII 二维码，国内站微信 / 企业微信扫码登录；`status` / `refresh` / `serve` 子命令完成全部管理。
+- **多账号池 + 轮询负载均衡**：支持同时挂载多个 CodeBuddy 账号（`-auth` 逗号分隔或 `-auth-dir` 目录），请求按轮询（round-robin）均匀分配到各账号，保持多账号额度使用一致；**国内站与国际站账号可混挂在同一池中**。
+- **凭据热加载（免重启）**：`serve` 运行期间自动扫描凭据来源（默认每 5 秒，`-reload-interval` 可调）：新增凭据文件自动入池、重新登录/手动更新凭据原地生效、删除凭据自动移出，全程无需重启服务。
+- **429 频率限制自动冷却**：任一账号触发上游频率限制（HTTP 429 / code 6004，中英文消息均可识别）时，自动解析消息中的重置时间（中文如 `将在 2026-09-04 07:48:15 UTC+8 重置`，英文如 `will reset at 2026-09-05 01:57:00 UTC+8`），将该账号屏蔽至重置时间；冷却期间自动改用其他账号代偿，冷却到期自动恢复。
 - **授权失效自动禁用**：账号授权过期、被撤销或令牌刷新失败（HTTP 401/403 / invalid token / 登录已过期）时，自动将该账号**禁止调度并删除凭据文件**，同时写入持久化失效标记；`status` / 启动日志会明确提示该账号失效原因与重新登录命令，重新 `login` 后自动恢复调度。
 - **后台自动续期**：运行期间每 5 分钟检查所有账号 Token，距过期不足 15 分钟自动刷新并持久化回各自凭据文件。
 - **OpenAI 兼容协议**：`POST /v1/chat/completions`（SSE 流式 + 非流式聚合）、`GET /v1/models`、`GET /health`。
@@ -38,6 +47,28 @@ workbuddy-gateway login -auth /opt/workbuddy-gateway/workbuddy001.json
 终端将打印 ASCII 二维码与浏览器直达链接，扫码后凭据自动保存到当前目录 `workbuddy.json`（请勿提交到代码仓库）。
 
 > 提示：建议在 **CodeBuddy 控制台（网页端）** 扫码登录获取更高权限评级的 Token；若使用 `login` 命令扫码，账号渠道可能受限（`azp=invite`）。
+
+### 1b. 登录国际站（workbuddy.ai）
+
+```bash
+# 登录国际站账号（保存到指定文件以便与国内站账号区分）
+workbuddy-gateway login -intl
+workbuddy-gateway login -intl -auth workbuddy-intl.json
+```
+
+国际站登录流程与国内站不同：网关生成登录链接后，**需要你在浏览器里完成登录**（支持邮箱、验证码、SSO 等方式），流程如下：
+
+1. 终端打印二维码与直达链接（手机扫码或电脑打开均可）；
+2. 在浏览器中完成登录，页面显示 **Login Successful** 即可（无需理会跳转 App 的提示）；
+3. 网关自动轮询拿到 Token 并保存到凭据文件（`edition: "intl"`），等待窗口 15 分钟。
+
+启动服务无需任何额外参数——凭据文件内已记录站点标识，`serve` / `refresh` 会自动路由到对应上游；**登录成功后新账号由凭据热加载自动加入运行中的账号池，无需重启服务**：
+
+```bash
+workbuddy-gateway serve    # 自动发现目录下所有 workbuddy*.json（含国际站账号，混挂轮询）
+```
+
+> 说明：国际站 `www.workbuddy.ai` 与国内站 `copilot.tencent.com` 是同一协议的两套部署（登录 platform 为 `workbuddy-ai`，等待授权时轮询返回 code 11217）。国际站账号是否可用各模型、额度与风控策略由腾讯国际站侧决定。
 
 ### 2. 查看凭据状态
 
@@ -123,6 +154,7 @@ workbuddy-gateway status
 # 输出示例：
 # --- 账号 #1 ---
 # 凭据文件:     workbuddy-2.json
+# 站点:         国内站 (copilot.tencent.com)
 # 用户昵称:     tester
 # 用户 UID:     uid-xxx
 # 账号状态:     ❌ 授权失效（禁止调度）
@@ -139,6 +171,22 @@ workbuddy-gateway status   # 该账号恢复为 ✅ 可用
 - 不传 `-auth` / `-auth-dir` 时，自动发现当前工作目录下所有 `workbuddy*.json`；目录中只有一个凭据文件时行为与旧版完全一致；
 - 只有一个账号时，请求始终使用该账号，429 冷却逻辑同样生效（冷却期间请求将返回 429 提示）；
 - 账号之间使用独立的串行锁：同一账号请求严格排队，不同账号可并行，兼顾风控与吞吐。
+
+### 凭据热加载（免重启增减账号）
+
+`serve` 运行期间默认每 5 秒扫描一次凭据来源（`-reload-interval` 可调，设为 `0` 关闭），自动完成：
+
+- **新增账号**：把新的 `workbuddy*.json` 放进凭据目录（或对运行中的网关执行 `login -auth 新文件.json`），几秒内自动加入轮询池；
+- **重新登录 / 更新凭据**：对已有凭据文件重新 `login` 后，网关原地替换凭据并自动恢复调度（含曾因授权失效被禁用的账号）；
+- **删除账号**：删除凭据文件即自动移出轮询池（已写入失效标记的账号保留提示，重新登录后自动恢复）。
+
+日志示例：
+
+```text
+[Reload] 发现新账号凭据 workbuddy4.json（国际站），已自动加入账号池
+[Reload] 账号 workbuddy2.json 重新登录成功，已自动恢复调度
+[Reload] 凭据文件 workbuddy3.json 已删除，已移出账号池
+```
 
 ## 前台实时监控 (monitor)
 
@@ -288,7 +336,7 @@ sudo /opt/workbuddy-gateway/workbuddy-gateway login -auth /opt/workbuddy-gateway
 
 > 💡 **多账号自动发现**：服务通过 `WorkingDirectory` 固定在 `/opt/workbuddy-gateway`，
 > 无需修改 ExecStart——把多个凭据文件（`workbuddy.json`、`workbuddy2.json`…）放进该目录，
-> 重启服务即自动加载全部账号组成轮询池。确认方式：
+> 即可自动组成轮询池；凭据热加载会让新增/更新/删除的凭据文件免重启生效。确认方式：
 > ```bash
 > sudo journalctl -u workbuddy-gateway | grep 账号池
 > # 输出示例: 已就绪账号池: 2 个账号 (有效 2, 失效 0)
@@ -363,7 +411,8 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 
 ```
 命令:  serve | login | status | refresh | monitor | version | help
-选项:  -addr <ip> · -port <port> · -auth <path> · -auth-dir <dir> · -api-key <key> · -proxy <url> · -verbose
+选项:  -addr <ip> · -port <port> · -auth <path> · -auth-dir <dir> · -intl · -reload-interval <sec> · -api-key <key> · -proxy <url> · -verbose
+       （-intl 仅 login 生效：登录国际站 www.workbuddy.ai；-reload-interval 默认 5，0 关闭热加载）
 monitor: -interval <sec> · -journal <svc> · -logfile <path> · -lines <n>
 ```
 
@@ -379,4 +428,4 @@ CGO_ENABLED=0 go build -ldflags="-s -w" -o workbuddy-gateway .
 
 ## 免责声明
 
-本项目仅用于个人学习与技术研究。腾讯 CodeBuddy 的接口协议与风控策略可能随时变化；请遵守腾讯服务条款，自行承担使用风险。本仓库不包含任何官方未公开的密钥或凭据。
+本项目仅用于个人学习与技术研究。腾讯 CodeBuddy（含国内站与国际站 workbuddy.ai）的接口协议与风控策略可能随时变化；请遵守腾讯服务条款，自行承担使用风险。本仓库不包含任何官方未公开的密钥或凭据。

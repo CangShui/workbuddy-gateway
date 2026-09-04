@@ -1,19 +1,16 @@
 # 凭据与敏感数据（切勿提交！）
-workbuddy.json
+workbuddy*.json
 workbuddy-console.json
-dist/workbuddy.json
-dist/*.json
 last-*.json
 *.json.bak
 *.json.disabled
+*.disabled
 .workbuddy-*.json
-workbuddy-status.json
 
 # 本地编译产物
+workbuddy-gateway
 workbuddy-gateway.exe
-dist/*.exe
-dist/workbuddy-gateway-linux-*
-dist/workbuddy-gateway-darwin-*
+dist/
 
 # 日志与临时文件
 *.log

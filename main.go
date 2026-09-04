@@ -31,22 +31,79 @@ import (
 )
 
 const (
-	version       = "1.5.0"
-	upstreamBase  = "https://copilot.tencent.com"
-	clientUA      = "CLI/2.143.1 CodeBuddy/2.143.1"
-	originReferer = "https://www.codebuddy.cn"
-
-	endpointAuthState    = upstreamBase + "/v2/plugin/auth/state?platform=VSCode"
-	endpointLoginAcct    = upstreamBase + "/v2/plugin/login/account?state="
-	endpointAuthToken    = upstreamBase + "/v2/plugin/auth/token?state="
-	endpointTokenRefresh = upstreamBase + "/v2/plugin/auth/token/refresh"
-	endpointChat         = upstreamBase + "/v2/chat/completions"
-
-	loginTTL = 5 * time.Minute
+	version = "1.7.0"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
 )
+
+// -----------------------------------------------------------------------------
+// 上游站点 Profile（国内站 / 国际站）
+//
+// 国际站 www.workbuddy.ai 与国内站 copilot.tencent.com 走同一套 /v2/plugin/* 协议
+// （实测：auth/state、auth/token、login/account、auth/token/refresh、chat/completions
+// 的路径与响应包络完全一致），差异仅在：
+//   - 上游域名与 Web Origin（国际站位于腾讯 EdgeOne 国际 CDN）
+//   - 登录 platform 参数（workbuddy-ai 而非 VSCode），登录在浏览器内完成（邮箱/验证码/SSO）
+//   - 等待授权期间 auth/token 轮询返回 code 11217 (login ing...)
+// 每个账号凭据文件通过 edition 字段记录所属站点，账号池支持国内/国际混挂轮询。
+// -----------------------------------------------------------------------------
+
+type upstreamProfile struct {
+	Key       string        // 存储于凭据文件 edition 字段的站点标识
+	Label     string        // 控制台展示名
+	Base      string        // 上游 API 基础地址
+	Origin    string        // Origin/Referer 伪装来源（各站 Web 控制台）
+	Platform  string        // auth/state 的 platform 参数
+	ClientUA  string        // User-Agent
+	ClientID  string        // X-Client-ID
+	ClientVer string        // X-Client-Version
+	Product   string        // X-Product
+	LoginTTL  time.Duration // login 命令等待授权完成的超时
+}
+
+var (
+	profileCN = upstreamProfile{
+		Key: "cn", Label: "国内站",
+		Base: "https://copilot.tencent.com", Origin: "https://www.codebuddy.cn",
+		Platform: "VSCode", ClientUA: "CLI/2.143.1 CodeBuddy/2.143.1",
+		ClientID: "codebuddy-cli", ClientVer: "2.143.1", Product: "SaaS",
+		LoginTTL: 5 * time.Minute,
+	}
+	profileINTL = upstreamProfile{
+		Key: "intl", Label: "国际站",
+		Base: "https://www.workbuddy.ai", Origin: "https://www.workbuddy.ai",
+		Platform: "workbuddy-ai", ClientUA: "CLI/2.143.1 CodeBuddy/2.143.1",
+		ClientID: "codebuddy-cli", ClientVer: "2.143.1", Product: "SaaS",
+		LoginTTL: 15 * time.Minute, // 浏览器内登录（邮箱/验证码/SSO）比扫码慢，放宽超时
+	}
+)
+
+// profileForEdition 根据凭据文件中的 edition 标识返回上游站点参数；空值/未知值回退国内站。
+func profileForEdition(edition string) *upstreamProfile {
+	switch strings.ToLower(strings.TrimSpace(edition)) {
+	case "intl", "international", "global", "workbuddy.ai":
+		return &profileINTL
+	default:
+		return &profileCN
+	}
+}
+
+func (p *upstreamProfile) authStateURL() string {
+	return p.Base + "/v2/plugin/auth/state?platform=" + url.QueryEscape(p.Platform)
+}
+
+func (p *upstreamProfile) loginAcctURL(state string) string {
+	return p.Base + "/v2/plugin/login/account?state=" + url.QueryEscape(state)
+}
+
+func (p *upstreamProfile) authTokenURL(state string) string {
+	return p.Base + "/v2/plugin/auth/token?state=" + url.QueryEscape(state)
+}
+
+func (p *upstreamProfile) tokenRefreshURL() string { return p.Base + "/v2/plugin/auth/token/refresh" }
+
+func (p *upstreamProfile) chatURL() string { return p.Base + "/v2/chat/completions" }
 
 // -----------------------------------------------------------------------------
 // 数据结构定义
@@ -55,6 +112,7 @@ const (
 type StoredAuth struct {
 	Auth    StoredTokens  `json:"auth"`
 	Account StoredAccount `json:"account"`
+	Edition string        `json:"edition,omitempty"` // 站点标识：cn（国内站，默认）| intl（国际站 www.workbuddy.ai）
 }
 
 type StoredTokens struct {
@@ -105,9 +163,11 @@ type Config struct {
 	AuthFile        string
 	AuthDir         string
 	AuthExplicit    bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
+	LoginIntl       bool  // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
 	APIKey          string
 	ProxyURL        string
 	Verbose         bool
+	ReloadInterval  int    // 账号池热加载扫描间隔（秒），0 关闭
 	MonitorInterval int    // monitor 状态刷新间隔（秒）
 	LogFile         string // monitor 附加展示的日志文件路径
 	JournalService  string // monitor 附加展示的 systemd 服务名（journalctl -u）
@@ -125,7 +185,17 @@ type Account struct {
 	DisabledReason string      // 失效原因，用于控制台展示
 	Nickname       string      // 失效标记持久化字段：昵称（Auth 为 nil 时使用）
 	UID            string      // 失效标记持久化字段：UID
+	Edition        string      // 站点标识（cn/intl）：失效标记恢复时 Auth 为 nil 也可见
+	fingerprint    string      // 凭据文件变更指纹（mtime+size，凭据热加载用）
 	lock           sync.Mutex  // 单账号串行锁（防止同账号并发触发 11128）
+}
+
+// Profile 返回该账号对应的上游站点参数（国内站/国际站）。
+func (acc *Account) Profile() *upstreamProfile {
+	if acc.Auth != nil {
+		return profileForEdition(acc.Auth.Edition)
+	}
+	return profileForEdition(acc.Edition)
 }
 
 // disabledMarker 是授权失效账号的持久化标记（凭据文件删除后用于控制台提示重新登录）。
@@ -135,6 +205,7 @@ type disabledMarker struct {
 	DisabledAt int64  `json:"disabledAt"`
 	Nickname   string `json:"nickname,omitempty"`
 	UID        string `json:"uid,omitempty"`
+	Edition    string `json:"edition,omitempty"` // 站点标识（cn/intl），用于控制台展示
 }
 
 // markerPath 返回与凭据文件同目录的失效标记文件路径。
@@ -185,7 +256,9 @@ func main() {
 	fs.StringVar(&cfg.APIKey, "api-key", "", "可选：访问网关所需的 API Key (客户端 Bearer 校验)")
 	fs.StringVar(&cfg.ProxyURL, "proxy", "", "可选：上游请求代理 (如 http://127.0.0.1:7890)")
 	fs.BoolVar(&cfg.Verbose, "verbose", false, "输出详细调试日志")
+	fs.BoolVar(&cfg.LoginIntl, "intl", false, "login 专用：登录国际站 (www.workbuddy.ai，浏览器内完成登录)；默认登录国内站")
 	fs.IntVar(&cfg.MonitorInterval, "interval", 3, "monitor 状态刷新间隔（秒）")
+	fs.IntVar(&cfg.ReloadInterval, "reload-interval", 5, "账号池热加载扫描间隔（秒），0 关闭：运行期自动发现新增/更新/删除的凭据文件，免重启")
 	fs.StringVar(&cfg.LogFile, "logfile", "", "monitor 附加跟随的日志文件路径（如 -logfile /var/log/workbuddy-gateway.log）")
 	fs.StringVar(&cfg.JournalService, "journal", "", "monitor 附加跟随的 systemd 服务名（Linux 下用 journalctl -u <服务> -f 跟随）")
 	fs.IntVar(&cfg.LogLines, "lines", 5, "monitor 每次刷新展示的最近日志行数")
@@ -234,8 +307,8 @@ func printHelp() {
 
 命令:
   serve       启动本地网关 (默认操作)
-  login       微信/企业微信扫码登录，获取/更新凭据
-  status      查看账号池状态（含冷却状态与过期时间）
+  login       登录并获取/更新凭据：国内站微信扫码；-intl 登录国际站 (浏览器内完成)
+  status      查看账号池状态（含站点、冷却状态与过期时间）
   refresh     手动立即刷新所有账号访问令牌 (Access Token)
   monitor     前台实时监控：周期刷新展示账号状态 + 最近日志 (Ctrl+C 退出)
   version     查看版本信息
@@ -247,6 +320,10 @@ func printHelp() {
   -auth <path>      凭据文件路径；支持逗号分隔多个文件实现多账号
                     (默认: 自动发现当前目录下所有 workbuddy*.json)
   -auth-dir <dir>   凭据目录：自动加载目录下所有 workbuddy*.json 作为账号池
+  -intl             login 专用：登录国际站 www.workbuddy.ai（浏览器内完成登录）
+  -reload-interval <sec>
+                    账号池热加载扫描间隔（默认 5 秒，0 关闭）：运行期自动发现
+                    新增/更新/删除的凭据文件，免重启生效
   -api-key <key>    设置后，调用网关必须携带 Bearer <key> 鉴权
   -proxy <url>      设置上游转发代理 (例如 http://127.0.0.1:7890 或 socks5://...)
   -verbose          输出详细调试日志 (请求/响应体)
@@ -261,18 +338,26 @@ monitor 选项:
   # 登录第二个账号（保存到不同文件）
   workbuddy-gateway login -auth workbuddy2.json
 
+  # 登录国际站账号（www.workbuddy.ai，浏览器内完成登录）
+  workbuddy-gateway login -intl -auth workbuddy-intl.json
+
   # 自动发现：把多个凭据文件放进工作目录即可自动多账号（无需任何参数）
   workbuddy-gateway serve        # 自动加载 ./workbuddy*.json
 
-  # 启动时指定多个凭据文件（轮询 + 429 自动冷却代偿）
+  # 启动时指定多个凭据文件（轮询 + 429 自动冷却代偿；国内/国际可混挂）
   workbuddy-gateway serve -auth workbuddy.json,workbuddy2.json
 
   # 或使用目录模式：目录内所有 workbuddy*.json 自动组成账号池
   workbuddy-gateway serve -auth-dir ./auths
 
+  # 运行期新增/更新/删除凭据文件会自动热加载（默认每 5 秒），无需重启 serve
+
 示例:
-  # 首次使用扫码登录
+  # 首次使用扫码登录（国内站）
   workbuddy-gateway login
+
+  # 登录国际站（www.workbuddy.ai）
+  workbuddy-gateway login -intl
 
   # 启动本地网关 (监听 127.0.0.1:8317)
   workbuddy-gateway serve
@@ -387,6 +472,15 @@ func loadAccountFile(path string) (*StoredAuth, error) {
 	return &sa, nil
 }
 
+// isCredentialFile 判断自动发现模式下文件名是否为凭据文件。
+// 排除运行时产物：workbuddy-status.json（monitor 状态快照）等。
+func isCredentialFile(name string) bool {
+	if !strings.HasPrefix(name, "workbuddy") || !strings.HasSuffix(name, ".json") {
+		return false
+	}
+	return name != statusSnapshotFile
+}
+
 // collectConfiguredAuthPaths 解析应加载的凭据路径列表：
 //  1) -auth-dir 指定目录 → 目录下所有 workbuddy*.json
 //  2) 显式 -auth → 逗号分隔的凭据文件列表（保持用户顺序）
@@ -399,13 +493,10 @@ func collectConfiguredAuthPaths() []string {
 		entries, err := os.ReadDir(cfg.AuthDir)
 		if err == nil {
 			for _, e := range entries {
-				if e.IsDir() {
+				if e.IsDir() || !isCredentialFile(e.Name()) {
 					continue
 				}
-				name := e.Name()
-				if strings.HasPrefix(name, "workbuddy") && strings.HasSuffix(name, ".json") {
-					paths = append(paths, filepath.Join(cfg.AuthDir, name))
-				}
+				paths = append(paths, filepath.Join(cfg.AuthDir, e.Name()))
 			}
 			sort.Strings(paths)
 		}
@@ -426,13 +517,10 @@ func collectConfiguredAuthPaths() []string {
 	entries, err := os.ReadDir(".")
 	if err == nil {
 		for _, e := range entries {
-			if e.IsDir() {
+			if e.IsDir() || !isCredentialFile(e.Name()) {
 				continue
 			}
-			name := e.Name()
-			if strings.HasPrefix(name, "workbuddy") && strings.HasSuffix(name, ".json") {
-				paths = append(paths, name)
-			}
+			paths = append(paths, e.Name())
 		}
 		sort.Strings(paths)
 	}
@@ -459,7 +547,11 @@ func loadAccounts() error {
 			log.Printf("[Auth] 跳过无效凭据文件 %s: %v", p, err)
 			continue
 		}
-		accounts = append(accounts, &Account{Path: p, Auth: sa})
+		fp := ""
+		if st, statErr := os.Stat(p); statErr == nil {
+			fp = accountFingerprint(st)
+		}
+		accounts = append(accounts, &Account{Path: p, Auth: sa, Edition: profileForEdition(sa.Edition).Key, fingerprint: fp})
 	}
 
 	// 恢复持久化的失效账号标记（凭据文件已删除，仅供控制台提示重新登录）
@@ -469,6 +561,124 @@ func loadAccounts() error {
 		return fmt.Errorf("未找到有效凭据，请先执行 login 命令扫码登录")
 	}
 	return nil
+}
+
+// -----------------------------------------------------------------------------
+// 凭据热加载：serve 运行期间自动发现凭据文件的新增/更新/删除，免重启收敛账号池
+// -----------------------------------------------------------------------------
+
+// accountFingerprint 基于文件 mtime+size 生成凭据文件变更指纹。
+func accountFingerprint(st os.FileInfo) string {
+	return fmt.Sprintf("%d:%d", st.ModTime().UnixNano(), st.Size())
+}
+
+// reloadAccounts 将磁盘上的凭据文件与内存账号池原地收敛（热加载）：
+//   - 新增凭据文件 → 自动加入账号池；
+//   - 凭据内容变化（重新登录/手动更新）→ 原地替换凭据、清除冷却/失效状态并恢复调度；
+//   - 凭据文件被删除 → 移出账号池（已写入失效标记的幻影账号保留，用于提示重新登录）。
+//
+// 返回本次是否发生变更。调用方需自行处理 accountMu 之外的快照刷新。
+func reloadAccounts() bool {
+	accountMu.Lock()
+	defer accountMu.Unlock()
+
+	changed := false
+	seen := make(map[string]bool)
+
+	for _, p := range collectConfiguredAuthPaths() {
+		st, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		seen[p] = true
+		fp := accountFingerprint(st)
+
+		var existing *Account
+		for _, acc := range accounts {
+			if acc.Path == p {
+				existing = acc
+				break
+			}
+		}
+
+		if existing == nil {
+			// 新凭据文件：加载并加入账号池（文件可能正在写入，失败则下轮重试）
+			sa, err := loadAccountFile(p)
+			if err != nil {
+				log.Printf("[Reload] 凭据文件 %s 暂不可解析，下轮重试: %v", p, err)
+				continue
+			}
+			accounts = append(accounts, &Account{
+				Path:        p,
+				Auth:        sa,
+				Edition:     profileForEdition(sa.Edition).Key,
+				fingerprint: fp,
+			})
+			log.Printf("[Reload] 发现新账号凭据 %s（%s），已自动加入账号池", p, profileForEdition(sa.Edition).Label)
+			changed = true
+			continue
+		}
+
+		if existing.fingerprint == fp {
+			continue // 未变化
+		}
+
+		// 内容变化：原地替换凭据（重新登录或手动更新）
+		sa, err := loadAccountFile(p)
+		if err != nil {
+			// 不更新指纹，下一轮重试（正常写入窗口极短，几乎必在下轮成功）
+			log.Printf("[Reload] 凭据文件 %s 变更但暂不可解析，保留旧凭据: %v", p, err)
+			continue
+		}
+		recovered := existing.Disabled
+		existing.Auth = sa
+		existing.Edition = profileForEdition(sa.Edition).Key
+		existing.Disabled = false
+		existing.DisabledReason = ""
+		existing.CooldownUntil = time.Time{}
+		existing.CooldownMsg = ""
+		existing.fingerprint = fp
+		clearDisabledMarker(p)
+		if recovered {
+			log.Printf("[Reload] 账号 %s 重新登录成功，已自动恢复调度", p)
+		} else {
+			log.Printf("[Reload] 账号 %s 凭据已更新（热加载，无需重启）", p)
+		}
+		changed = true
+	}
+
+	// 收敛：移除已删除的凭据（失效幻影账号保留）
+	kept := make([]*Account, 0, len(accounts))
+	for _, acc := range accounts {
+		if !seen[acc.Path] && !acc.Disabled {
+			log.Printf("[Reload] 凭据文件 %s 已删除，已移出账号池", acc.Path)
+			changed = true
+			continue
+		}
+		kept = append(kept, acc)
+	}
+	accounts = kept
+	if len(accounts) > 0 {
+		rrIndex %= len(accounts)
+	} else {
+		rrIndex = 0
+	}
+	return changed
+}
+
+// accountReloaderLoop serve 后台凭据热加载协程：周期扫描凭据变化并原地收敛账号池。
+func accountReloaderLoop() {
+	interval := time.Duration(cfg.ReloadInterval) * time.Second
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if reloadAccounts() {
+			writeStatusSnapshot() // 立即刷新 monitor 状态文件
+		}
+	}
 }
 
 // nextAccount 轮询选择下一个未处于冷却状态且未被禁用的账号。
@@ -534,11 +744,14 @@ func disableAccount(acc *Account, reason string) {
 	path := acc.Path
 	nickname := ""
 	uid := ""
+	edition := ""
 	if acc.Auth != nil {
 		nickname = acc.Auth.Account.Nickname
 		uid = acc.Auth.Account.UID
+		edition = profileForEdition(acc.Auth.Edition).Key
 		acc.Nickname = nickname
 		acc.UID = uid
+		acc.Edition = edition
 	}
 	accountMu.Unlock()
 
@@ -549,6 +762,7 @@ func disableAccount(acc *Account, reason string) {
 		DisabledAt: time.Now().Unix(),
 		Nickname:   nickname,
 		UID:        uid,
+		Edition:    edition,
 	}
 	if data, err := json.MarshalIndent(marker, "", "  "); err == nil {
 		if werr := os.WriteFile(markerPath(path), data, 0600); werr != nil {
@@ -635,6 +849,7 @@ func loadDisabledMarkers() {
 			DisabledReason: m.Reason,
 			Nickname:       m.Nickname,
 			UID:            m.UID,
+			Edition:        m.Edition,
 		})
 	}
 }
@@ -666,39 +881,56 @@ func isAuthFailure(statusCode int, body string) bool {
 
 var resetTimeRe = regexp.MustCompile(`将在\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s*(UTC[+-]\d+(?::\d{2})?)?`)
 
+// resetTimeGenericRe 兜底匹配任意「日期 + 时间(可选 UTC 偏移)」片段，
+// 用于国际站等英文限流消息（如 "will reset at 2026-09-05 01:57:00 UTC+8"）。
+var resetTimeGenericRe = regexp.MustCompile(`(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\s*(UTC[+-]\d+(?::\d{2})?))?`)
+
 // parseResetTime 从上游 429 错误消息中解析频率限制重置时间。
-// 示例: "您的使用量已超出频率限制，将在 2026-09-04 07:48:15 UTC+8 重置"
+// 国内站示例: "您的使用量已超出频率限制，将在 2026-09-04 07:48:15 UTC+8 重置"
+// 国际站示例: "Your usage has exceeded the rate limit. It will reset at 2026-09-05 01:57:00 UTC+8."
 func parseResetTime(s string) (time.Time, bool) {
 	m := resetTimeRe.FindStringSubmatch(s)
 	if m == nil {
+		m = resetTimeGenericRe.FindStringSubmatch(s)
+	}
+	if m == nil {
 		return time.Time{}, false
 	}
+	return parseDateTimeTZ(m[1], m[2], m[3])
+}
+
+// parseDateTimeTZ 按「日期 时间 (可选 UTC 偏移)」解析时间；未提供时区时默认按 UTC+8。
+func parseDateTimeTZ(date, clock, zone string) (time.Time, bool) {
 	offset := 8 * 3600 // 默认按 UTC+8 解析
-	if m[3] != "" {
-		zone := m[3]
-		zone = strings.TrimPrefix(zone, "UTC")
-		zone = strings.TrimPrefix(zone, "utc")
+	if zone != "" {
+		z := zone
+		z = strings.TrimPrefix(z, "UTC")
+		z = strings.TrimPrefix(z, "utc")
 		var h, mi int
-		if _, err := fmt.Sscanf(zone, "%d:%d", &h, &mi); err == nil {
+		if _, err := fmt.Sscanf(z, "%d:%d", &h, &mi); err == nil {
 			offset = h*3600 + mi*60
-		} else if _, err := fmt.Sscanf(zone, "%d", &h); err == nil {
+		} else if _, err := fmt.Sscanf(z, "%d", &h); err == nil {
 			offset = h * 3600
 		}
 	}
 	loc := time.FixedZone("UTC", offset)
-	t, err := time.ParseInLocation("2006-01-02 15:04:05", m[1]+" "+m[2], loc)
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", date+" "+clock, loc)
 	if err != nil {
 		return time.Time{}, false
 	}
 	return t, true
 }
 
-// isRateLimited 判断上游响应是否属于频率限制（429 或 code 6004 / 频率限制提示）。
+// isRateLimited 判断上游响应是否属于频率限制（429 或 code 6004 / 频率限制提示，含中英文）。
 func isRateLimited(statusCode int, body string) bool {
 	if statusCode == http.StatusTooManyRequests {
 		return true
 	}
 	if strings.Contains(body, `"code":6004`) || strings.Contains(body, "频率限制") || strings.Contains(body, "frequency limit") {
+		return true
+	}
+	low := strings.ToLower(body)
+	if strings.Contains(low, "rate limit") || strings.Contains(low, "ratelimit") || strings.Contains(low, "too many requests") {
 		return true
 	}
 	return false
@@ -766,10 +998,12 @@ func doRefreshTokenFor(acc *Account) error {
 }
 
 // refreshTokenPayload 调用上游刷新接口并更新内存中的令牌字段（不落盘）。
+// 按凭据文件中的 edition 路由到对应站点（国内站/国际站）的刷新接口。
 // 返回上游 HTTP 状态码（成功或失败时均为实际状态；网络错误为 0）。
 func refreshTokenPayload(sa *StoredAuth) (int, error) {
+	prof := profileForEdition(sa.Edition)
 	headers := func(r *http.Request) {
-		commonHeaders(r)
+		commonHeaders(r, prof)
 		r.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
 		if sa.Account.EnterpriseID != "" {
 			r.Header.Set("X-Enterprise-Id", sa.Account.EnterpriseID)
@@ -777,7 +1011,7 @@ func refreshTokenPayload(sa *StoredAuth) (int, error) {
 		r.Header.Set("X-Auth-Refresh-Source", "workbuddy")
 	}
 
-	data, status, err := doJSON(cfg.HttpClient, http.MethodPost, endpointTokenRefresh, headers, nil)
+	data, status, err := doJSON(cfg.HttpClient, http.MethodPost, prof.tokenRefreshURL(), headers, nil)
 	if err != nil {
 		return status, fmt.Errorf("上游刷新拒绝 (HTTP %d): %w", status, err)
 	}
@@ -809,6 +1043,8 @@ func formatAccountStatus(acc *Account, idx int, now time.Time) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("\n--- 账号 #%d ---\n", idx))
 	sb.WriteString(fmt.Sprintf("凭据文件:     %s\n", acc.Path))
+	prof := acc.Profile()
+	sb.WriteString(fmt.Sprintf("站点:         %s (%s)\n", prof.Label, strings.TrimPrefix(prof.Base, "https://")))
 
 	if acc.Disabled {
 		// 失效账号（Auth 可能为 nil：凭据文件已删除，信息来自失效标记）
@@ -911,6 +1147,7 @@ func runRefresh() {
 // accountSnapshot 是写入状态快照文件的单个账号状态。
 type accountSnapshot struct {
 	Path           string `json:"path"`
+	Edition        string `json:"edition,omitempty"` // 站点标识（cn/intl）
 	Nickname       string `json:"nickname"`
 	UID            string `json:"uid"`
 	State          string `json:"state"` // active | cooldown | disabled
@@ -933,7 +1170,7 @@ func writeStatusSnapshot() {
 	snap := statusSnapshot{UpdatedAt: time.Now().Unix()}
 	now := time.Now()
 	for _, acc := range accounts {
-		as := accountSnapshot{Path: acc.Path}
+		as := accountSnapshot{Path: acc.Path, Edition: acc.Profile().Key}
 		switch {
 		case acc.Disabled:
 			as.State = "disabled"
@@ -1114,7 +1351,7 @@ func runMonitor() {
 				fmt.Printf("📊 账号池: 共 %d 个 | ✅ 可用 %d | 🔒 冷却 %d | ❌ 失效 %d\n",
 					len(snap.Accounts), active, cooldown, disabled)
 				for i, a := range snap.Accounts {
-					fmt.Printf("  #%d %s (%s)\n", i+1, a.Path, ifEmpty(a.Nickname, "?"))
+					fmt.Printf("  #%d %s (%s · %s)\n", i+1, a.Path, ifEmpty(a.Nickname, "?"), profileForEdition(a.Edition).Label)
 					switch a.State {
 					case "active":
 						fmt.Printf("     ✅ 可用 | Token 有效期至: %s\n",
@@ -1159,7 +1396,16 @@ func runMonitor() {
 }
 
 func runLogin() {
-	fmt.Println("================ WorkBuddy 扫码登录 ================")
+	prof := &profileCN
+	if cfg.LoginIntl {
+		prof = &profileINTL
+	}
+
+	fmt.Println("================ WorkBuddy 登录 ================")
+	fmt.Printf("目标站点:     %s (%s)\n", prof.Label, strings.TrimPrefix(prof.Base, "https://"))
+	if cfg.LoginIntl {
+		fmt.Println("国际站登录将在浏览器中完成（邮箱 / 验证码 / SSO 等），凭据由网关自动接管。")
+	}
 	fmt.Println("正在生成登录凭据与二维码...")
 
 	loginClient := &http.Client{
@@ -1167,7 +1413,13 @@ func runLogin() {
 		Jar:     cfg.HttpClient.Jar,
 	}
 
-	data, _, err := doJSON(loginClient, http.MethodPost, endpointAuthState, nil, bytes.NewReader([]byte("{}")))
+	// 轮询 auth/token 时与官方客户端一致，显式声明无 Authorization
+	pollHeaders := func(r *http.Request) {
+		commonHeaders(r, prof)
+		r.Header.Set("X-No-Authorization", "1")
+	}
+
+	data, _, err := doJSON(loginClient, http.MethodPost, prof.authStateURL(), nil, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		fmt.Printf("获取登录状态失败: %v\n", err)
 		return
@@ -1182,15 +1434,19 @@ func runLogin() {
 	// 终端字符二维码
 	qr, err := qrcode.New(st.AuthURL, qrcode.Medium)
 	if err == nil {
-		fmt.Println("\n请使用 微信 或 企业微信 扫描下方二维码登录：")
+		if cfg.LoginIntl {
+			fmt.Println("\n请用手机扫描下方二维码，并在浏览器中完成登录（邮箱 / 验证码 / SSO 等）：")
+		} else {
+			fmt.Println("\n请使用 微信 或 企业微信 扫描下方二维码登录：")
+		}
 		fmt.Println(qr.ToSmallString(false))
 	}
 
 	fmt.Println("如无法扫码，也可在浏览器中直接打开以下链接：")
 	fmt.Printf("👉 %s\n\n", st.AuthURL)
-	fmt.Println("等待扫码授权中 (按 Ctrl+C 可取消)...")
+	fmt.Println("等待登录授权完成 (按 Ctrl+C 可取消)...")
 
-	deadline := time.Now().Add(loginTTL)
+	deadline := time.Now().Add(prof.LoginTTL)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -1201,7 +1457,7 @@ func runLogin() {
 				fmt.Println("\n登录已超时，请重新执行 login 命令。")
 				return
 			}
-			tokRaw, _, errTok := doJSON(loginClient, http.MethodGet, endpointAuthToken+st.State, nil, nil)
+			tokRaw, _, errTok := doJSON(loginClient, http.MethodGet, prof.authTokenURL(st.State), pollHeaders, nil)
 			if errTok != nil {
 				continue
 			}
@@ -1213,14 +1469,15 @@ func runLogin() {
 			// 登录成功，拉取账号信息
 			var acct accountData
 			acctHeaders := func(r *http.Request) {
-				commonHeaders(r)
+				commonHeaders(r, prof)
 				r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 			}
-			if acctRaw, _, errAcct := doJSON(loginClient, http.MethodGet, endpointLoginAcct+st.State, acctHeaders, nil); errAcct == nil {
+			if acctRaw, _, errAcct := doJSON(loginClient, http.MethodGet, prof.loginAcctURL(st.State), acctHeaders, nil); errAcct == nil {
 				_ = json.Unmarshal(acctRaw, &acct)
 			}
 
 			sa := &StoredAuth{
+				Edition: prof.Key,
 				Auth: StoredTokens{
 					AccessToken:  tok.AccessToken,
 					RefreshToken: tok.RefreshToken,
@@ -1240,6 +1497,7 @@ func runLogin() {
 			}
 
 			fmt.Println("\n🎉 登录成功！")
+			fmt.Printf("站点:         %s (%s)\n", prof.Label, strings.TrimPrefix(prof.Base, "https://"))
 			fmt.Printf("欢迎，%s (UID: %s)\n", sa.Account.Nickname, sa.Account.UID)
 			fmt.Printf("凭据已成功保存至: %s\n", cfg.AuthFile)
 			fmt.Printf("令牌有效期至: %s\n", time.Unix(sa.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
@@ -1274,6 +1532,11 @@ func runServe() {
 	// 启动状态快照协程（monitor 命令实时读取展示）
 	go statusSnapshotLoop()
 
+	// 启动凭据热加载协程（新增/更新/删除凭据文件免重启生效）
+	if cfg.ReloadInterval > 0 {
+		go accountReloaderLoop()
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", handleChatCompletions)
 	mux.HandleFunc("/chat/completions", handleChatCompletions)
@@ -1297,6 +1560,11 @@ func runServe() {
 	fmt.Printf("   Chat 接口地址: http://%s/v1/chat/completions\n", listenAddr)
 	fmt.Printf("   Models 接口:   http://%s/v1/models\n", listenAddr)
 	fmt.Printf("   模型转发策略:  【完全透传】客户端请求的任意 model 原样中继至上游\n")
+	if cfg.ReloadInterval > 0 {
+		fmt.Printf("   凭据热加载:    每 %ds 自动扫描，新增/更新/删除凭据免重启生效\n", cfg.ReloadInterval)
+	} else {
+		fmt.Printf("   凭据热加载:    已关闭 (-reload-interval 0)\n")
+	}
 	if cfg.APIKey != "" {
 		fmt.Printf("   API 鉴权:      已启用 (Bearer %s)\n", cfg.APIKey)
 	} else {
@@ -1501,20 +1769,23 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, endpointChat, bytes.NewReader(upstreamBytes))
+		// 按账号所属站点（国内站/国际站）路由上游与指纹 Header
+		prof := acc.Profile()
+
+		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, prof.chatURL(), bytes.NewReader(upstreamBytes))
 		if err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, "req_create_error", err.Error())
 			return
 		}
 		// 注入 CodeBuddy 凭据与指纹 Header
-		backendHeaders(upstreamReq, acc.Auth)
+		backendHeaders(upstreamReq, acc.Auth, prof)
 
 		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止 DSH 同时发起标题生成+主对话触发腾讯 11128 风控
 		acc.lock.Lock()
 		resp, err := cfg.HttpClient.Do(upstreamReq)
 		acc.lock.Unlock()
 		if err != nil {
-			log.Printf("[#%d] 账号 %s 上游请求失败: %v", reqID, acc.Path, err)
+			log.Printf("[#%d] 账号 %s [%s] 上游请求失败: %v", reqID, acc.Path, prof.Label, err)
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
 			return
 		}
@@ -1524,7 +1795,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			errStr := string(errBody)
-			log.Printf("[#%d] 账号 %s 上游返回 HTTP %d: %s (耗时 %v)", reqID, acc.Path, resp.StatusCode, errStr, time.Since(startTime))
+			log.Printf("[#%d] 账号 %s [%s] 上游返回 HTTP %d: %s (耗时 %v)", reqID, acc.Path, prof.Label, resp.StatusCode, errStr, time.Since(startTime))
 
 			if isRateLimited(resp.StatusCode, errStr) {
 				// 429 频率限制：解析重置时间并屏蔽该账号，交由其他账号代偿
@@ -1584,7 +1855,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			resp.Body.Close()
-			log.Printf("[#%d] 流式输出完成 (账号 %s, 耗时 %v)", reqID, acc.Path, time.Since(startTime))
+			log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 耗时 %v)", reqID, acc.Path, prof.Label, time.Since(startTime))
 		} else {
 			// 客户端需要完整 JSON 响应，聚合 SSE 数据流
 			completionJSON, err := aggregateCompletion(resp.Body, modelName)
@@ -1597,7 +1868,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(completionJSON)
-			log.Printf("[#%d] 非流式响应完成 (账号 %s, 耗时 %v)", reqID, acc.Path, time.Since(startTime))
+			log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v)", reqID, acc.Path, prof.Label, time.Since(startTime))
 		}
 		return
 	}
@@ -1704,14 +1975,14 @@ func sanitizeBlockedTemplates(s string) string {
 	return s
 }
 
-// backendHeaders 设置 CodeBuddy 上游专用指纹与鉴权 Header
-func backendHeaders(req *http.Request, sa *StoredAuth) {
-	commonHeaders(req)
+// backendHeaders 设置 CodeBuddy 上游专用指纹与鉴权 Header（按站点 Profile 生成）
+func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile) {
+	commonHeaders(req, prof)
 	reqID := uuid.New().String()
 	req.Header.Set("X-Request-ID", reqID)
 	req.Header.Set("X-Trace-ID", reqID)
-	req.Header.Set("X-Client-ID", "codebuddy-cli")
-	req.Header.Set("X-Client-Version", "2.143.1")
+	req.Header.Set("X-Client-ID", prof.ClientID)
+	req.Header.Set("X-Client-Version", prof.ClientVer)
 
 	if sa != nil && sa.Auth.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
@@ -1736,16 +2007,17 @@ func backendHeaders(req *http.Request, sa *StoredAuth) {
 	} else {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
-	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("X-Product", prof.Product)
 }
 
-func commonHeaders(req *http.Request) {
+// commonHeaders 按站点 Profile 设置通用伪装 Header（Origin/Referer/UA 因站点而异）。
+func commonHeaders(req *http.Request, prof *upstreamProfile) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Origin", originReferer)
-	req.Header.Set("Referer", originReferer+"/")
-	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("Origin", prof.Origin)
+	req.Header.Set("Referer", prof.Origin+"/")
+	req.Header.Set("User-Agent", prof.ClientUA)
 }
 
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
@@ -1756,7 +2028,7 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 	if headers != nil {
 		headers(req)
 	} else {
-		commonHeaders(req)
+		commonHeaders(req, &profileCN) // 兜底默认（当前所有调用方均显式传入站点 Profile）
 	}
 	resp, err := client.Do(req)
 	if err != nil {
