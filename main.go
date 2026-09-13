@@ -31,10 +31,14 @@ import (
 )
 
 const (
-	version = "1.7.0"
+	version = "1.8.1"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
+
+	// defaultSystemPrompt 是当客户端首条消息不是 system 时注入的保底系统提示，
+	// 用于满足腾讯上游「首条消息必须是 system prompt」的硬性要求 (code 11128)。
+	defaultSystemPrompt = "You are a helpful assistant."
 )
 
 // -----------------------------------------------------------------------------
@@ -1540,6 +1544,8 @@ func runServe() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", handleChatCompletions)
 	mux.HandleFunc("/chat/completions", handleChatCompletions)
+	mux.HandleFunc("/v1/responses", handleResponses)
+	mux.HandleFunc("/responses", handleResponses)
 	mux.HandleFunc("/v1/models", handleModels)
 	mux.HandleFunc("/models", handleModels)
 	mux.HandleFunc("/health", handleHealth)
@@ -1678,6 +1684,104 @@ func authMiddleware(next http.Handler) http.Handler {
 // 路由处理: /v1/chat/completions (支持任意 model 透传)
 // -----------------------------------------------------------------------------
 
+// upstreamChat 完成「多账号轮询 + 429 冷却代偿 + 授权失效禁用 + 单账号串行」的上游调度。
+// 成功时返回 200 响应（调用方负责关闭 Body）与命中的账号/站点；失败时函数内部已写回
+// 错误响应并返回 ok=false。Chat Completions 与 Responses 两个入口共用此逻辑。
+func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstreamBytes []byte, startTime time.Time) (*http.Response, *Account, *upstreamProfile, bool) {
+	accountMu.Lock()
+	poolSize := len(accounts)
+	accountMu.Unlock()
+	if poolSize == 0 {
+		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
+		return nil, nil, nil, false
+	}
+
+	var lastRateErr string
+	var lastAuthErr string
+	for attempt := 0; attempt < poolSize; attempt++ {
+		acc, err := nextAccount()
+		if err != nil {
+			// 所有账号均不可用（冷却或失效）
+			msg := fmt.Sprintf("无可用账号: %v", err)
+			if lastAuthErr != "" {
+				msg += " | 最近一次授权失效: " + truncate(lastAuthErr, 200)
+			}
+			if lastRateErr != "" {
+				msg += " | 最近一次频率限制: " + truncate(lastRateErr, 200)
+			}
+			log.Printf("[#%d] %s", reqID, msg)
+			writeOpenAIError(w, http.StatusServiceUnavailable, "no_available_account", msg)
+			return nil, nil, nil, false
+		}
+		_ = ensureValidTokenFor(acc)
+		// 令牌刷新时若发现授权失效会禁用账号；若被禁用则跳过换下一个
+		accountMu.Lock()
+		disabled := acc.Disabled
+		accountMu.Unlock()
+		if disabled {
+			lastAuthErr = acc.DisabledReason
+			continue
+		}
+
+		// 按账号所属站点（国内站/国际站）路由上游与指纹 Header
+		prof := acc.Profile()
+
+		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, prof.chatURL(), bytes.NewReader(upstreamBytes))
+		if err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "req_create_error", err.Error())
+			return nil, nil, nil, false
+		}
+		// 注入 CodeBuddy 凭据与指纹 Header
+		backendHeaders(upstreamReq, acc.Auth, prof)
+
+		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
+		acc.lock.Lock()
+		resp, err := cfg.HttpClient.Do(upstreamReq)
+		acc.lock.Unlock()
+		if err != nil {
+			log.Printf("[#%d] 账号 %s [%s] 上游请求失败: %v", reqID, acc.Path, prof.Label, err)
+			writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
+			return nil, nil, nil, false
+		}
+
+		// 上游非 200 响应处理
+		if resp.StatusCode >= 400 {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			errStr := string(errBody)
+			log.Printf("[#%d] 账号 %s [%s] 上游返回 HTTP %d: %s (耗时 %v)", reqID, acc.Path, prof.Label, resp.StatusCode, errStr, time.Since(startTime))
+
+			if isRateLimited(resp.StatusCode, errStr) {
+				// 429 频率限制：解析重置时间并屏蔽该账号，交由其他账号代偿
+				until, ok := parseResetTime(errStr)
+				if !ok {
+					until = time.Now().Add(60 * time.Second) // 无法解析时默认冷却 60 秒
+				}
+				markCooldown(acc, until, errStr)
+				lastRateErr = errStr
+				continue // 尝试下一个账号
+			}
+
+			if isAuthFailure(resp.StatusCode, errStr) {
+				// 授权失效（401/403 / token 无效 / 登录过期）：禁用该账号并删除凭据文件，
+				// 自动改用下一个可用账号，控制台提示用户重新登录
+				disableAccount(acc, fmt.Sprintf("上游鉴权失败 (HTTP %d): %s", resp.StatusCode, truncate(errStr, 200)))
+				lastAuthErr = errStr
+				continue // 尝试下一个账号
+			}
+
+			writeOpenAIError(w, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
+			return nil, nil, nil, false
+		}
+
+		return resp, acc, prof, true
+	}
+
+	// 理论上不可达（poolSize 次尝试后未成功即已在循环内返回）
+	writeOpenAIError(w, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
+	return nil, nil, nil, false
+}
+
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "仅支持 POST 请求")
@@ -1719,6 +1823,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 模板净化：改写 Claude Code 等框架被腾讯官方逐字拉黑的固定 prompt 语句
 	sanitizeMessages(reqObj)
 
+	// 会话结构归一化：保证首条消息为 system，修复部分非 harness 客户端
+	//（以 assistant / tool 续写或回传工具结果）触发的上游 11128 错误
+	ensureLeadingSystemMessage(reqObj)
+
 	upstreamBytes, err := json.Marshal(reqObj)
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "encode_error", "序列化请求失败")
@@ -1731,150 +1839,64 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[#%d] POST /v1/chat/completions -> Upstream [Model: %s, Stream: %v]", reqID, modelName, isStream)
 	}
 
-	// 多账号轮询 + 429 自动冷却代偿：
-	// 按轮询顺序尝试账号；命中 429 频率限制时立即将当前账号屏蔽到重置时间，
-	// 并自动改用下一个可用账号重试（代偿），直至成功或所有账号均不可用。
-	accountMu.Lock()
-	poolSize := len(accounts)
-	accountMu.Unlock()
-	if poolSize == 0 {
-		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
+	resp, acc, prof, ok := upstreamChat(w, r, reqID, upstreamBytes, startTime)
+	if !ok {
+		return
+	}
+	if isStream {
+		streamChatResponse(w, resp, reqID, acc, prof, startTime)
+	} else {
+		writeChatAggregate(w, resp, modelName, reqID, acc, prof, startTime)
+	}
+}
+
+// streamChatResponse 将上游 SSE 逐行透传为 OpenAI Chat Completions 流式响应。
+func streamChatResponse(w http.ResponseWriter, resp *http.Response, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeOpenAIError(w, http.StatusInternalServerError, "streaming_unsupported", "服务器不支持流式响应 Flush")
 		return
 	}
 
-	var lastRateErr string
-	var lastAuthErr string
-	for attempt := 0; attempt < poolSize; attempt++ {
-		acc, err := nextAccount()
-		if err != nil {
-			// 所有账号均不可用（冷却或失效）
-			msg := fmt.Sprintf("无可用账号: %v", err)
-			if lastAuthErr != "" {
-				msg += " | 最近一次授权失效: " + truncate(lastAuthErr, 200)
-			}
-			if lastRateErr != "" {
-				msg += " | 最近一次频率限制: " + truncate(lastRateErr, 200)
-			}
-			log.Printf("[#%d] %s", reqID, msg)
-			writeOpenAIError(w, http.StatusServiceUnavailable, "no_available_account", msg)
-			return
-		}
-		_ = ensureValidTokenFor(acc)
-		// 令牌刷新时若发现授权失效会禁用账号；若被禁用则跳过换下一个
-		accountMu.Lock()
-		disabled := acc.Disabled
-		accountMu.Unlock()
-		if disabled {
-			lastAuthErr = acc.DisabledReason
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		cleanData := stripDataPrefix(scanner.Text())
+		if cleanData == "" {
 			continue
 		}
-
-		// 按账号所属站点（国内站/国际站）路由上游与指纹 Header
-		prof := acc.Profile()
-
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, prof.chatURL(), bytes.NewReader(upstreamBytes))
-		if err != nil {
-			writeOpenAIError(w, http.StatusInternalServerError, "req_create_error", err.Error())
-			return
+		if cleanData == "[DONE]" {
+			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			break
 		}
-		// 注入 CodeBuddy 凭据与指纹 Header
-		backendHeaders(upstreamReq, acc.Auth, prof)
-
-		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止 DSH 同时发起标题生成+主对话触发腾讯 11128 风控
-		acc.lock.Lock()
-		resp, err := cfg.HttpClient.Do(upstreamReq)
-		acc.lock.Unlock()
-		if err != nil {
-			log.Printf("[#%d] 账号 %s [%s] 上游请求失败: %v", reqID, acc.Path, prof.Label, err)
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
-			return
+		if cleanedChunk := cleanChunkJSON(cleanData); cleanedChunk != "" {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", cleanedChunk)
+			flusher.Flush()
 		}
+	}
+	log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 耗时 %v)", reqID, acc.Path, prof.Label, time.Since(startTime))
+}
 
-		// 上游非 200 响应处理
-		if resp.StatusCode >= 400 {
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			errStr := string(errBody)
-			log.Printf("[#%d] 账号 %s [%s] 上游返回 HTTP %d: %s (耗时 %v)", reqID, acc.Path, prof.Label, resp.StatusCode, errStr, time.Since(startTime))
-
-			if isRateLimited(resp.StatusCode, errStr) {
-				// 429 频率限制：解析重置时间并屏蔽该账号，交由其他账号代偿
-				until, ok := parseResetTime(errStr)
-				if !ok {
-					until = time.Now().Add(60 * time.Second) // 无法解析时默认冷却 60 秒
-				}
-				markCooldown(acc, until, errStr)
-				lastRateErr = errStr
-				continue // 尝试下一个账号
-			}
-
-			if isAuthFailure(resp.StatusCode, errStr) {
-				// 授权失效（401/403 / token 无效 / 登录过期）：禁用该账号并删除凭据文件，
-				// 自动改用下一个可用账号，控制台提示用户重新登录
-				disableAccount(acc, fmt.Sprintf("上游鉴权失败 (HTTP %d): %s", resp.StatusCode, truncate(errStr, 200)))
-				lastAuthErr = errStr
-				continue // 尝试下一个账号
-			}
-
-			writeOpenAIError(w, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
-			return
-		}
-
-		if isStream {
-			// 客户端需要流式响应
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Connection", "keep-alive")
-			w.Header().Set("X-Accel-Buffering", "no")
-
-			flusher, ok := w.(http.Flusher)
-			if !ok {
-				resp.Body.Close()
-				writeOpenAIError(w, http.StatusInternalServerError, "streaming_unsupported", "服务器不支持流式响应 Flush")
-				return
-			}
-
-			scanner := bufio.NewScanner(resp.Body)
-			scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-
-			for scanner.Scan() {
-				line := scanner.Text()
-				cleanData := stripDataPrefix(line)
-				if cleanData == "" {
-					continue
-				}
-				if cleanData == "[DONE]" {
-					_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-					flusher.Flush()
-					break
-				}
-				cleanedChunk := cleanChunkJSON(cleanData)
-				if cleanedChunk != "" {
-					_, _ = fmt.Fprintf(w, "data: %s\n\n", cleanedChunk)
-					flusher.Flush()
-				}
-			}
-			resp.Body.Close()
-			log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 耗时 %v)", reqID, acc.Path, prof.Label, time.Since(startTime))
-		} else {
-			// 客户端需要完整 JSON 响应，聚合 SSE 数据流
-			completionJSON, err := aggregateCompletion(resp.Body, modelName)
-			resp.Body.Close()
-			if err != nil {
-				log.Printf("[#%d] 聚合响应失败: %v", reqID, err)
-				writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(completionJSON)
-			log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v)", reqID, acc.Path, prof.Label, time.Since(startTime))
-		}
+// writeChatAggregate 聚合上游 SSE 为完整 Chat Completions JSON 响应。
+func writeChatAggregate(w http.ResponseWriter, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
+	defer resp.Body.Close()
+	completionJSON, err := aggregateCompletion(resp.Body, modelName)
+	if err != nil {
+		log.Printf("[#%d] 聚合响应失败: %v", reqID, err)
+		writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
 		return
 	}
-
-	// 理论上不可达（poolSize 次尝试后未成功即已在循环内返回）
-	writeOpenAIError(w, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(completionJSON)
+	log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v)", reqID, acc.Path, prof.Label, time.Since(startTime))
 }
 
 // -----------------------------------------------------------------------------
@@ -1918,7 +1940,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = fmt.Fprintf(w, "WorkBuddy Local Gateway v%s is running.\n\nEndpoints:\n- POST /v1/chat/completions\n- GET  /v1/models\n- GET  /health\n", version)
+	_, _ = fmt.Fprintf(w, "WorkBuddy Local Gateway v%s is running.\n\nEndpoints:\n- POST /v1/chat/completions\n- POST /v1/responses\n- GET  /v1/models\n- GET  /health\n", version)
 }
 
 // -----------------------------------------------------------------------------
@@ -1948,6 +1970,12 @@ func sanitizeMessages(obj map[string]any) {
 		if !ok {
 			continue
 		}
+		// OpenAI 新版 developer 角色（GPT-5 系客户端/Codex）不被腾讯上游接受，
+		// 会返回 11128 "Illegal API invocation from an unapproved channel"，
+		// 统一归一化为 system（语义等价）。
+		if roleOfMessage(msg) == "developer" {
+			msg["role"] = "system"
+		}
 		switch c := msg["content"].(type) {
 		case string:
 			msg["content"] = sanitizeBlockedTemplates(c)
@@ -1963,6 +1991,66 @@ func sanitizeMessages(obj map[string]any) {
 			}
 		}
 	}
+}
+
+// ensureLeadingSystemMessage 保证 messages 的首条消息符合腾讯上游的会话结构校验。
+//
+// 上游要求首条消息为 system prompt，否则返回 HTTP 400
+// {"code":11128,"msg":"first message is not system prompt"}。实测国内站对 user 开头较宽容，
+// 但国际站（workbuddy.ai）严格校验；账号池混挂时表现为约 50% 请求随机失败。部分非 harness
+// 客户端在续写或仅回传工具结果时还会以 assistant / tool 作为首条消息。此处统一归一化为：
+//  1. 首条已是 system：原样透传；
+//  2. 首条是 developer（OpenAI 新版 system 别名）：重命名为 system；
+//  3. 后续存在 system/developer：提升到首位（developer 归一化为 system），其余保持原序；
+//  4. 其余情况（user / assistant / tool 开头且无 system）：在最前注入一条保底 system。
+func ensureLeadingSystemMessage(obj map[string]any) {
+	messages, ok := obj["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		obj["messages"] = []any{map[string]any{"role": "system", "content": defaultSystemPrompt}}
+		return
+	}
+
+	switch roleOfMessage(messages[0]) {
+	case "system":
+		return
+	case "developer":
+		if msg, ok := messages[0].(map[string]any); ok {
+			msg["role"] = "system"
+		}
+		return
+	}
+
+	// 后续存在 system/developer：提升到首位，其余保持原序
+	for i := 1; i < len(messages); i++ {
+		switch roleOfMessage(messages[i]) {
+		case "system", "developer":
+			if msg, ok := messages[i].(map[string]any); ok {
+				msg["role"] = "system"
+			}
+			reordered := make([]any, 0, len(messages))
+			reordered = append(reordered, messages[i])
+			reordered = append(reordered, messages[:i]...)
+			reordered = append(reordered, messages[i+1:]...)
+			obj["messages"] = reordered
+			return
+		}
+	}
+
+	// 无任何 system：在最前注入保底 system（兼容国内站/国际站）
+	injected := make([]any, 0, len(messages)+1)
+	injected = append(injected, map[string]any{"role": "system", "content": defaultSystemPrompt})
+	injected = append(injected, messages...)
+	obj["messages"] = injected
+}
+
+// roleOfMessage 读取消息的 role 字段并归一化为小写去空格；非法结构返回空串。
+func roleOfMessage(m any) string {
+	msg, ok := m.(map[string]any)
+	if !ok {
+		return ""
+	}
+	role, _ := msg["role"].(string)
+	return strings.ToLower(strings.TrimSpace(role))
 }
 
 func sanitizeBlockedTemplates(s string) string {
@@ -2053,11 +2141,55 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 // 流式聚合与格式清理
 // -----------------------------------------------------------------------------
 
+// mergedToolCall 累积合并上游按 index 分片下发的工具调用增量。
+type mergedToolCall struct {
+	ID   string
+	Type string
+	Name string
+	Args strings.Builder
+}
+
+// applyToolCallDelta 将上游 tool_calls 增量按 index 归并进 map；order 记录首次出现的
+// index 顺序，保证最终输出顺序稳定。Chat Completions 聚合与 Responses 流式共用。
+func applyToolCallDelta(toolCalls map[int]*mergedToolCall, order *[]int, tcs []any) {
+	for _, tcAny := range tcs {
+		tc, ok := tcAny.(map[string]any)
+		if !ok {
+			continue
+		}
+		idx := 0
+		if v, ok := tc["index"].(float64); ok {
+			idx = int(v)
+		}
+		st, exists := toolCalls[idx]
+		if !exists {
+			st = &mergedToolCall{Type: "function"}
+			toolCalls[idx] = st
+			*order = append(*order, idx)
+		}
+		if id, ok := tc["id"].(string); ok && id != "" {
+			st.ID = id
+		}
+		if t, ok := tc["type"].(string); ok && t != "" {
+			st.Type = t
+		}
+		if fn, ok := tc["function"].(map[string]any); ok {
+			if n, ok := fn["name"].(string); ok && n != "" {
+				st.Name = n
+			}
+			if a, ok := fn["arguments"].(string); ok && a != "" {
+				st.Args.WriteString(a)
+			}
+		}
+	}
+}
+
 func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	var content, reasoning, role, respModel, respID, finish string
 	var created int64
 	var usage map[string]any
-	var toolCalls []map[string]any
+	toolCalls := map[int]*mergedToolCall{}
+	var toolOrder []int
 
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
@@ -2096,11 +2228,7 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 					reasoning += v
 				}
 				if tcs, ok := delta["tool_calls"].([]any); ok {
-					for _, tc := range tcs {
-						if call, ok := tc.(map[string]any); ok {
-							toolCalls = append(toolCalls, call)
-						}
-					}
+					applyToolCallDelta(toolCalls, &toolOrder, tcs)
 				}
 			}
 			if v, ok := choice["finish_reason"].(string); ok && v != "" {
@@ -2113,8 +2241,25 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	if reasoning != "" {
 		message["reasoning_content"] = reasoning
 	}
-	if len(toolCalls) > 0 {
-		message["tool_calls"] = toolCalls
+	if len(toolOrder) > 0 {
+		calls := make([]map[string]any, 0, len(toolOrder))
+		for _, idx := range toolOrder {
+			st := toolCalls[idx]
+			id := st.ID
+			if id == "" {
+				id = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), idx)
+			}
+			calls = append(calls, map[string]any{
+				"id":    id,
+				"type":  ifEmpty(st.Type, "function"),
+				"index": idx,
+				"function": map[string]any{
+					"name":      st.Name,
+					"arguments": st.Args.String(),
+				},
+			})
+		}
+		message["tool_calls"] = calls
 	}
 	if created == 0 {
 		created = time.Now().Unix()

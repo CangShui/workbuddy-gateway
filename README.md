@@ -21,9 +21,10 @@
 - **429 频率限制自动冷却**：任一账号触发上游频率限制（HTTP 429 / code 6004，中英文消息均可识别）时，自动解析消息中的重置时间（中文如 `将在 2026-09-04 07:48:15 UTC+8 重置`，英文如 `will reset at 2026-09-05 01:57:00 UTC+8`），将该账号屏蔽至重置时间；冷却期间自动改用其他账号代偿，冷却到期自动恢复。
 - **授权失效自动禁用**：账号授权过期、被撤销或令牌刷新失败（HTTP 401/403 / invalid token / 登录已过期）时，自动将该账号**禁止调度并删除凭据文件**，同时写入持久化失效标记；`status` / 启动日志会明确提示该账号失效原因与重新登录命令，重新 `login` 后自动恢复调度。
 - **后台自动续期**：运行期间每 5 分钟检查所有账号 Token，距过期不足 15 分钟自动刷新并持久化回各自凭据文件。
-- **OpenAI 兼容协议**：`POST /v1/chat/completions`（SSE 流式 + 非流式聚合）、`GET /v1/models`、`GET /health`。
+- **OpenAI 兼容协议**：`POST /v1/chat/completions`（SSE 流式 + 非流式聚合）、`POST /v1/responses`（OpenAI Responses API，支持流式语义事件、非流式与 function tools）、`GET /v1/models`、`GET /health`。
 - **深度思考透传规则**：仅当客户端显式请求 `reasoning_effort` 时转发；绝不强制注入，避免触发上游内容安全策略。
 - **反审查净化**：自动改写 Claude Code 等框架被上游逐字拉黑的固定 Prompt 语句。
+- **会话结构自动归一化**：自动保证首条消息为 `system`，修复部分非 harness 客户端（以 `assistant` 续写或以 `tool` 回传工具结果开头）触发的上游 `first message is not system prompt` (code 11128) 报错；同时兼容 OpenAI 新版 `developer` 角色。
 - **单账号串行化**：同一账号请求自动排队，避免并发双发触发上游风控；不同账号之间可并行。
 
 ## 快速上手

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -600,4 +601,312 @@ func TestWriteStatusSnapshot(t *testing.T) {
 		t.Fatalf("expected all three states in snapshot, got %v", states)
 	}
 	t.Logf("snapshot states: %v", states)
+}
+
+// 构造 messages 便于表驱动测试
+func msg(role, content string) map[string]any {
+	return map[string]any{"role": role, "content": content}
+}
+
+// 提取 messages 各条 role，便于断言
+func rolesOf(obj map[string]any) []string {
+	messages, _ := obj["messages"].([]any)
+	roles := make([]string, 0, len(messages))
+	for _, m := range messages {
+		roles = append(roles, roleOfMessage(m))
+	}
+	return roles
+}
+
+// 验证会话结构归一化：修复上游 11128「first message is not system prompt」
+func TestEnsureLeadingSystemMessage(t *testing.T) {
+	cases := []struct {
+		name       string
+		messages   []any
+		wantRoles  []string
+		wantInject bool // 首条是否应为注入的保底 system
+	}{
+		{
+			name:      "首条已是 system 保持原样",
+			messages:  []any{msg("system", "You are helpful"), msg("user", "hi")},
+			wantRoles: []string{"system", "user"},
+		},
+		{
+			name:       "首条 user 且无 system（国内站宽容/国际站必须，统一注入 system）",
+			messages:   []any{msg("user", "hi")},
+			wantRoles:  []string{"system", "user"},
+			wantInject: true,
+		},
+		{
+			name:       "首条 assistant（续写）注入 system",
+			messages:   []any{msg("assistant", "Sure")},
+			wantRoles:  []string{"system", "assistant"},
+			wantInject: true,
+		},
+		{
+			name:       "首条 tool（仅回传工具结果）注入 system",
+			messages:   []any{msg("tool", "result")},
+			wantRoles:  []string{"system", "tool"},
+			wantInject: true,
+		},
+		{
+			name:      "后续 system 提升到首位",
+			messages:  []any{msg("user", "hi"), msg("system", "You are helpful"), msg("user", "bye")},
+			wantRoles: []string{"system", "user", "user"},
+		},
+		{
+			name:      "首条 developer 归一化为 system",
+			messages:  []any{msg("developer", "You are helpful"), msg("user", "hi")},
+			wantRoles: []string{"system", "user"},
+		},
+		{
+			name:       "空 messages 注入 system",
+			messages:   []any{},
+			wantRoles:  []string{"system"},
+			wantInject: true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			obj := map[string]any{"messages": c.messages}
+			ensureLeadingSystemMessage(obj)
+			got := rolesOf(obj)
+			if len(got) != len(c.wantRoles) {
+				t.Fatalf("roles = %v, want %v", got, c.wantRoles)
+			}
+			for i := range got {
+				if got[i] != c.wantRoles[i] {
+					t.Fatalf("roles = %v, want %v", got, c.wantRoles)
+				}
+			}
+			messages, _ := obj["messages"].([]any)
+			first, _ := messages[0].(map[string]any)
+			if c.wantInject {
+				if content, _ := first["content"].(string); content != defaultSystemPrompt {
+					t.Fatalf("injected system content = %q, want %q", content, defaultSystemPrompt)
+				}
+			}
+			t.Logf("roles -> %v", got)
+		})
+	}
+}
+
+// 验证缺失 / 非法 messages 字段时也能安全注入（不得 panic）
+func TestEnsureLeadingSystemMessageMissingField(t *testing.T) {
+	obj := map[string]any{}
+	ensureLeadingSystemMessage(obj)
+	messages, ok := obj["messages"].([]any)
+	if !ok || len(messages) != 1 {
+		t.Fatalf("expected 1 injected message, got %#v", obj["messages"])
+	}
+	if roleOfMessage(messages[0]) != "system" {
+		t.Fatalf("expected system first, got %v", roleOfMessage(messages[0]))
+	}
+	t.Log("missing messages field handled")
+}
+
+// 验证 developer 角色（GPT-5/Codex）被归一化为 system，避免上游 11128
+// "Illegal API invocation from an unapproved channel"
+func TestSanitizeMessagesNormalizesDeveloperRole(t *testing.T) {
+	obj := map[string]any{"messages": []any{
+		msg("system", "You are helpful."),
+		msg("developer", "Be terse."),
+		msg("user", "hi"),
+	}}
+	sanitizeMessages(obj)
+	roles := rolesOf(obj)
+	for _, r := range roles {
+		if r == "developer" {
+			t.Fatalf("developer role should be normalized, got %v", roles)
+		}
+	}
+	if roles[1] != "system" {
+		t.Fatalf("roles = %v, want second = system", roles)
+	}
+	t.Logf("roles normalized: %v", roles)
+}
+
+// 验证上游 tool_calls 增量按 index 正确归并为一个完整工具调用
+func TestApplyToolCallDeltaMerge(t *testing.T) {
+	merged := map[int]*mergedToolCall{}
+	var order []int
+	applyToolCallDelta(merged, &order, []any{
+		map[string]any{"index": float64(0), "id": "call_1", "type": "function",
+			"function": map[string]any{"name": "get_weather", "arguments": ""}},
+	})
+	applyToolCallDelta(merged, &order, []any{
+		map[string]any{"index": float64(0), "function": map[string]any{"arguments": `{"city":`}},
+	})
+	applyToolCallDelta(merged, &order, []any{
+		map[string]any{"index": float64(0), "function": map[string]any{"arguments": `"Beijing"}`}},
+	})
+	if len(order) != 1 || order[0] != 0 {
+		t.Fatalf("order = %v, want [0]", order)
+	}
+	st := merged[0]
+	if st.ID != "call_1" || st.Name != "get_weather" {
+		t.Fatalf("id/name = %q/%q", st.ID, st.Name)
+	}
+	if got := st.Args.String(); got != `{"city":"Beijing"}` {
+		t.Fatalf("args = %q", got)
+	}
+	t.Logf("merged tool call: %s(%s) id=%s", st.Name, st.Args.String(), st.ID)
+}
+
+// 验证 aggregateCompletion 正确合并流式 tool_calls（修复旧的按片追加问题）
+func TestAggregateCompletionToolCalls(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"id":"cmpl-1","model":"hy3-preview","created":1700000000,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Beijing\"}"}}]}}]}`,
+		`data: [DONE]`,
+	}, "\n")
+
+	out, err := aggregateCompletion(strings.NewReader(sse), "hy3-preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(out, &chat); err != nil {
+		t.Fatal(err)
+	}
+	choices := chat["choices"].([]any)
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	calls, ok := msg["tool_calls"].([]any)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("expected 1 merged tool_call, got %#v", msg["tool_calls"])
+	}
+	call := calls[0].(map[string]any)
+	fn := call["function"].(map[string]any)
+	if fn["name"] != "get_weather" || fn["arguments"] != `{"city":"Beijing"}` || call["id"] != "call_1" {
+		t.Fatalf("bad merged call: %#v", call)
+	}
+	t.Logf("aggregateCompletion merged: %v", call)
+}
+
+// 验证 Responses -> Chat Completions 请求转换（instructions/input/tools/tool_choice/参数）
+func TestResponsesToChatRequest(t *testing.T) {
+	respReq := map[string]any{
+		"model":             "hy3-preview",
+		"instructions":      "You are helpful.",
+		"max_output_tokens": float64(128),
+		"temperature":       float64(0.3),
+		"input": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "input_text", "text": "weather?"},
+			}},
+			map[string]any{"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": `{"city":"BJ"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "sunny"},
+		},
+		"tools": []any{map[string]any{
+			"type": "function", "name": "get_weather", "description": "Get weather",
+			"parameters": map[string]any{"type": "object"},
+		}},
+		"tool_choice": "auto",
+		"reasoning":   map[string]any{"effort": "high"},
+	}
+
+	chat, err := responsesToChatRequest(respReq, "hy3-preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chat["model"] != "hy3-preview" || chat["max_tokens"] != float64(128) || chat["temperature"] != float64(0.3) {
+		t.Fatalf("bad top-level fields: %#v", chat)
+	}
+	if chat["reasoning_effort"] != "high" {
+		t.Fatalf("reasoning_effort = %v", chat["reasoning_effort"])
+	}
+	messages := chat["messages"].([]any)
+	if len(messages) != 4 {
+		t.Fatalf("expected 4 messages (system+user+assistant+tool), got %d: %#v", len(messages), messages)
+	}
+	if rolesOf(map[string]any{"messages": messages})[0] != "system" {
+		t.Fatalf("first message should be system")
+	}
+	assistant := messages[2].(map[string]any)
+	if assistant["role"] != "assistant" {
+		t.Fatalf("3rd message role = %v", assistant["role"])
+	}
+	toolMsg := messages[3].(map[string]any)
+	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "call_1" || toolMsg["content"] != "sunny" {
+		t.Fatalf("tool message = %#v", toolMsg)
+	}
+	tools := chat["tools"].([]any)
+	fn := tools[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "get_weather" {
+		t.Fatalf("tools not flattened: %#v", tools)
+	}
+	if chat["tool_choice"] != "auto" {
+		t.Fatalf("tool_choice = %v", chat["tool_choice"])
+	}
+	t.Log("responses request converted OK")
+}
+
+// 验证 responsesToChatRequest 对纯字符串 input 的处理与空 input 报错
+func TestResponsesToChatRequestStringInput(t *testing.T) {
+	chat, err := responsesToChatRequest(map[string]any{"model": "x", "input": "hello"}, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chat["messages"].([]any)
+	if len(messages) != 1 || messages[0].(map[string]any)["content"] != "hello" {
+		t.Fatalf("bad messages: %#v", messages)
+	}
+	if _, err := responsesToChatRequest(map[string]any{"model": "x"}, "x"); err == nil {
+		t.Fatal("empty input should error")
+	}
+}
+
+// 验证 chat.completion -> Responses 非流式响应对象转换
+func TestChatCompletionToResponses(t *testing.T) {
+	chat := map[string]any{
+		"id": "cmpl-123", "created": float64(1700000000), "model": "hy3-preview",
+		"choices": []any{map[string]any{"index": 0, "message": map[string]any{
+			"role": "assistant", "content": "hello", "reasoning_content": "thinking",
+			"tool_calls": []any{map[string]any{
+				"id": "call_1", "type": "function",
+				"function": map[string]any{"name": "get_weather", "arguments": `{"city":"BJ"}`},
+			}},
+		}}},
+		"usage": map[string]any{
+			"prompt_tokens": float64(10), "completion_tokens": float64(5), "total_tokens": float64(15),
+			"prompt_tokens_details":     map[string]any{"cached_tokens": float64(2)},
+			"completion_tokens_details": map[string]any{"reasoning_tokens": float64(3)},
+		},
+	}
+	raw, _ := json.Marshal(chat)
+	out, err := chatCompletionToResponses(raw, "hy3-preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["object"] != "response" || result["status"] != "completed" {
+		t.Fatalf("bad envelope: %#v", result)
+	}
+	output := result["output"].([]any)
+	if len(output) != 3 {
+		t.Fatalf("expected 3 output items (reasoning+message+function_call), got %d", len(output))
+	}
+	if output[0].(map[string]any)["type"] != "reasoning" {
+		t.Fatalf("output[0] = %#v", output[0])
+	}
+	if output[1].(map[string]any)["type"] != "message" {
+		t.Fatalf("output[1] = %#v", output[1])
+	}
+	fc := output[2].(map[string]any)
+	if fc["type"] != "function_call" || fc["call_id"] != "call_1" || fc["name"] != "get_weather" {
+		t.Fatalf("function_call item bad: %#v", fc)
+	}
+	usage := result["usage"].(map[string]any)
+	if usage["input_tokens"] != float64(10) && usage["input_tokens"] != int64(10) {
+		t.Fatalf("usage input = %#v", usage["input_tokens"])
+	}
+	if usage["total_tokens"] != float64(15) && usage["total_tokens"] != int64(15) {
+		t.Fatalf("usage total = %#v", usage["total_tokens"])
+	}
+	t.Logf("responses object output items: %d", len(output))
 }
