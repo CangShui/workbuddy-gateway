@@ -2,7 +2,7 @@
 <img width="797" height="231" alt="image" src="https://github.com/user-attachments/assets/b179efab-1caa-4bf6-a679-d6b6f299cbd6" />
 
 
-基于腾讯 **CodeBuddy / 混元（Hunyuan）** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。无 Web UI，仅通过命令行（CLI）完成登录、凭据续期与服务控制。
+基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。无 Web UI，仅通过命令行（CLI）完成登录、凭据续期与服务控制。
 
 **同时支持两个上游站点**（同一套协议，凭据按站点隔离，账号池可混挂轮询）：
 
