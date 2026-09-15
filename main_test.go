@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -90,6 +94,9 @@ func TestUpstreamProfileURLs(t *testing.T) {
 	}
 	if got := cn.quotaSummaryURL(); got != "https://www.codebuddy.cn/billing/meter/get-user-resource-summary" {
 		t.Errorf("cn quotaSummaryURL = %s", got)
+	}
+	if got := cn.dailyCheckinURL(); got != "https://www.codebuddy.cn/v2/billing/meter/daily-checkin" {
+		t.Errorf("cn dailyCheckinURL = %s", got)
 	}
 
 	itl := profileForEdition("intl")
@@ -271,6 +278,81 @@ func TestIsQuotaExhausted(t *testing.T) {
 		if got := isQuotaExhausted(tc.status, tc.body); got != tc.want {
 			t.Errorf("isQuotaExhausted(%d, %q)=%v want %v", tc.status, tc.body, got, tc.want)
 		}
+	}
+}
+
+func TestIsAlreadyCheckedIn(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{409, `{"code":10001,"msg":"今天已签到"}`, true},
+		{400, `{"code":14001,"msg":"今日已签到"}`, true},
+		{409, `{"msg":"Already checked in today"}`, true},
+		{500, "connection reset", false},
+		{400, `{"code":10002,"msg":"积分不足"}`, false},
+	}
+	for _, tc := range cases {
+		if got := isAlreadyCheckedIn(tc.status, tc.body); got != tc.want {
+			t.Errorf("isAlreadyCheckedIn(%d, %q)=%v want %v", tc.status, tc.body, got, tc.want)
+		}
+	}
+}
+
+func TestNextDailyCheckinUTC8(t *testing.T) {
+	loc := time.FixedZone("test", 8*60*60)
+	before := time.Date(2026, 9, 15, 8, 59, 0, 0, loc)
+	if got := nextDailyCheckin(before); !got.Equal(time.Date(2026, 9, 15, 9, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))) {
+		t.Fatalf("before 09:00 got %v", got)
+	}
+	after := time.Date(2026, 9, 15, 9, 1, 0, 0, loc)
+	if got := nextDailyCheckin(after); !got.Equal(time.Date(2026, 9, 16, 9, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))) {
+		t.Fatalf("after 09:00 got %v", got)
+	}
+}
+
+func TestCheckinAccountCNAndSkipIntl(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/v2/billing/meter/daily-checkin" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer test-access" || r.Header.Get("X-User-Id") != "user-1" {
+			t.Errorf("missing checkin auth headers")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{}}`))
+	}))
+	defer server.Close()
+
+	oldOrigin := profileCN.Origin
+	oldClient := cfg.HttpClient
+	profileCN.Origin = server.URL
+	cfg.HttpClient = server.Client()
+	defer func() {
+		profileCN.Origin = oldOrigin
+		cfg.HttpClient = oldClient
+	}()
+
+	cn := &Account{Path: "cn.json", Auth: &StoredAuth{
+		Edition: "cn",
+		Auth:    StoredTokens{AccessToken: "test-access"},
+		Account: StoredAccount{UID: "user-1"},
+	}}
+	result, err := checkinAccount(context.Background(), cn)
+	if err != nil || result != "ok" || calls != 1 {
+		t.Fatalf("cn checkin result=%q calls=%d err=%v", result, calls, err)
+	}
+
+	intl := &Account{Path: "intl.json", Auth: &StoredAuth{
+		Edition: "intl",
+		Auth:    StoredTokens{AccessToken: "test-access"},
+	}}
+	result, err = checkinAccount(context.Background(), intl)
+	if err != nil || result != "global_skipped" || calls != 1 {
+		t.Fatalf("intl should be skipped: result=%q calls=%d err=%v", result, calls, err)
 	}
 }
 
@@ -740,6 +822,21 @@ func TestParseQuotaSummary(t *testing.T) {
 	}
 }
 
+func TestLockAccountWithContextTimeout(t *testing.T) {
+	var mu sync.Mutex
+	mu.Lock()
+	defer mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if lockAccountWithContext(ctx, &mu) {
+		t.Fatal("lock should time out while mutex is held")
+	}
+	if elapsed := time.Since(start); elapsed < 15*time.Millisecond || elapsed > 200*time.Millisecond {
+		t.Fatalf("unexpected timeout duration: %v", elapsed)
+	}
+}
+
 func TestFormatQuotaRoundsToTwoDecimals(t *testing.T) {
 	cases := map[float64]string{
 		4566:               "4566",
@@ -756,8 +853,8 @@ func TestFormatQuotaRoundsToTwoDecimals(t *testing.T) {
 
 func TestRenderAccountTableRowsHaveEqualDisplayWidth(t *testing.T) {
 	table := renderAccountTable([]accountSnapshot{
-		{Path: "workbuddy1.json", Nickname: "Abandon", Edition: "cn", State: "quota_exhausted", QuotaKnown: true, QuotaTotal: 2000, QuotaUsed: 2000},
-		{Path: "workbuddy2.json", Nickname: "啊水", Edition: "cn", State: "active", QuotaKnown: true, QuotaTotal: 2000, QuotaUsed: 69.98999993, QuotaRemaining: 1930.01000007},
+		{Path: "workbuddy1.json", Nickname: "user-a", Edition: "cn", State: "quota_exhausted", QuotaKnown: true, QuotaTotal: 2000, QuotaUsed: 2000},
+		{Path: "workbuddy2.json", Nickname: "user-b", Edition: "cn", State: "active", QuotaKnown: true, QuotaTotal: 2000, QuotaUsed: 69.98999993, QuotaRemaining: 1930.01000007},
 	})
 	lines := strings.Split(table, "\n")
 	want := displayWidth(lines[0])

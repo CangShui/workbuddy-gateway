@@ -6,6 +6,8 @@ last-*.json
 *.json.disabled
 *.disabled
 .workbuddy-*.json
+wb-models-cache.json
+wb-models-cache.json.tmp
 
 # 本地编译产物
 workbuddy-gateway
