@@ -144,7 +144,7 @@ workbuddy-gateway refresh
 
 处理流程：
 
-1. 将该账号标记为 **❌ 授权失效**，立即移出轮询调度；
+1. 将该账号标记为 **授权失效**，立即移出轮询调度；
 2. **删除对应的凭据文件**（如 `workbuddy.json`），并写入持久化失效标记（`workbuddy.json.disabled`）；
 3. 控制台（`status` / 启动日志 / 运行日志）明确显示失效原因，并给出重新登录命令；
 4. 失效期间其余账号正常代偿；**重新执行 login 后自动清除失效标记并恢复调度**。
@@ -158,13 +158,13 @@ workbuddy-gateway status
 # 站点:         国内站 (copilot.tencent.com)
 # 用户昵称:     tester
 # 用户 UID:     uid-xxx
-# 账号状态:     ❌ 授权失效（禁止调度）
+# 账号状态:     授权失效（禁止调度）
 # 失效原因:     令牌刷新失败 (HTTP 401): invalid token
-# 处理建议:     ⚠️ 凭据文件已删除，请重新执行: workbuddy-gateway login -auth workbuddy-2.json
+# 处理建议:     凭据文件已删除，请重新执行: workbuddy-gateway login -auth workbuddy-2.json
 
 # 失效账号重新登录后自动恢复
 workbuddy-gateway login -auth workbuddy-2.json
-workbuddy-gateway status   # 该账号恢复为 ✅ 可用
+workbuddy-gateway status   # 该账号恢复为可用
 ```
 
 ### 与单账号模式的兼容性
@@ -194,7 +194,7 @@ workbuddy-gateway status   # 该账号恢复为 ✅ 可用
 网关以 systemd / 后台方式运行时，可用 **`monitor` 命令在前台实时查看所有账号的最新状态与最近日志**（Ctrl+C 退出）：
 
 ```bash
-# 基本用法：每 3 秒刷新展示账号池状态（可用/冷却/失效 + Token 有效期）
+# 基本用法：每 3 秒刷新展示账号池状态（可用/冷却/过期/失效 + Token 完整有效期）
 cd /opt/workbuddy-gateway        # 必须与 serve 同一工作目录（读取 workbuddy-status.json）
 workbuddy-gateway monitor
 
@@ -217,19 +217,20 @@ workbuddy-gateway monitor -journal workbuddy-gateway -lines 8
 ================ WorkBuddy 实时监控 ================
 按 Ctrl+C 退出 | 状态文件: workbuddy-status.json
 ---------------------------------------------------------------
-🕐 更新时间: 2026-09-04 09:35:12
-📊 账号池: 共 2 个 | ✅ 可用 1 | 🔒 冷却 1 | ❌ 失效 0
-  #1 workbuddy.json (Abandon)
-     ✅ 可用 | Token 有效期至: 09-10 20:43
-  #2 workbuddy2.json (啊水)
-     🔒 冷却中 至 09-05 01:57 (剩余 16h)
-     原因: 您的使用量已超出频率限制...
-📜 最近日志 (journalctl -u workbuddy-gateway):
+更新时间: 2026-09-04 09:35:12
+账号池: 共 2 个 | 可用 1 | 冷却 0 | 额度耗尽 1 | 过期 0 | 失效 0
++------+----------------------+--------------------------+----------+------------+---------------------+------------+------------+------------+------------+
+| 序号 | 凭据文件             | 账号                     | 站点     | 状态       | Token 有效期        | 总额度     | 已用       | 剩余       | 付费用户   |
++------+----------------------+--------------------------+----------+------------+---------------------+------------+------------+------------+------------+
+| 1    | workbuddy.json       | Abandon                  | 国内站   | 可用       | 2026-09-10 20:43:00 | 2000       | 1500       | 500        | 否         |
+| 2    | workbuddy2.json      | 啊水                     | 国际站   | 额度耗尽   | 2027-09-05 01:57:00 | 1100       | 1100       | 0          | 否         |
++------+----------------------+--------------------------+----------+------------+---------------------+------------+------------+------------+------------+
+最近日志 (journalctl -u workbuddy-gateway):
   9月 04 09:34:31 ... [Cooldown] 账号 workbuddy2.json 触发频率限制...
 ---------------------------------------------------------------
 ```
 
-> 原理：`serve` 后台每 3 秒（及状态变化时）将账号池实时状态原子写入同目录 `workbuddy-status.json`，`monitor` 前台读取该文件并周期刷新展示；日志通过 `journalctl` 或日志文件补充展示。
+> 原理：`serve` 后台每 3 秒（及状态变化时）将账号池实时状态原子写入同目录 `workbuddy-status.json`，`monitor` 前台读取该文件并周期刷新展示；Token 每 5 分钟检查一次，距离过期不足 15 分钟时自动刷新；账号额度在服务启动、凭据池发生变化时立即查询，此后每 1 分钟更新。新一轮扫描开始时会取消上一轮尚未完成的请求，避免扫描堆积。额度支持小数并按上游原值展示；额度为 0 的账号冻结调度，扫描发现剩余额度大于 0 后自动恢复。运行日志同时写入 `logs/gateway-YYYY-MM-DD.log`，也可通过 `journalctl` 查看。额度表格中的数值来自用户中心只读计费接口；首次查询失败时显示 `-`。
 
 ## 客户端接入
 
@@ -335,7 +336,7 @@ sudo /opt/workbuddy-gateway/workbuddy-gateway login
 sudo /opt/workbuddy-gateway/workbuddy-gateway login -auth /opt/workbuddy-gateway/workbuddy2.json
 ```
 
-> 💡 **多账号自动发现**：服务通过 `WorkingDirectory` 固定在 `/opt/workbuddy-gateway`，
+> **多账号自动发现**：服务通过 `WorkingDirectory` 固定在 `/opt/workbuddy-gateway`，
 > 无需修改 ExecStart——把多个凭据文件（`workbuddy.json`、`workbuddy2.json`…）放进该目录，
 > 即可自动组成轮询池；凭据热加载会让新增/更新/删除的凭据文件免重启生效。确认方式：
 > ```bash

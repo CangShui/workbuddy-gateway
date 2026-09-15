@@ -25,16 +25,18 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/skip2/go-qrcode"
 )
 
 const (
-	version = "1.8.1"
+	version = "1.8.2"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
+	logDir             = "logs"
 
 	// defaultSystemPrompt 是当客户端首条消息不是 system 时注入的保底系统提示，
 	// 用于满足腾讯上游「首条消息必须是 system prompt」的硬性要求 (code 11128)。
@@ -109,6 +111,10 @@ func (p *upstreamProfile) tokenRefreshURL() string { return p.Base + "/v2/plugin
 
 func (p *upstreamProfile) chatURL() string { return p.Base + "/v2/chat/completions" }
 
+func (p *upstreamProfile) quotaSummaryURL() string {
+	return p.Origin + "/billing/meter/get-user-resource-summary"
+}
+
 // -----------------------------------------------------------------------------
 // 数据结构定义
 // -----------------------------------------------------------------------------
@@ -157,6 +163,17 @@ type authStateData struct {
 	AuthURL string `json:"authUrl"`
 }
 
+type quotaPackage struct {
+	CycleTotalCapacity  string `json:"CycleTotalCapacity"`
+	CycleUsedCapacity   string `json:"CycleUsedCapacity"`
+	CycleRemainCapacity string `json:"CycleRemainCapacity"`
+}
+
+type quotaSummaryData struct {
+	Packages   []quotaPackage `json:"Packages"`
+	IsPaidUser bool           `json:"IsPaidUser"`
+}
+
 // -----------------------------------------------------------------------------
 // 全局状态与配置
 // -----------------------------------------------------------------------------
@@ -167,7 +184,7 @@ type Config struct {
 	AuthFile        string
 	AuthDir         string
 	AuthExplicit    bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
-	LoginIntl       bool  // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
+	LoginIntl       bool // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
 	APIKey          string
 	ProxyURL        string
 	Verbose         bool
@@ -190,6 +207,12 @@ type Account struct {
 	Nickname       string      // 失效标记持久化字段：昵称（Auth 为 nil 时使用）
 	UID            string      // 失效标记持久化字段：UID
 	Edition        string      // 站点标识（cn/intl）：失效标记恢复时 Auth 为 nil 也可见
+	QuotaTotal     float64     // 最近一次额度查询返回的周期总额度
+	QuotaUsed      float64     // 最近一次额度查询返回的已用额度
+	QuotaRemaining float64     // 最近一次额度查询返回的剩余额度
+	IsPaidUser     bool        // 是否为付费用户
+	QuotaKnown     bool        // 是否已成功获取过额度
+	QuotaExhausted bool        // 已确认额度为 0；额度扫描发现恢复后自动解除
 	fingerprint    string      // 凭据文件变更指纹（mtime+size，凭据热加载用）
 	lock           sync.Mutex  // 单账号串行锁（防止同账号并发触发 11128）
 }
@@ -226,6 +249,8 @@ var (
 	accountMu sync.Mutex // 账号池保护锁
 	accounts  []*Account // 多账号池（单账号时长度为 1，行为与旧版完全一致）
 	rrIndex   int        // 轮询游标
+
+	quotaScanTrigger = make(chan struct{}, 1)
 )
 
 // -----------------------------------------------------------------------------
@@ -279,6 +304,8 @@ func main() {
 
 	// 初始化 HTTP 客户端
 	initHTTPClient()
+	closeLog := initFileLogging(command)
+	defer closeLog()
 
 	switch command {
 	case "serve", "run", "start":
@@ -298,6 +325,23 @@ func main() {
 		printHelp()
 		os.Exit(1)
 	}
+}
+
+// initFileLogging 将运行日志同时写入控制台和按日期命名的项目日志文件。
+func initFileLogging(command string) func() {
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		log.Printf("[Log] 无法创建日志目录 %s，将仅输出到控制台: %v", logDir, err)
+		return func() {}
+	}
+	path := filepath.Join(logDir, "gateway-"+time.Now().Format("2006-01-02")+".log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Printf("[Log] 无法打开日志文件 %s，将仅输出到控制台: %v", path, err)
+		return func() {}
+	}
+	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	log.Printf("[Log] 审计日志已启用，文件=%s，命令=%s，版本=%s", path, command, version)
+	return func() { _ = f.Close() }
 }
 
 func printHelp() {
@@ -486,9 +530,9 @@ func isCredentialFile(name string) bool {
 }
 
 // collectConfiguredAuthPaths 解析应加载的凭据路径列表：
-//  1) -auth-dir 指定目录 → 目录下所有 workbuddy*.json
-//  2) 显式 -auth → 逗号分隔的凭据文件列表（保持用户顺序）
-//  3) 均未指定（自动发现模式）→ 扫描当前目录下所有 workbuddy*.json，
+//  1. -auth-dir 指定目录 → 目录下所有 workbuddy*.json
+//  2. 显式 -auth → 逗号分隔的凭据文件列表（保持用户顺序）
+//  3. 均未指定（自动发现模式）→ 扫描当前目录下所有 workbuddy*.json，
 //     这样把多个凭据文件放进工作目录即可自动组成多账号池；若一个都没有则回退默认 cfg.AuthFile
 func collectConfiguredAuthPaths() []string {
 	var paths []string
@@ -641,6 +685,8 @@ func reloadAccounts() bool {
 		existing.DisabledReason = ""
 		existing.CooldownUntil = time.Time{}
 		existing.CooldownMsg = ""
+		existing.QuotaKnown = false
+		existing.QuotaExhausted = false
 		existing.fingerprint = fp
 		clearDisabledMarker(p)
 		if recovered {
@@ -681,6 +727,7 @@ func accountReloaderLoop() {
 	for range ticker.C {
 		if reloadAccounts() {
 			writeStatusSnapshot() // 立即刷新 monitor 状态文件
+			requestQuotaScan()
 		}
 	}
 }
@@ -697,6 +744,7 @@ func nextAccount() (*Account, error) {
 	now := time.Now()
 	disabledCount := 0
 	cooldownCount := 0
+	exhaustedCount := 0
 	for i := 0; i < len(accounts); i++ {
 		idx := (rrIndex + i) % len(accounts)
 		acc := accounts[idx]
@@ -708,8 +756,15 @@ func nextAccount() (*Account, error) {
 			cooldownCount++
 			continue
 		}
+		if acc.QuotaExhausted {
+			exhaustedCount++
+			continue
+		}
 		rrIndex = (idx + 1) % len(accounts)
 		return acc, nil
+	}
+	if exhaustedCount > 0 && exhaustedCount+disabledCount+cooldownCount == len(accounts) {
+		return nil, fmt.Errorf("所有可调度账号额度均已耗尽，等待下一次额度扫描（最多 1 分钟）")
 	}
 	// 全部不可用：优先报告失效账号
 	for _, a := range accounts {
@@ -778,7 +833,7 @@ func disableAccount(acc *Account, reason string) {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		log.Printf("[Auth] 账号 %s 凭据文件删除失败: %v", path, err)
 	}
-	log.Printf("[Auth] ⚠️ 账号 %s 授权失效，已禁止调度并删除凭据文件: %s", path, reason)
+	log.Printf("[Auth] 账号 %s 授权失效，已禁止调度并删除凭据文件: %s", path, reason)
 	writeStatusSnapshot()
 }
 
@@ -940,15 +995,43 @@ func isRateLimited(statusCode int, body string) bool {
 	return false
 }
 
+func isQuotaExhausted(statusCode int, body string) bool {
+	if statusCode != http.StatusTooManyRequests && !strings.Contains(body, `"code":14018`) {
+		return false
+	}
+	low := strings.ToLower(body)
+	return strings.Contains(body, `"code":14018`) || strings.Contains(body, "额度已用尽") || strings.Contains(low, "credits exhausted")
+}
+
 // ensureValidTokenFor 对指定账号检查并刷新令牌（多账号版）。
 // 失效账号（Disabled 或 Auth 为 nil）直接跳过，不参与调度。
 func ensureValidTokenFor(acc *Account) error {
-	if acc == nil || acc.Disabled || acc.Auth == nil {
+	if acc == nil {
 		return nil
 	}
-	if time.Now().Unix() > acc.Auth.Auth.ExpiresAt-900 {
-		log.Printf("[Auth] 账号 %s 访问令牌即将/已经过期，正在自动刷新...", acc.Path)
-		return doRefreshTokenFor(acc)
+	accountMu.Lock()
+	disabled := acc.Disabled
+	hasAuth := acc.Auth != nil
+	expiresAt := int64(0)
+	if hasAuth {
+		expiresAt = acc.Auth.Auth.ExpiresAt
+	}
+	accountMu.Unlock()
+	if disabled || !hasAuth {
+		return nil
+	}
+	now := time.Now()
+	if now.Unix() > expiresAt-900 {
+		log.Printf("[Auth] 账号 %s Token 需要续期，当前过期时间=%s，刷新阈值=过期前15分钟，开始调用上游刷新接口", acc.Path, time.Unix(expiresAt, 0).Format("2006-01-02 15:04:05"))
+		if err := doRefreshTokenFor(acc); err != nil {
+			accountMu.Lock()
+			isDisabled := acc.Disabled
+			accountMu.Unlock()
+			if !isDisabled {
+				markCooldown(acc, now.Add(time.Minute), "Token 自动续期失败: "+err.Error())
+			}
+			return err
+		}
 	}
 	return nil
 }
@@ -983,20 +1066,49 @@ func doRefreshToken(sa *StoredAuth) error {
 // doRefreshTokenFor 刷新指定账号的令牌并保存回其凭据文件（多账号版）。
 // 若刷新因授权失效失败（401/403/refresh token 无效），自动禁用该账号并删除凭据文件。
 func doRefreshTokenFor(acc *Account) error {
-	if acc == nil || acc.Disabled || acc.Auth == nil || acc.Auth.Auth.RefreshToken == "" {
+	if acc == nil {
 		return fmt.Errorf("无法刷新：账号缺少 RefreshToken 或已失效")
 	}
-	status, err := refreshTokenPayload(acc.Auth)
+
+	// 与该账号的上游请求串行，避免刷新过程中请求读到一半更新的 Token。
+	acc.lock.Lock()
+	defer acc.lock.Unlock()
+
+	accountMu.Lock()
+	if acc.Disabled || acc.Auth == nil || acc.Auth.Auth.RefreshToken == "" {
+		accountMu.Unlock()
+		return fmt.Errorf("无法刷新：账号缺少 RefreshToken 或已失效")
+	}
+	refreshed := *acc.Auth
+	path := acc.Path
+	oldExpiresAt := refreshed.Auth.ExpiresAt
+	accountMu.Unlock()
+
+	log.Printf("[Auth] 账号 %s 开始刷新 Token，站点=%s，刷新前过期时间=%s", path, profileForEdition(refreshed.Edition).Label, time.Unix(oldExpiresAt, 0).Format("2006-01-02 15:04:05"))
+	status, err := refreshTokenPayload(&refreshed)
 	if err != nil {
+		log.Printf("[Auth] 账号 %s Token 刷新失败，HTTP=%d，原因=%v，旧凭据未覆盖", path, status, err)
 		if isAuthFailure(status, err.Error()) {
 			disableAccount(acc, fmt.Sprintf("令牌刷新失败 (HTTP %d): %v", status, err))
 		}
 		return err
 	}
-	if err := saveAuthTo(acc.Path, acc.Auth); err != nil {
+	if err := saveAuthTo(path, &refreshed); err != nil {
+		log.Printf("[Auth] 账号 %s Token 已从上游刷新，但写回凭据失败，内存与磁盘均保留旧凭据: %v", path, err)
 		return fmt.Errorf("写回凭据失败: %w", err)
 	}
-	log.Printf("[Auth] 账号 %s Token 刷新成功！新过期时间: %s", acc.Path, time.Unix(acc.Auth.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
+	fingerprint := ""
+	if st, statErr := os.Stat(path); statErr == nil {
+		fingerprint = accountFingerprint(st)
+	}
+	accountMu.Lock()
+	if !acc.Disabled {
+		acc.Auth = &refreshed
+		acc.Edition = profileForEdition(refreshed.Edition).Key
+		acc.fingerprint = fingerprint
+	}
+	accountMu.Unlock()
+	log.Printf("[Auth] 账号 %s Token 刷新成功，过期时间由 %s 更新为 %s，凭据已安全写回", path, time.Unix(oldExpiresAt, 0).Format("2006-01-02 15:04:05"), time.Unix(refreshed.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
 	writeStatusSnapshot()
 	return nil
 }
@@ -1037,6 +1149,161 @@ func refreshTokenPayload(sa *StoredAuth) (int, error) {
 	return status, nil
 }
 
+func parseQuotaCapacity(value string) (float64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
+	}
+	return strconv.ParseFloat(value, 64)
+}
+
+func parseQuotaSummary(data []byte) (total, used, remaining float64, paid bool, err error) {
+	var summary quotaSummaryData
+	if err = json.Unmarshal(data, &summary); err != nil {
+		return 0, 0, 0, false, fmt.Errorf("解析额度响应失败: %w", err)
+	}
+	for _, pkg := range summary.Packages {
+		pkgTotal, parseErr := parseQuotaCapacity(pkg.CycleTotalCapacity)
+		if parseErr != nil {
+			return 0, 0, 0, false, fmt.Errorf("解析总额度 %q 失败: %w", pkg.CycleTotalCapacity, parseErr)
+		}
+		pkgUsed, parseErr := parseQuotaCapacity(pkg.CycleUsedCapacity)
+		if parseErr != nil {
+			return 0, 0, 0, false, fmt.Errorf("解析已用额度 %q 失败: %w", pkg.CycleUsedCapacity, parseErr)
+		}
+		pkgRemaining, parseErr := parseQuotaCapacity(pkg.CycleRemainCapacity)
+		if parseErr != nil {
+			return 0, 0, 0, false, fmt.Errorf("解析剩余额度 %q 失败: %w", pkg.CycleRemainCapacity, parseErr)
+		}
+		total += pkgTotal
+		used += pkgUsed
+		remaining += pkgRemaining
+	}
+	return total, used, remaining, summary.IsPaidUser, nil
+}
+
+func formatQuota(value float64) string {
+	if value > -0.005 && value < 0.005 {
+		value = 0
+	}
+	return strings.TrimRight(strings.TrimRight(strconv.FormatFloat(value, 'f', 2, 64), "0"), ".")
+}
+
+// refreshAccountQuota 通过用户中心只读计费接口刷新账号额度，不记录或回传 Token。
+func refreshAccountQuota(ctx context.Context, acc *Account) error {
+	if acc == nil {
+		return nil
+	}
+	acc.lock.Lock()
+	defer acc.lock.Unlock()
+
+	accountMu.Lock()
+	if acc.Disabled || acc.Auth == nil || acc.Auth.Auth.AccessToken == "" {
+		accountMu.Unlock()
+		return nil
+	}
+	auth := *acc.Auth
+	path := acc.Path
+	prof := acc.Profile()
+	accountMu.Unlock()
+
+	log.Printf("[Quota] 账号 %s 开始查询额度，站点=%s，接口=%s", path, prof.Label, prof.quotaSummaryURL())
+	headers := func(r *http.Request) {
+		commonHeaders(r, prof)
+		r.Header.Set("Authorization", "Bearer "+auth.Auth.AccessToken)
+		r.Header.Set("X-Client-Platform", "web")
+		if auth.Account.EnterpriseID != "" {
+			r.Header.Set("X-Enterprise-Id", auth.Account.EnterpriseID)
+		}
+	}
+	data, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.quotaSummaryURL(), headers, strings.NewReader("{}"))
+	if err != nil {
+		log.Printf("[Quota] 账号 %s 查询额度失败，HTTP=%d，原因=%v，保留上一次额度数据", path, status, err)
+		return err
+	}
+	total, used, remaining, paid, err := parseQuotaSummary(data)
+	if err != nil {
+		log.Printf("[Quota] 账号 %s 查询额度响应无法解析，原因=%v，保留上一次额度数据", path, err)
+		return err
+	}
+	accountMu.Lock()
+	wasExhausted := acc.QuotaExhausted
+	acc.QuotaTotal = total
+	acc.QuotaUsed = used
+	acc.QuotaRemaining = remaining
+	acc.IsPaidUser = paid
+	acc.QuotaKnown = true
+	acc.QuotaExhausted = remaining <= 0
+	accountMu.Unlock()
+	switch {
+	case !wasExhausted && remaining <= 0:
+		log.Printf("[Quota] 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t；账号已冻结调度，等待额度恢复", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid)
+	case wasExhausted && remaining > 0:
+		log.Printf("[Quota] 账号 %s 额度已恢复，总额度=%s，已用=%s，剩余=%s，付费用户=%t；账号已自动解除冻结并恢复调度", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid)
+	default:
+		log.Printf("[Quota] 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid)
+	}
+	return nil
+}
+
+func refreshAllAccountQuotas(ctx context.Context, done chan<- struct{}) {
+	defer close(done)
+	accountMu.Lock()
+	accs := append([]*Account(nil), accounts...)
+	accountMu.Unlock()
+	log.Printf("[Quota] 开始批量更新额度，账号数=%d", len(accs))
+	for _, acc := range accs {
+		if err := ctx.Err(); err != nil {
+			log.Printf("[Quota] 本轮额度更新被取消，尚未扫描的账号将等待下一轮: %v", err)
+			break
+		}
+		if err := refreshAccountQuota(ctx, acc); err != nil {
+			log.Printf("[Quota] 账号 %s 本轮额度更新未完成: %v", acc.Path, err)
+		}
+	}
+	writeStatusSnapshot()
+	log.Printf("[Quota] 本轮额度更新完成，状态快照已写入")
+}
+
+func backgroundQuotaRefresher() {
+	const interval = time.Minute
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var cancel context.CancelFunc
+	var done chan struct{}
+	start := func() {
+		if cancel != nil && done != nil {
+			select {
+			case <-done:
+			default:
+				log.Printf("[Quota] 新一轮额度扫描到达，正在强制取消上一轮未完成的请求")
+				cancel()
+			}
+		}
+		ctx, nextCancel := context.WithCancel(context.Background())
+		cancel = nextCancel
+		done = make(chan struct{})
+		go refreshAllAccountQuotas(ctx, done)
+	}
+	start()
+	for {
+		select {
+		case <-ticker.C:
+			start()
+		case <-quotaScanTrigger:
+			log.Printf("[Quota] 凭据池发生变化，立即触发一轮额度扫描")
+			start()
+		}
+	}
+}
+
+func requestQuotaScan() {
+	select {
+	case quotaScanTrigger <- struct{}{}:
+	default:
+	}
+}
+
 // -----------------------------------------------------------------------------
 // CLI 子命令实现: login, status, refresh
 // -----------------------------------------------------------------------------
@@ -1060,9 +1327,9 @@ func formatAccountStatus(acc *Account, idx int, now time.Time) string {
 		}
 		sb.WriteString(fmt.Sprintf("用户昵称:     %s\n", ifEmpty(nickname, "(未知)")))
 		sb.WriteString(fmt.Sprintf("用户 UID:     %s\n", ifEmpty(uid, "(未知)")))
-		sb.WriteString("账号状态:     ❌ 授权失效（禁止调度）\n")
+		sb.WriteString("账号状态:     授权失效（禁止调度）\n")
 		sb.WriteString(fmt.Sprintf("失效原因:     %s\n", truncate(acc.DisabledReason, 200)))
-		sb.WriteString(fmt.Sprintf("处理建议:     ⚠️ 凭据文件已删除，请重新执行: workbuddy-gateway login -auth %s\n", acc.Path))
+		sb.WriteString(fmt.Sprintf("处理建议:     凭据文件已删除，请重新执行: workbuddy-gateway login -auth %s\n", acc.Path))
 		return sb.String()
 	}
 
@@ -1082,12 +1349,12 @@ func formatAccountStatus(acc *Account, idx int, now time.Time) string {
 	sb.WriteString(fmt.Sprintf("企业 ID:      %s\n", ifEmpty(acc.Auth.Account.EnterpriseID, "(个人账号)")))
 	sb.WriteString(fmt.Sprintf("认证域名:     %s\n", ifEmpty(acc.Auth.Auth.Domain, "www.codebuddy.cn")))
 	if acc.CooldownUntil.After(now) {
-		sb.WriteString(fmt.Sprintf("冷却状态:     🔒 冷却中 (解封: %s, 剩余 %v)\n",
+		sb.WriteString(fmt.Sprintf("冷却状态:     冷却中 (解封: %s, 剩余 %v)\n",
 			acc.CooldownUntil.Format("2006-01-02 15:04:05"),
 			time.Until(acc.CooldownUntil).Round(time.Minute)))
 		sb.WriteString(fmt.Sprintf("冷却原因:     %s\n", truncate(acc.CooldownMsg, 120)))
 	} else {
-		sb.WriteString("冷却状态:     ✅ 可用\n")
+		sb.WriteString("冷却状态:     可用\n")
 	}
 	sb.WriteString(fmt.Sprintf("Token 状态:   %s\n", statusStr))
 	sb.WriteString(fmt.Sprintf("过期时间:     %s (剩余 %v)\n", expTime.Format("2006-01-02 15:04:05"), remaining.Round(time.Minute)))
@@ -1118,26 +1385,30 @@ func runRefresh() {
 		return
 	}
 	accountMu.Lock()
-	defer accountMu.Unlock()
-	if len(accounts) == 0 {
+	accs := append([]*Account(nil), accounts...)
+	accountMu.Unlock()
+	if len(accs) == 0 {
 		fmt.Println("账号池为空")
 		return
 	}
 	ok := 0
 	fail := 0
 	skipped := 0
-	for i, acc := range accounts {
+	for i, acc := range accs {
 		fmt.Printf("正在刷新账号 #%d (%s)... ", i+1, acc.Path)
-		if acc.Disabled || acc.Auth == nil {
-			fmt.Printf("⏭️ 跳过（授权失效，请重新登录）\n")
+		accountMu.Lock()
+		disabled := acc.Disabled || acc.Auth == nil
+		accountMu.Unlock()
+		if disabled {
+			fmt.Printf("跳过（授权失效，请重新登录）\n")
 			skipped++
 			continue
 		}
 		if err := doRefreshTokenFor(acc); err != nil {
-			fmt.Printf("❌ %v\n", err)
+			fmt.Printf("失败: %v\n", err)
 			fail++
 		} else {
-			fmt.Println("✅")
+			fmt.Println("成功")
 			ok++
 		}
 	}
@@ -1150,15 +1421,21 @@ func runRefresh() {
 
 // accountSnapshot 是写入状态快照文件的单个账号状态。
 type accountSnapshot struct {
-	Path           string `json:"path"`
-	Edition        string `json:"edition,omitempty"` // 站点标识（cn/intl）
-	Nickname       string `json:"nickname"`
-	UID            string `json:"uid"`
-	State          string `json:"state"` // active | cooldown | disabled
-	CooldownUntil  int64  `json:"cooldownUntil,omitempty"`
-	CooldownMsg    string `json:"cooldownMsg,omitempty"`
-	DisabledReason string `json:"disabledReason,omitempty"`
-	TokenExpiresAt int64  `json:"tokenExpiresAt,omitempty"`
+	Path           string  `json:"path"`
+	Edition        string  `json:"edition,omitempty"` // 站点标识（cn/intl）
+	Nickname       string  `json:"nickname"`
+	UID            string  `json:"uid"`
+	State          string  `json:"state"` // active | cooldown | expired | disabled
+	CooldownUntil  int64   `json:"cooldownUntil,omitempty"`
+	CooldownMsg    string  `json:"cooldownMsg,omitempty"`
+	DisabledReason string  `json:"disabledReason,omitempty"`
+	TokenExpiresAt int64   `json:"tokenExpiresAt,omitempty"`
+	QuotaTotal     float64 `json:"quotaTotal,omitempty"`
+	QuotaUsed      float64 `json:"quotaUsed,omitempty"`
+	QuotaRemaining float64 `json:"quotaRemaining"`
+	IsPaidUser     bool    `json:"isPaidUser"`
+	QuotaKnown     bool    `json:"quotaKnown,omitempty"`
+	QuotaExhausted bool    `json:"quotaExhausted,omitempty"`
 }
 
 // statusSnapshot 是写入 workbuddy-status.json 的完整快照。
@@ -1175,6 +1452,12 @@ func writeStatusSnapshot() {
 	now := time.Now()
 	for _, acc := range accounts {
 		as := accountSnapshot{Path: acc.Path, Edition: acc.Profile().Key}
+		as.QuotaTotal = acc.QuotaTotal
+		as.QuotaUsed = acc.QuotaUsed
+		as.QuotaRemaining = acc.QuotaRemaining
+		as.IsPaidUser = acc.IsPaidUser
+		as.QuotaKnown = acc.QuotaKnown
+		as.QuotaExhausted = acc.QuotaExhausted
 		switch {
 		case acc.Disabled:
 			as.State = "disabled"
@@ -1190,6 +1473,18 @@ func writeStatusSnapshot() {
 			as.State = "cooldown"
 			as.CooldownUntil = acc.CooldownUntil.Unix()
 			as.CooldownMsg = acc.CooldownMsg
+			if acc.Auth != nil {
+				as.Nickname = acc.Auth.Account.Nickname
+				as.UID = acc.Auth.Account.UID
+				as.TokenExpiresAt = acc.Auth.Auth.ExpiresAt
+			}
+		case acc.Auth != nil && acc.Auth.Auth.ExpiresAt > 0 && acc.Auth.Auth.ExpiresAt <= now.Unix():
+			as.State = "expired"
+			as.Nickname = acc.Auth.Account.Nickname
+			as.UID = acc.Auth.Account.UID
+			as.TokenExpiresAt = acc.Auth.Auth.ExpiresAt
+		case acc.QuotaExhausted:
+			as.State = "quota_exhausted"
 			if acc.Auth != nil {
 				as.Nickname = acc.Auth.Account.Nickname
 				as.UID = acc.Auth.Account.UID
@@ -1217,6 +1512,104 @@ func writeStatusSnapshot() {
 		return
 	}
 	_ = os.Rename(tmp, statusSnapshotFile)
+}
+
+func displayWidth(s string) int {
+	width := 0
+	for _, r := range s {
+		if r >= 0x1100 && (r <= 0x115f || r == 0x2329 || r == 0x232a ||
+			(r >= 0x2e80 && r <= 0xa4cf) || (r >= 0xac00 && r <= 0xd7a3) ||
+			(r >= 0xf900 && r <= 0xfaff) || (r >= 0xfe10 && r <= 0xfe6f) ||
+			(r >= 0xff00 && r <= 0xff60) || (r >= 0xffe0 && r <= 0xffe6)) {
+			width += 2
+		} else {
+			width++
+		}
+	}
+	return width
+}
+
+func fitCell(s string, width int) string {
+	s = strings.ReplaceAll(strings.ReplaceAll(s, "\r", " "), "\n", " ")
+	if displayWidth(s) <= width {
+		return s + strings.Repeat(" ", width-displayWidth(s))
+	}
+	limit := width - 3
+	var b strings.Builder
+	used := 0
+	for len(s) > 0 {
+		r, size := utf8.DecodeRuneInString(s)
+		rw := displayWidth(string(r))
+		if used+rw > limit {
+			break
+		}
+		b.WriteRune(r)
+		used += rw
+		s = s[size:]
+	}
+	return b.String() + "..." + strings.Repeat(" ", width-used-3)
+}
+
+func renderAccountTable(accs []accountSnapshot) string {
+	widths := []int{4, 20, 24, 8, 10, 19, 10, 10, 10, 10}
+	headers := []string{"序号", "凭据文件", "账号", "站点", "状态", "Token 有效期", "总额度", "已用", "剩余", "付费用户"}
+	border := func() string {
+		var b strings.Builder
+		b.WriteByte('+')
+		for _, width := range widths {
+			b.WriteString(strings.Repeat("-", width+2))
+			b.WriteByte('+')
+		}
+		return b.String()
+	}
+	row := func(cells []string) string {
+		var b strings.Builder
+		b.WriteByte('|')
+		for i, cell := range cells {
+			b.WriteByte(' ')
+			b.WriteString(fitCell(cell, widths[i]))
+			b.WriteString(" |")
+		}
+		return b.String()
+	}
+
+	var b strings.Builder
+	b.WriteString(border() + "\n")
+	b.WriteString(row(headers) + "\n")
+	b.WriteString(border() + "\n")
+	for i, a := range accs {
+		status := "可用"
+		expires := "-"
+		total, used, remaining, paid := "-", "-", "-", "-"
+		if a.QuotaKnown {
+			total = formatQuota(a.QuotaTotal)
+			used = formatQuota(a.QuotaUsed)
+			remaining = formatQuota(a.QuotaRemaining)
+			paid = "否"
+			if a.IsPaidUser {
+				paid = "是"
+			}
+		}
+		if a.TokenExpiresAt > 0 {
+			expires = time.Unix(a.TokenExpiresAt, 0).Format("2006-01-02 15:04:05")
+		}
+		switch a.State {
+		case "cooldown":
+			status = "冷却"
+		case "expired":
+			status = "已过期"
+		case "quota_exhausted":
+			status = "额度耗尽"
+		case "disabled":
+			status = "失效"
+		}
+		b.WriteString(row([]string{
+			strconv.Itoa(i + 1), filepath.Base(a.Path), ifEmpty(a.Nickname, "-"),
+			profileForEdition(a.Edition).Label, status, expires, total, used, remaining, paid,
+		}) + "\n")
+	}
+	b.WriteString(border())
+	return b.String()
 }
 
 // statusSnapshotLoop serve 后台每 3 秒刷新一次状态快照。
@@ -1333,61 +1726,48 @@ func runMonitor() {
 		} else {
 			fmt.Println()
 		}
-		fmt.Printf("🕐 更新时间: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+		fmt.Printf("更新时间: %s\n", time.Now().Format("2006-01-02 15:04:05"))
 
 		data, err := os.ReadFile(statusSnapshotFile)
 		if err != nil {
-			fmt.Printf("⚠️ 未找到状态文件 %s（服务是否在运行？请确认已在服务工作目录执行 monitor）\n", statusSnapshotFile)
+			fmt.Printf("未找到状态文件 %s（服务是否在运行？请确认已在服务工作目录执行 monitor）\n", statusSnapshotFile)
 		} else {
 			var snap statusSnapshot
 			if err := json.Unmarshal(data, &snap); err == nil {
-				active, cooldown, disabled := 0, 0, 0
+				active, cooldown, exhausted, expired, disabled := 0, 0, 0, 0, 0
 				for _, a := range snap.Accounts {
 					switch a.State {
 					case "active":
 						active++
 					case "cooldown":
 						cooldown++
+					case "expired":
+						expired++
+					case "quota_exhausted":
+						exhausted++
 					case "disabled":
 						disabled++
 					}
 				}
-				fmt.Printf("📊 账号池: 共 %d 个 | ✅ 可用 %d | 🔒 冷却 %d | ❌ 失效 %d\n",
-					len(snap.Accounts), active, cooldown, disabled)
-				for i, a := range snap.Accounts {
-					fmt.Printf("  #%d %s (%s · %s)\n", i+1, a.Path, ifEmpty(a.Nickname, "?"), profileForEdition(a.Edition).Label)
-					switch a.State {
-					case "active":
-						fmt.Printf("     ✅ 可用 | Token 有效期至: %s\n",
-							time.Unix(a.TokenExpiresAt, 0).Format("01-02 15:04"))
-					case "cooldown":
-						fmt.Printf("     🔒 冷却中 至 %s (剩余 %v)\n",
-							time.Unix(a.CooldownUntil, 0).Format("01-02 15:04:05"),
-							time.Until(time.Unix(a.CooldownUntil, 0)).Round(time.Minute))
-						if a.CooldownMsg != "" {
-							fmt.Printf("     原因: %s\n", truncate(a.CooldownMsg, 100))
-						}
-					case "disabled":
-						fmt.Printf("     ❌ 授权失效: %s\n", truncate(a.DisabledReason, 100))
-						fmt.Printf("     ⚠️ 请重新执行: workbuddy-gateway login -auth %s\n", a.Path)
-					}
-				}
+				fmt.Printf("账号池: 共 %d 个 | 可用 %d | 冷却 %d | 额度耗尽 %d | 过期 %d | 失效 %d\n",
+					len(snap.Accounts), active, cooldown, exhausted, expired, disabled)
+				fmt.Println(renderAccountTable(snap.Accounts))
 			} else {
-				fmt.Println("⚠️ 状态文件解析失败")
+				fmt.Println("状态文件解析失败")
 			}
 		}
 
 		// 最近日志
 		if cfg.JournalService != "" {
 			if lines, err := journalLines(cfg.JournalService, logN); err == nil && len(lines) > 0 {
-				fmt.Printf("\n📜 最近日志 (journalctl -u %s):\n", cfg.JournalService)
+				fmt.Printf("\n最近日志 (journalctl -u %s):\n", cfg.JournalService)
 				for _, l := range lines {
 					fmt.Println("  " + l)
 				}
 			}
 		} else if cfg.LogFile != "" {
 			if lines, err := tailLines(cfg.LogFile, logN); err == nil && len(lines) > 0 {
-				fmt.Printf("\n📜 最近日志 (%s):\n", cfg.LogFile)
+				fmt.Printf("\n最近日志 (%s):\n", cfg.LogFile)
 				for _, l := range lines {
 					fmt.Println("  " + l)
 				}
@@ -1447,7 +1827,7 @@ func runLogin() {
 	}
 
 	fmt.Println("如无法扫码，也可在浏览器中直接打开以下链接：")
-	fmt.Printf("👉 %s\n\n", st.AuthURL)
+	fmt.Printf("%s\n\n", st.AuthURL)
 	fmt.Println("等待登录授权完成 (按 Ctrl+C 可取消)...")
 
 	deadline := time.Now().Add(prof.LoginTTL)
@@ -1500,7 +1880,7 @@ func runLogin() {
 				return
 			}
 
-			fmt.Println("\n🎉 登录成功！")
+			fmt.Println("\n登录成功")
 			fmt.Printf("站点:         %s (%s)\n", prof.Label, strings.TrimPrefix(prof.Base, "https://"))
 			fmt.Printf("欢迎，%s (UID: %s)\n", sa.Account.Nickname, sa.Account.UID)
 			fmt.Printf("凭据已成功保存至: %s\n", cfg.AuthFile)
@@ -1521,17 +1901,19 @@ func runServe() {
 		fmt.Printf("警告: 未检测到有效凭据 (%v)。\n请先执行: workbuddy-gateway login 扫码登录，或确保凭据文件存在。\n\n", err)
 	} else {
 		accountMu.Lock()
-		for _, acc := range accounts {
+		accs := append([]*Account(nil), accounts...)
+		accountMu.Unlock()
+		for _, acc := range accs {
 			if acc.Disabled || acc.Auth == nil {
 				continue
 			}
 			_ = ensureValidTokenFor(acc)
 		}
-		accountMu.Unlock()
 	}
 
 	// 启动后台自动刷新协程
 	go backgroundTokenRefresher()
+	go backgroundQuotaRefresher()
 
 	// 启动状态快照协程（monitor 命令实时读取展示）
 	go statusSnapshotLoop()
@@ -1555,13 +1937,13 @@ func runServe() {
 	listenAddr := fmt.Sprintf("%s:%d", cfg.Addr, cfg.Port)
 	server := &http.Server{
 		Addr:         listenAddr,
-		Handler:      corsMiddleware(authMiddleware(mux)),
+		Handler:      requestAuditMiddleware(corsMiddleware(authMiddleware(mux))),
 		ReadTimeout:  120 * time.Second,
 		WriteTimeout: 300 * time.Second,
 	}
 
 	fmt.Println("================================================================")
-	fmt.Printf("🚀 WorkBuddy 本地网关已启动！\n")
+	fmt.Printf("WorkBuddy 本地网关已启动\n")
 	fmt.Printf("   服务监听地址:  http://%s\n", listenAddr)
 	fmt.Printf("   Chat 接口地址: http://%s/v1/chat/completions\n", listenAddr)
 	fmt.Printf("   Models 接口:   http://%s/v1/models\n", listenAddr)
@@ -1607,9 +1989,9 @@ func runServe() {
 		fileList = append(fileList, acc.Path)
 	}
 	if len(fileList) > 0 {
-		fmt.Printf("   ✅ 已加载凭据文件 (%d): %s\n", len(fileList), strings.Join(fileList, ", "))
+		fmt.Printf("   已加载凭据文件 (%d): %s\n", len(fileList), strings.Join(fileList, ", "))
 	} else {
-		fmt.Println("   ⚠️ 未加载到任何凭据文件，请先执行 login 命令扫码登录")
+		fmt.Println("   未加载到任何凭据文件，请先执行 login 命令扫码登录")
 	}
 	accountMu.Unlock()
 
@@ -1649,6 +2031,50 @@ func backgroundTokenRefresher() {
 	}
 }
 
+type auditResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *auditResponseWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *auditResponseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *auditResponseWriter) Flush() {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func requestAuditMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		traceID := r.Header.Get("X-Trace-ID")
+		if traceID == "" {
+			traceID = uuid.NewString()
+		}
+		w.Header().Set("X-Trace-ID", traceID)
+		aw := &auditResponseWriter{ResponseWriter: w}
+		log.Printf("[请求到达] traceId=%s 方法=%s 路径=%s 来源=%s 说明=请求已进入网关", traceID, r.Method, r.URL.Path, r.RemoteAddr)
+		next.ServeHTTP(aw, r)
+		if aw.status == 0 {
+			aw.status = http.StatusOK
+		}
+		log.Printf("[响应返回] traceId=%s 状态码=%d 耗时=%v 结果=%s", traceID, aw.status, time.Since(start), http.StatusText(aw.status))
+	})
+}
+
 // -----------------------------------------------------------------------------
 // 中间件: CORS 与可选 APIKey 校验
 // -----------------------------------------------------------------------------
@@ -1659,9 +2085,11 @@ func corsMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "*")
 		if r.Method == http.MethodOptions {
+			log.Printf("[中间件-CORS] traceId=%s 结果=通过并直接响应 说明=预检请求未进入业务方法", w.Header().Get("X-Trace-ID"))
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		log.Printf("[中间件-CORS] traceId=%s 结果=通过", w.Header().Get("X-Trace-ID"))
 		next.ServeHTTP(w, r)
 	})
 }
@@ -1672,10 +2100,12 @@ func authMiddleware(next http.Handler) http.Handler {
 			authHeader := r.Header.Get("Authorization")
 			token := strings.TrimPrefix(authHeader, "Bearer ")
 			if token != cfg.APIKey {
+				log.Printf("[请求被拦截] traceId=%s 拦截层=API鉴权 结果=拒绝 原因=未提供有效API密钥 返回状态码=401 业务影响=请求未进入业务方法", w.Header().Get("X-Trace-ID"))
 				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "未提供有效 API 密钥")
 				return
 			}
 		}
+		log.Printf("[中间件-鉴权] traceId=%s 结果=通过", w.Header().Get("X-Trace-ID"))
 		next.ServeHTTP(w, r)
 	})
 }
@@ -1688,6 +2118,8 @@ func authMiddleware(next http.Handler) http.Handler {
 // 成功时返回 200 响应（调用方负责关闭 Body）与命中的账号/站点；失败时函数内部已写回
 // 错误响应并返回 ok=false。Chat Completions 与 Responses 两个入口共用此逻辑。
 func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstreamBytes []byte, startTime time.Time) (*http.Response, *Account, *upstreamProfile, bool) {
+	traceID := w.Header().Get("X-Trace-ID")
+	log.Printf("[业务入口] traceId=%s requestId=%d 业务=上游模型调用 请求体字节数=%d", traceID, reqID, len(upstreamBytes))
 	accountMu.Lock()
 	poolSize := len(accounts)
 	accountMu.Unlock()
@@ -1713,7 +2145,10 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstream
 			writeOpenAIError(w, http.StatusServiceUnavailable, "no_available_account", msg)
 			return nil, nil, nil, false
 		}
-		_ = ensureValidTokenFor(acc)
+		if err := ensureValidTokenFor(acc); err != nil {
+			lastAuthErr = err.Error()
+			continue
+		}
 		// 令牌刷新时若发现授权失效会禁用账号；若被禁用则跳过换下一个
 		accountMu.Lock()
 		disabled := acc.Disabled
@@ -1732,13 +2167,13 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstream
 			return nil, nil, nil, false
 		}
 		// 注入 CodeBuddy 凭据与指纹 Header
-		backendHeaders(upstreamReq, acc.Auth, prof)
-
 		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
 		acc.lock.Lock()
+		backendHeaders(upstreamReq, acc.Auth, prof)
 		resp, err := cfg.HttpClient.Do(upstreamReq)
 		acc.lock.Unlock()
 		if err != nil {
+			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游网络调用 账号=%s 异常=%v 业务影响=本次模型请求失败 是否已处理=是", traceID, reqID, acc.Path, err)
 			log.Printf("[#%d] 账号 %s [%s] 上游请求失败: %v", reqID, acc.Path, prof.Label, err)
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
 			return nil, nil, nil, false
@@ -1750,6 +2185,19 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstream
 			resp.Body.Close()
 			errStr := string(errBody)
 			log.Printf("[#%d] 账号 %s [%s] 上游返回 HTTP %d: %s (耗时 %v)", reqID, acc.Path, prof.Label, resp.StatusCode, errStr, time.Since(startTime))
+			log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=失败 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
+
+			if isQuotaExhausted(resp.StatusCode, errStr) {
+				accountMu.Lock()
+				acc.QuotaRemaining = 0
+				acc.QuotaKnown = true
+				acc.QuotaExhausted = true
+				accountMu.Unlock()
+				log.Printf("[Quota] 账号 %s 上游明确返回额度耗尽，已冻结调度；等待后台额度扫描发现恢复后自动解冻", acc.Path)
+				writeStatusSnapshot()
+				lastRateErr = errStr
+				continue
+			}
 
 			if isRateLimited(resp.StatusCode, errStr) {
 				// 429 频率限制：解析重置时间并屏蔽该账号，交由其他账号代偿
@@ -1774,6 +2222,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstream
 			return nil, nil, nil, false
 		}
 
+		log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=成功 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
 		return resp, acc, prof, true
 	}
 
@@ -2109,7 +2558,11 @@ func commonHeaders(req *http.Request, prof *upstreamProfile) {
 }
 
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
-	req, err := http.NewRequest(method, fullURL, body)
+	return doJSONContext(context.Background(), client, method, fullURL, headers, body)
+}
+
+func doJSONContext(ctx context.Context, client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
 	if err != nil {
 		return nil, 0, err
 	}

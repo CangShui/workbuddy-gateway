@@ -88,6 +88,9 @@ func TestUpstreamProfileURLs(t *testing.T) {
 	if got := cn.tokenRefreshURL(); got != "https://copilot.tencent.com/v2/plugin/auth/token/refresh" {
 		t.Errorf("cn tokenRefreshURL = %s", got)
 	}
+	if got := cn.quotaSummaryURL(); got != "https://www.codebuddy.cn/billing/meter/get-user-resource-summary" {
+		t.Errorf("cn quotaSummaryURL = %s", got)
+	}
 
 	itl := profileForEdition("intl")
 	if got := itl.authStateURL(); got != "https://www.workbuddy.ai/v2/plugin/auth/state?platform=workbuddy-ai" {
@@ -101,6 +104,9 @@ func TestUpstreamProfileURLs(t *testing.T) {
 	}
 	if got := itl.chatURL(); got != "https://www.workbuddy.ai/v2/chat/completions" {
 		t.Errorf("intl chatURL = %s", got)
+	}
+	if got := itl.quotaSummaryURL(); got != "https://www.workbuddy.ai/billing/meter/get-user-resource-summary" {
+		t.Errorf("intl quotaSummaryURL = %s", got)
 	}
 }
 
@@ -217,6 +223,57 @@ func TestNextAccountCooldownExpiry(t *testing.T) {
 	t.Logf("expired cooldown recovers, selected %s", a.Path)
 }
 
+func TestNextAccountSkipsQuotaExhausted(t *testing.T) {
+	accountMu.Lock()
+	accounts = []*Account{
+		{Path: "empty.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaExhausted: true},
+		{Path: "available.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaRemaining: 10},
+	}
+	rrIndex = 0
+	accountMu.Unlock()
+
+	acc, err := nextAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Path != "available.json" {
+		t.Fatalf("expected available account, got %s", acc.Path)
+	}
+}
+
+func TestNextAccountAllQuotaExhausted(t *testing.T) {
+	accountMu.Lock()
+	accounts = []*Account{
+		{Path: "a.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaExhausted: true},
+		{Path: "b.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaExhausted: true},
+	}
+	rrIndex = 0
+	accountMu.Unlock()
+
+	_, err := nextAccount()
+	if err == nil || !strings.Contains(err.Error(), "额度均已耗尽") {
+		t.Fatalf("expected quota exhausted error, got %v", err)
+	}
+}
+
+func TestIsQuotaExhausted(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{429, `{"error":{"data":{"code":14018,"msg":"额度已用尽"}}}`, true},
+		{429, `{"error":{"data":{"code":14018,"msg":"Credits exhausted"}}}`, true},
+		{429, `{"code":6004,"msg":"rate limit"}`, false},
+		{400, `{"code":14018,"msg":"额度已用尽"}`, true},
+	}
+	for _, tc := range cases {
+		if got := isQuotaExhausted(tc.status, tc.body); got != tc.want {
+			t.Errorf("isQuotaExhausted(%d, %q)=%v want %v", tc.status, tc.body, got, tc.want)
+		}
+	}
+}
+
 // 验证授权失效识别（401/403 / invalid token / 登录过期等）
 func TestIsAuthFailure(t *testing.T) {
 	cases := []struct {
@@ -285,7 +342,7 @@ func TestDisableAccount(t *testing.T) {
 	}
 
 	acc := &Account{Path: authPath, Auth: &StoredAuth{
-		Auth: StoredTokens{AccessToken: "x"},
+		Auth:    StoredTokens{AccessToken: "x"},
 		Account: StoredAccount{Nickname: "tester", UID: "uid-1"},
 	}}
 
@@ -571,7 +628,7 @@ func TestWriteStatusSnapshot(t *testing.T) {
 		{Path: "a.json", Auth: &StoredAuth{
 			Auth:    StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()},
 			Account: StoredAccount{Nickname: "alice", UID: "u1"},
-		}},
+		}, QuotaTotal: 2000, QuotaUsed: 1500, QuotaRemaining: 500, IsPaidUser: true, QuotaKnown: true},
 		{Path: "b.json", Auth: &StoredAuth{
 			Auth:    StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()},
 			Account: StoredAccount{Nickname: "bob", UID: "u2"},
@@ -600,7 +657,115 @@ func TestWriteStatusSnapshot(t *testing.T) {
 	if !states["active"] || !states["cooldown"] || !states["disabled"] {
 		t.Fatalf("expected all three states in snapshot, got %v", states)
 	}
+	if snap.Accounts[0].QuotaTotal != 2000 || snap.Accounts[0].QuotaUsed != 1500 || snap.Accounts[0].QuotaRemaining != 500 || !snap.Accounts[0].IsPaidUser || !snap.Accounts[0].QuotaKnown {
+		t.Fatalf("quota fields not preserved in snapshot: %+v", snap.Accounts[0])
+	}
 	t.Logf("snapshot states: %v", states)
+}
+
+func TestWriteStatusSnapshotMarksExpiredToken(t *testing.T) {
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	accountMu.Lock()
+	oldAccounts := accounts
+	accounts = []*Account{{Path: "expired.json", Auth: &StoredAuth{
+		Auth:    StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(-time.Hour).Unix()},
+		Account: StoredAccount{Nickname: "expired-user"},
+	}}}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+
+	writeStatusSnapshot()
+	data, err := os.ReadFile(statusSnapshotFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snap statusSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Accounts) != 1 || snap.Accounts[0].State != "expired" {
+		t.Fatalf("expected expired state, got %+v", snap.Accounts)
+	}
+}
+
+func TestRenderAccountTableUsesFullYearAndNoEmoji(t *testing.T) {
+	expires := time.Date(2027, 9, 5, 1, 36, 55, 0, time.Local)
+	table := renderAccountTable([]accountSnapshot{{
+		Path:           "workbuddy4.json",
+		Edition:        "intl",
+		Nickname:       "user@example.com",
+		State:          "quota_exhausted",
+		TokenExpiresAt: expires.Unix(),
+		QuotaTotal:     1100,
+		QuotaUsed:      1100,
+		QuotaRemaining: 0,
+		IsPaidUser:     false,
+		QuotaKnown:     true,
+		QuotaExhausted: true,
+	}})
+	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "额度耗尽", "2027-09-05 01:36:55", "总额度", "已用", "剩余", "付费用户", "1100", "否"} {
+		if !strings.Contains(table, want) {
+			t.Fatalf("table missing %q:\n%s", want, table)
+		}
+	}
+	if strings.Contains(table, "说明") {
+		t.Fatalf("table should not contain removed description column:\n%s", table)
+	}
+	if strings.ContainsAny(table, "✅🔒❌🕐📊📜⚠️") {
+		t.Fatalf("table should not contain emoji:\n%s", table)
+	}
+}
+
+func TestParseQuotaSummary(t *testing.T) {
+	data := []byte(`{"Packages":[{"CycleTotalCapacity":"1500","CycleUsedCapacity":"69.98999993","CycleRemainCapacity":"1430.01000007"},{"CycleTotalCapacity":"500","CycleUsedCapacity":"500","CycleRemainCapacity":"0"}],"IsPaidUser":true}`)
+	total, used, remaining, paid, err := parseQuotaSummary(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2000 || used != 569.98999993 || remaining != 1430.01000007 || !paid {
+		t.Fatalf("unexpected quota summary: total=%v used=%v remaining=%v paid=%v", total, used, remaining, paid)
+	}
+}
+
+func TestFormatQuotaRoundsToTwoDecimals(t *testing.T) {
+	cases := map[float64]string{
+		4566:               "4566",
+		72.01999992:        "72.02",
+		4493.9800000800005: "4493.98",
+		0.001:              "0",
+	}
+	for input, want := range cases {
+		if got := formatQuota(input); got != want {
+			t.Errorf("formatQuota(%v)=%q want %q", input, got, want)
+		}
+	}
+}
+
+func TestRenderAccountTableRowsHaveEqualDisplayWidth(t *testing.T) {
+	table := renderAccountTable([]accountSnapshot{
+		{Path: "workbuddy1.json", Nickname: "Abandon", Edition: "cn", State: "quota_exhausted", QuotaKnown: true, QuotaTotal: 2000, QuotaUsed: 2000},
+		{Path: "workbuddy2.json", Nickname: "啊水", Edition: "cn", State: "active", QuotaKnown: true, QuotaTotal: 2000, QuotaUsed: 69.98999993, QuotaRemaining: 1930.01000007},
+	})
+	lines := strings.Split(table, "\n")
+	want := displayWidth(lines[0])
+	for i, line := range lines {
+		if got := displayWidth(line); got != want {
+			t.Fatalf("line %d display width=%d want=%d:\n%s", i, got, want, table)
+		}
+	}
 }
 
 // 构造 messages 便于表驱动测试
