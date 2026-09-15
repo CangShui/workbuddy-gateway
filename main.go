@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	version = "1.8.2"
+	version = "1.9.0"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -193,6 +193,7 @@ type Config struct {
 	LogFile         string // monitor 附加展示的日志文件路径
 	JournalService  string // monitor 附加展示的 systemd 服务名（journalctl -u）
 	LogLines        int    // monitor 展示的最近日志行数
+	ModelsRefresh   int    // 官方模型目录动态同步间隔（分钟），0 关闭
 	HttpClient      *http.Client
 }
 
@@ -291,6 +292,7 @@ func main() {
 	fs.StringVar(&cfg.LogFile, "logfile", "", "monitor 附加跟随的日志文件路径（如 -logfile /var/log/workbuddy-gateway.log）")
 	fs.StringVar(&cfg.JournalService, "journal", "", "monitor 附加跟随的 systemd 服务名（Linux 下用 journalctl -u <服务> -f 跟随）")
 	fs.IntVar(&cfg.LogLines, "lines", 5, "monitor 每次刷新展示的最近日志行数")
+	fs.IntVar(&cfg.ModelsRefresh, "models-refresh", 60, "官方模型目录动态同步间隔（分钟），0 关闭：/v1/models 自动跟进官方最新模型列表，无需更新二进制")
 	_ = fs.Parse(args)
 
 	// 检测 -auth 是否被显式指定：
@@ -304,6 +306,7 @@ func main() {
 
 	// 初始化 HTTP 客户端
 	initHTTPClient()
+	initModelsHTTPClient()
 	closeLog := initFileLogging(command)
 	defer closeLog()
 
@@ -372,6 +375,10 @@ func printHelp() {
   -reload-interval <sec>
                     账号池热加载扫描间隔（默认 5 秒，0 关闭）：运行期自动发现
                     新增/更新/删除的凭据文件，免重启生效
+  -models-refresh <min>
+                    官方模型目录动态同步间隔（默认 60 分钟，0 关闭）：
+                    /v1/models 自动合并 npm 官方目录与静态兜底列表，
+                    上游发布新模型（如 DeepSeek v4.1）后免更新自动跟进
   -api-key <key>    设置后，调用网关必须携带 Bearer <key> 鉴权
   -proxy <url>      设置上游转发代理 (例如 http://127.0.0.1:7890 或 socks5://...)
   -verbose          输出详细调试日志 (请求/响应体)
@@ -1923,6 +1930,12 @@ func runServe() {
 		go accountReloaderLoop()
 	}
 
+	// 加载模型目录磁盘缓存并启动官方目录动态同步协程（/v1/models 自动跟进最新模型）
+	loadModelsCache()
+	if cfg.ModelsRefresh > 0 {
+		go modelsRefreshLoop(time.Duration(cfg.ModelsRefresh) * time.Minute)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", handleChatCompletions)
 	mux.HandleFunc("/chat/completions", handleChatCompletions)
@@ -1948,6 +1961,7 @@ func runServe() {
 	fmt.Printf("   Chat 接口地址: http://%s/v1/chat/completions\n", listenAddr)
 	fmt.Printf("   Models 接口:   http://%s/v1/models\n", listenAddr)
 	fmt.Printf("   模型转发策略:  【完全透传】客户端请求的任意 model 原样中继至上游\n")
+	fmt.Printf("   模型列表:      %s\n", modelsStatusText())
 	if cfg.ReloadInterval > 0 {
 		fmt.Printf("   凭据热加载:    每 %ds 自动扫描，新增/更新/删除凭据免重启生效\n", cfg.ReloadInterval)
 	} else {
@@ -2353,33 +2367,46 @@ func writeChatAggregate(w http.ResponseWriter, resp *http.Response, modelName st
 // -----------------------------------------------------------------------------
 
 func handleModels(w http.ResponseWriter, r *http.Request) {
-	// 动态内置常见模型，用户直接传入任何未列出的 model 也会直接透传到上游
-	modelsList := []map[string]any{
-		{"id": "hy4-preview", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "hy3-preview-agent", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "hy3-preview", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "hy3", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "glm-5.2", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "glm-5.1", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "kimi-k2.7", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "deepseek-v4-pro", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "deepseek-v4-flash", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "minimax-m3-pay", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
+	// 动态合并官方目录与静态兜底列表；客户端传入任何未列出的 model 也会直接透传到上游
+	ids, source := mergedModelIDs()
+	data := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		data = append(data, map[string]any{
+			"id":         id,
+			"object":     "model",
+			"owned_by":   "workbuddy",
+			"permission": []any{},
+		})
 	}
 	resp := map[string]any{
 		"object": "list",
-		"data":   modelsList,
+		"data":   data,
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if source != "" {
+		w.Header().Set("X-Model-Source", "official-catalog-v"+source)
+	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// modelsStatusText 生成启动横幅/健康检查用的模型列表状态描述。
+func modelsStatusText() string {
+	ids, source := mergedModelIDs()
+	dyn, _ := modelsSnapshot()
+	if source == "" {
+		return fmt.Sprintf("静态兜底 %d 个（动态目录尚未同步成功）", len(ids))
+	}
+	return fmt.Sprintf("动态同步官方目录 v%s（%d 个）+ 静态兜底，共 %d 个", source, len(dyn), len(ids))
+}
+
 func handleHealth(w http.ResponseWriter, r *http.Request) {
+	_, source := modelsSnapshot()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":    "healthy",
-		"timestamp": time.Now().Unix(),
-		"version":   version,
+		"status":       "healthy",
+		"timestamp":    time.Now().Unix(),
+		"version":      version,
+		"modelsSource": ifEmpty(source, "static-fallback"),
 	})
 }
 

@@ -16,6 +16,7 @@
 
 - **国内 / 国际双站反代**：国际站 `www.workbuddy.ai` 与国内站走同一套 `/v2/plugin/*` 协议，凭据文件通过 `edition` 字段区分站点，刷新 / 对话自动路由到各自上游。
 - **模型完全透传**：客户端（OpenAI SDK、Cursor、Claude Code、DSH 等）传什么 `model`（如 `hy4-preview`、`hy3-preview-agent`、`hy3`、`deepseek-v4-pro`、`glm-5.2`…），网关原样透传至腾讯上游，无白名单限制。
+- **模型列表自动同步**：`GET /v1/models` 动态合并「官方 CLI 模型目录」（运行时从 npm 拉取 `@tencent-ai/codebuddy-code` 最新版内置目录，官方发布新版本后免更新二进制自动跟进；npmjs 不可达自动切 npmmirror 镜像）与内置静态兜底列表（含官方目录尚未收录的 `deepseek-v4.1`），目录落盘缓存、断网不影响服务。
 - **纯 CLI 控制**：终端内嵌 ASCII 二维码，国内站微信 / 企业微信扫码登录；`status` / `refresh` / `serve` 子命令完成全部管理。
 - **多账号池 + 轮询负载均衡**：支持同时挂载多个 CodeBuddy 账号（`-auth` 逗号分隔或 `-auth-dir` 目录），请求按轮询（round-robin）均匀分配到各账号，保持多账号额度使用一致；**国内站与国际站账号可混挂在同一池中**。
 - **凭据热加载（免重启）**：`serve` 运行期间自动扫描凭据来源（默认每 5 秒，`-reload-interval` 可调）：新增凭据文件自动入池、重新登录/手动更新凭据原地生效、删除凭据自动移出，全程无需重启服务。
@@ -404,6 +405,28 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
    launchctl load ~/Library/LaunchAgents/com.workbuddy.gateway.plist
    ```
 
+## 模型列表自动同步
+
+腾讯上游没有公开的模型列表 API，官方客户端（CLI / IDE 插件）的模型目录随版本打包在 npm 包
+`@tencent-ai/codebuddy-code` 的 `product.cloudhosted.json` 中（官方模型选择器渲染的正是这份目录）。
+网关运行时会自动跟进该目录，让 `/v1/models` 始终反映 WorkBuddy 最新的可用模型列表：
+
+- **动态目录**：默认每 60 分钟查询一次官方最新版本（`-models-refresh` 可调，设为 `0` 关闭），
+  仅在版本变化时才下载约 50MB 的官方包并流式提取目录文件；
+- **镜像容错**：`registry.npmjs.org` 不可达时（国内网络波动常见）自动切换 `registry.npmmirror.com` 镜像；
+- **静态兜底**：目录拉取失败或尚未完成时，回退内置静态列表（含 `deepseek-v4.1` 等官方目录暂未收录的模型），
+  合并去重后返回，服务可用性不受影响；
+- **落盘缓存**：目录缓存写入工作目录 `wb-models-cache.json`，重启后立即可用，无需等待首次下载。
+
+日志示例：
+
+```text
+[Models] 模型列表已同步官方目录 v2.151.0（21 个模型）
+```
+
+启动横幅与 `/health` 均会展示当前列表来源（如 `modelsSource: "2.151.0"`）；`/v1/models` 响应头
+`X-Model-Source` 亦标注动态目录版本，便于确认同步是否生效。
+
 ## 安全提示
 
 - `workbuddy.json` 包含真实 CodeBuddy 访问凭据（Access Token / Refresh Token），**严禁提交到 Git 仓库或公开分享**；本仓库 `.gitignore` 已将其排除。
@@ -414,8 +437,9 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 
 ```
 命令:  serve | login | status | refresh | monitor | version | help
-选项:  -addr <ip> · -port <port> · -auth <path> · -auth-dir <dir> · -intl · -reload-interval <sec> · -api-key <key> · -proxy <url> · -verbose
-       （-intl 仅 login 生效：登录国际站 www.workbuddy.ai；-reload-interval 默认 5，0 关闭热加载）
+选项:  -addr <ip> · -port <port> · -auth <path> · -auth-dir <dir> · -intl · -reload-interval <sec> · -models-refresh <min> · -api-key <key> · -proxy <url> · -verbose
+       （-intl 仅 login 生效：登录国际站 www.workbuddy.ai；-reload-interval 默认 5，0 关闭热加载；
+        -models-refresh 默认 60 分钟，0 关闭官方模型目录自动同步）
 monitor: -interval <sec> · -journal <svc> · -logfile <path> · -lines <n>
 ```
 

@@ -18,3 +18,6 @@ logs/
 *.tmp
 .DS_Store
 Thumbs.db
+
+# 模型目录运行时缓存
+wb-models-cache.json
