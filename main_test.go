@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +15,34 @@ import (
 	"testing"
 	"time"
 )
+
+// TestMain 将整个测试进程切到临时工作目录，确保任何写状态/缓存/日志的测试
+// 都不会污染仓库目录（这些文件按设计写在进程 cwd）。
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "workbuddy-gateway-test-*")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		panic(err)
+	}
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+// chdirTemp 将测试工作目录切到临时目录，避免测试写入仓库内的状态/缓存文件。
+func chdirTemp(t *testing.T) {
+	t.Helper()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+}
 
 // 验证 429 消息中的重置时间解析
 func TestParseResetTime(t *testing.T) {
@@ -230,36 +261,128 @@ func TestNextAccountCooldownExpiry(t *testing.T) {
 	t.Logf("expired cooldown recovers, selected %s", a.Path)
 }
 
-func TestNextAccountSkipsQuotaExhausted(t *testing.T) {
+func TestNextAccountForModelPrefersKnownFreeExhausted(t *testing.T) {
 	accountMu.Lock()
 	accounts = []*Account{
-		{Path: "empty.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaExhausted: true},
+		{Path: "empty-free.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaExhausted: true, ModelStates: map[string]*modelRuntimeState{
+			"free-model": {CostClass: modelCostFree},
+		}},
 		{Path: "available.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaRemaining: 10},
 	}
 	rrIndex = 0
 	accountMu.Unlock()
 
-	acc, err := nextAccount()
+	acc, kind, err := nextAccountForModel("free-model", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if acc.Path != "available.json" {
-		t.Fatalf("expected available account, got %s", acc.Path)
+	if acc.Path != "empty-free.json" || kind != selectionFreeExhausted {
+		t.Fatalf("expected free exhausted account, got %s kind=%s", acc.Path, kind)
 	}
 }
 
-func TestNextAccountAllQuotaExhausted(t *testing.T) {
+func TestNextAccountForModelAllowsOneUnknownProbe(t *testing.T) {
 	accountMu.Lock()
 	accounts = []*Account{
 		{Path: "a.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaExhausted: true},
-		{Path: "b.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaExhausted: true},
 	}
 	rrIndex = 0
 	accountMu.Unlock()
 
-	_, err := nextAccount()
-	if err == nil || !strings.Contains(err.Error(), "额度均已耗尽") {
-		t.Fatalf("expected quota exhausted error, got %v", err)
+	acc, kind, err := nextAccountForModel("unknown-model", nil)
+	if err != nil || acc.Path != "a.json" || kind != selectionProbeExhausted {
+		t.Fatalf("expected one controlled probe, acc=%v kind=%s err=%v", acc, kind, err)
+	}
+	if _, _, err = nextAccountForModel("unknown-model", nil); err == nil || !strings.Contains(err.Error(), "等待探测=1") {
+		t.Fatalf("expected probe cooldown error, got %v", err)
+	}
+}
+
+func TestNextAccountForModelSkipsPaidAndQuotaBlocked(t *testing.T) {
+	accountMu.Lock()
+	accounts = []*Account{
+		{Path: "paid.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaExhausted: true, ModelStates: map[string]*modelRuntimeState{
+			"paid-model": {CostClass: modelCostPaid, QuotaBlocked: true},
+		}},
+	}
+	rrIndex = 0
+	accountMu.Unlock()
+	if _, _, err := nextAccountForModel("paid-model", nil); err == nil || !strings.Contains(err.Error(), "额度阻断=1") {
+		t.Fatalf("expected model quota block, got %v", err)
+	}
+}
+
+func TestModelCooldownOnlyBlocksTriggeringModel(t *testing.T) {
+	accountMu.Lock()
+	accounts = []*Account{{Path: "a.json", Auth: &StoredAuth{}, ModelStates: map[string]*modelRuntimeState{
+		"limited-model": {CostClass: modelCostFree, CooldownUntil: time.Now().Add(time.Hour)},
+	}}}
+	rrIndex = 0
+	accountMu.Unlock()
+	if _, _, err := nextAccountForModel("limited-model", nil); err == nil || !strings.Contains(err.Error(), "模型冷却=1") {
+		t.Fatalf("expected model cooldown, got %v", err)
+	}
+	acc, _, err := nextAccountForModel("other-model", nil)
+	if err != nil || acc.Path != "a.json" {
+		t.Fatalf("other model should remain usable, acc=%v err=%v", acc, err)
+	}
+}
+
+func TestMarkModelQuotaBlockedDoesNotOverwriteAccountBalance(t *testing.T) {
+	oldDir, _ := os.Getwd()
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	acc := &Account{Path: "a.json", Auth: &StoredAuth{}, QuotaKnown: true, QuotaRemaining: 123}
+	accountMu.Lock()
+	oldAccounts := accounts
+	accounts = []*Account{acc}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+	markModelQuotaBlocked(acc, "paid-model", "14018")
+	accountMu.Lock()
+	state := acc.ModelStates["paid-model"]
+	remaining := acc.QuotaRemaining
+	exhausted := acc.QuotaExhausted
+	accountMu.Unlock()
+	if state == nil || !state.QuotaBlocked || state.CostClass != modelCostPaid {
+		t.Fatalf("model block missing: %+v", state)
+	}
+	if remaining != 123 || exhausted {
+		t.Fatalf("model 14018 must not overwrite account balance: remaining=%v exhausted=%v", remaining, exhausted)
+	}
+}
+
+func TestQuotaRecoveryClearsBlocksKeepsModelCooldown(t *testing.T) {
+	until := time.Now().Add(time.Hour)
+	acc := &Account{QuotaExhausted: true, ModelStates: map[string]*modelRuntimeState{
+		"m": {CostClass: modelCostPaid, QuotaBlocked: true, CooldownUntil: until},
+	}}
+	accountMu.Lock()
+	acc.QuotaExhausted = false
+	for _, state := range acc.ModelStates {
+		state.QuotaBlocked = false
+		state.NextProbeAt = time.Time{}
+	}
+	state := acc.ModelStates["m"]
+	accountMu.Unlock()
+	if state.QuotaBlocked || !state.CooldownUntil.Equal(until) {
+		t.Fatalf("quota recovery should clear only quota block: %+v", state)
+	}
+}
+
+func TestIsModelRateLimited(t *testing.T) {
+	if !isModelRateLimited(`{"code":6004,"msg":"您也可以切换其他模型继续使用"}`) {
+		t.Fatal("6004 should be model-level rate limit")
+	}
+	if isModelRateLimited(`{"code":14018,"msg":"额度已用尽"}`) {
+		t.Fatal("14018 should not be model rate limit")
 	}
 }
 
@@ -789,7 +912,7 @@ func TestRenderAccountTableUsesFullYearAndNoEmoji(t *testing.T) {
 		Path:           "workbuddy4.json",
 		Edition:        "intl",
 		Nickname:       "user@example.com",
-		State:          "quota_exhausted",
+		State:          "paid_exhausted",
 		TokenExpiresAt: expires.Unix(),
 		QuotaTotal:     1100,
 		QuotaUsed:      1100,
@@ -797,8 +920,10 @@ func TestRenderAccountTableUsesFullYearAndNoEmoji(t *testing.T) {
 		IsPaidUser:     false,
 		QuotaKnown:     true,
 		QuotaExhausted: true,
+		FreeModels:     1,
+		ModelCooldowns: 2,
 	}})
-	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "额度耗尽", "2027-09-05 01:36:55", "总额度", "已用", "剩余", "付费用户", "1100", "否"} {
+	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "付费耗尽", "2027-09-05 01:36:55", "总额度", "已用", "剩余", "付费用户", "免费模型", "模型冷却", "1100", "否"} {
 		if !strings.Contains(table, want) {
 			t.Fatalf("table missing %q:\n%s", want, table)
 		}
@@ -808,6 +933,165 @@ func TestRenderAccountTableUsesFullYearAndNoEmoji(t *testing.T) {
 	}
 	if strings.ContainsAny(table, "✅🔒❌🕐📊📜⚠️") {
 		t.Fatalf("table should not contain emoji:\n%s", table)
+	}
+}
+
+func TestUsageCreditAndObserveModelCost(t *testing.T) {
+	for _, tc := range []struct {
+		usage map[string]any
+		want  float64
+		ok    bool
+	}{
+		{map[string]any{"credit": float64(0)}, 0, true},
+		{map[string]any{"credit": "1.25"}, 1.25, true},
+		{map[string]any{"total_tokens": 1}, 0, false},
+		{nil, 0, false},
+	} {
+		got, ok := usageCredit(tc.usage)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("usageCredit(%v)=%v/%v want %v/%v", tc.usage, got, ok, tc.want, tc.ok)
+		}
+	}
+
+	oldDir, _ := os.Getwd()
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldDir)
+	acc := &Account{Path: "empty.json", Auth: &StoredAuth{}, QuotaExhausted: true}
+	accountMu.Lock()
+	oldAccounts := accounts
+	accounts = []*Account{acc}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+	var logBuf bytes.Buffer
+	oldLogWriter := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(oldLogWriter)
+	// 样本过小：credit=0 但 total_tokens 太低，不得判定为免费
+	observeModelCredit(acc, "tiny-model", map[string]any{"credit": float64(0), "total_tokens": float64(2)}, 10)
+	accountMu.Lock()
+	tiny := acc.ModelStates["tiny-model"]
+	accountMu.Unlock()
+	if tiny != nil && tiny.CostClass == modelCostFree {
+		t.Fatalf("tiny sample must not be learned as free: %+v", tiny)
+	}
+
+	// 样本充足：credit=0 且 total_tokens 达标，判定为免费
+	observeModelCredit(acc, "free-model", map[string]any{"credit": float64(0), "total_tokens": float64(500)}, 1)
+	accountMu.Lock()
+	state := acc.ModelStates["free-model"]
+	accountMu.Unlock()
+	if state == nil || state.CostClass != modelCostFree || state.QuotaBlocked {
+		t.Fatalf("free model not learned: %+v", state)
+	}
+	if text := logBuf.String(); !strings.Contains(text, "[FreeModel]") || !strings.Contains(text, "付费余额耗尽账号 empty.json") {
+		t.Fatalf("missing explicit free model exhausted-account log: %s", text)
+	}
+	observeModelCredit(acc, "paid-model", map[string]any{"credit": 2.5}, 2)
+	accountMu.Lock()
+	paid := acc.ModelStates["paid-model"]
+	accountMu.Unlock()
+	if paid == nil || paid.CostClass != modelCostPaid {
+		t.Fatalf("paid model not learned: %+v", paid)
+	}
+}
+
+func TestKnownFreeModelUsesExhaustedAccountAndLogs(t *testing.T) {
+	chdirTemp(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"credit\":0,\"total_tokens\":500}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	oldBase, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient := cfg.HttpClient
+	accountMu.Lock()
+	oldAccounts, oldRR := accounts, rrIndex
+	acc := &Account{Path: "empty-free.json", Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()}}, QuotaExhausted: true,
+		ModelStates: map[string]*modelRuntimeState{"free-model": {CostClass: modelCostFree}}}
+	accounts, rrIndex = []*Account{acc}, 0
+	accountMu.Unlock()
+	profileCN.Base, profileCN.Origin = server.URL, server.URL
+	cfg.HttpClient = server.Client()
+	defer func() {
+		profileCN.Base, profileCN.Origin = oldBase, oldOrigin
+		cfg.HttpClient = oldClient
+		accountMu.Lock()
+		accounts, rrIndex = oldAccounts, oldRR
+		accountMu.Unlock()
+	}()
+
+	var logs bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(oldWriter)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"free-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	text := logs.String()
+	for _, want := range []string{
+		"请求的是已知免费模型 free-model，选择付费余额耗尽账号 empty-free.json 发起请求",
+		"请求的是免费模型 free-model，已明确使用付费余额耗尽账号 empty-free.json 完成请求，usage.credit=0",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing log %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestUnknownModelQuotaProbeStopsAfterOneExhaustedAccount(t *testing.T) {
+	chdirTemp(t)
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"data":{"code":14018,"msg":"额度已用尽"}}}`)
+	}))
+	defer server.Close()
+
+	oldBase, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient := cfg.HttpClient
+	accountMu.Lock()
+	oldAccounts, oldRR := accounts, rrIndex
+	a := &Account{Path: "a.json", Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "a", ExpiresAt: time.Now().Add(time.Hour).Unix()}}, QuotaExhausted: true}
+	b := &Account{Path: "b.json", Auth: &StoredAuth{Edition: "cn", Auth: StoredTokens{AccessToken: "b", ExpiresAt: time.Now().Add(time.Hour).Unix()}}, QuotaExhausted: true}
+	accounts, rrIndex = []*Account{a, b}, 0
+	accountMu.Unlock()
+	profileCN.Base, profileCN.Origin = server.URL, server.URL
+	cfg.HttpClient = server.Client()
+	defer func() {
+		profileCN.Base, profileCN.Origin = oldBase, oldOrigin
+		cfg.HttpClient = oldClient
+		accountMu.Lock()
+		accounts, rrIndex = oldAccounts, oldRR
+		accountMu.Unlock()
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"unknown-paid","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls, rec.Body.String())
+	}
+	accountMu.Lock()
+	blockedA := a.ModelStates["unknown-paid"] != nil && a.ModelStates["unknown-paid"].QuotaBlocked
+	_, touchedB := b.ModelStates["unknown-paid"]
+	accountMu.Unlock()
+	if !blockedA || touchedB {
+		t.Fatalf("expected only first exhausted account probed: blockedA=%v touchedB=%v", blockedA, touchedB)
 	}
 }
 

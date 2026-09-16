@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	version = "1.9.0"
+	version = "1.10.0"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -203,24 +203,53 @@ type Config struct {
 
 // Account 表示一个 CodeBuddy 账号凭据及其运行时状态。
 type Account struct {
-	Path           string      // 凭据文件路径
-	Auth           *StoredAuth // 凭据内容（失效标记恢复时可能为 nil）
-	CooldownUntil  time.Time   // 冷却截止时间（429 频率限制后自动屏蔽到该时间）
-	CooldownMsg    string      // 触发冷却的原因/上游提示
-	Disabled       bool        // 授权失效（token 过期且无法刷新/已撤销）：禁止调度
-	DisabledReason string      // 失效原因，用于控制台展示
-	Nickname       string      // 失效标记持久化字段：昵称（Auth 为 nil 时使用）
-	UID            string      // 失效标记持久化字段：UID
-	Edition        string      // 站点标识（cn/intl）：失效标记恢复时 Auth 为 nil 也可见
-	QuotaTotal     float64     // 最近一次额度查询返回的周期总额度
-	QuotaUsed      float64     // 最近一次额度查询返回的已用额度
-	QuotaRemaining float64     // 最近一次额度查询返回的剩余额度
-	IsPaidUser     bool        // 是否为付费用户
-	QuotaKnown     bool        // 是否已成功获取过额度
-	QuotaExhausted bool        // 已确认额度为 0；额度扫描发现恢复后自动解除
-	fingerprint    string      // 凭据文件变更指纹（mtime+size，凭据热加载用）
-	lock           sync.Mutex  // 单账号串行锁（防止同账号并发触发 11128）
+	Path           string                        // 凭据文件路径
+	Auth           *StoredAuth                   // 凭据内容（失效标记恢复时可能为 nil）
+	CooldownUntil  time.Time                     // 冷却截止时间（429 频率限制后自动屏蔽到该时间）
+	CooldownMsg    string                        // 触发冷却的原因/上游提示
+	Disabled       bool                          // 授权失效（token 过期且无法刷新/已撤销）：禁止调度
+	DisabledReason string                        // 失效原因，用于控制台展示
+	Nickname       string                        // 失效标记持久化字段：昵称（Auth 为 nil 时使用）
+	UID            string                        // 失效标记持久化字段：UID
+	Edition        string                        // 站点标识（cn/intl）：失效标记恢复时 Auth 为 nil 也可见
+	QuotaTotal     float64                       // 最近一次额度查询返回的周期总额度
+	QuotaUsed      float64                       // 最近一次额度查询返回的已用额度
+	QuotaRemaining float64                       // 最近一次额度查询返回的剩余额度
+	IsPaidUser     bool                          // 是否为付费用户
+	QuotaKnown     bool                          // 是否已成功获取过额度
+	QuotaExhausted bool                          // 已确认额度为 0；额度扫描发现恢复后自动解除
+	ModelStates    map[string]*modelRuntimeState // 按模型隔离的成本、限流和额度阻断状态
+	fingerprint    string                        // 凭据文件变更指纹（mtime+size，凭据热加载用）
+	lock           sync.Mutex                    // 单账号串行锁（防止同账号并发触发 11128）
 }
+
+const (
+	modelCostUnknown = "unknown"
+	modelCostFree    = "free"
+	modelCostPaid    = "paid"
+	modelProbeDelay  = 5 * time.Minute
+
+	// modelFreeMinTokens 判定“免费模型”所需的最小样本：上游对极小请求也可能记
+	// credit=0（例如探针请求），那不是真正的免费，不能据此让零余额账号请求收费模型。
+	modelFreeMinTokens = 100
+)
+
+type modelRuntimeState struct {
+	CostClass     string
+	CooldownUntil time.Time
+	QuotaBlocked  bool
+	NextProbeAt   time.Time
+	LastReason    string
+	ObservedAt    time.Time
+}
+
+type accountSelectionKind string
+
+const (
+	selectionNormal         accountSelectionKind = "normal"
+	selectionFreeExhausted  accountSelectionKind = "free_exhausted"
+	selectionProbeExhausted accountSelectionKind = "probe_exhausted"
+)
 
 // Profile 返回该账号对应的上游站点参数（国内站/国际站）。
 func (acc *Account) Profile() *upstreamProfile {
@@ -614,11 +643,65 @@ func loadAccounts() error {
 
 	// 恢复持久化的失效账号标记（凭据文件已删除，仅供控制台提示重新登录）
 	loadDisabledMarkers()
+	restoreAccountRuntimeStateLocked()
 
 	if len(accounts) == 0 {
 		return fmt.Errorf("未找到有效凭据，请先执行 login 命令扫码登录")
 	}
 	return nil
+}
+
+// restoreAccountRuntimeStateLocked 从 monitor 快照恢复额度与模型级账本；调用方持有 accountMu。
+func restoreAccountRuntimeStateLocked() {
+	data, err := os.ReadFile(statusSnapshotFile)
+	if err != nil {
+		return
+	}
+	var snap statusSnapshot
+	if json.Unmarshal(data, &snap) != nil {
+		return
+	}
+	byPath := make(map[string]accountSnapshot, len(snap.Accounts))
+	for _, state := range snap.Accounts {
+		byPath[state.Path] = state
+	}
+	for _, acc := range accounts {
+		state, ok := byPath[acc.Path]
+		if !ok || acc.Disabled {
+			continue
+		}
+		acc.QuotaTotal = state.QuotaTotal
+		acc.QuotaUsed = state.QuotaUsed
+		acc.QuotaRemaining = state.QuotaRemaining
+		acc.IsPaidUser = state.IsPaidUser
+		acc.QuotaKnown = state.QuotaKnown
+		acc.QuotaExhausted = state.QuotaExhausted
+		if len(state.ModelStates) == 0 {
+			continue
+		}
+		acc.ModelStates = make(map[string]*modelRuntimeState, len(state.ModelStates))
+		for model, saved := range state.ModelStates {
+			acc.ModelStates[normalizeModelName(model)] = &modelRuntimeState{
+				CostClass: saved.CostClass, CooldownUntil: timeFromUnix(saved.CooldownUntil),
+				QuotaBlocked: saved.QuotaBlocked, NextProbeAt: timeFromUnix(saved.NextProbeAt),
+				LastReason: saved.LastReason, ObservedAt: timeFromUnix(saved.ObservedAt),
+			}
+		}
+	}
+}
+
+func timeFromUnix(value int64) time.Time {
+	if value <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(value, 0)
+}
+
+func unixOrZero(value time.Time) int64 {
+	if value.IsZero() {
+		return 0
+	}
+	return value.Unix()
 }
 
 // -----------------------------------------------------------------------------
@@ -697,6 +780,7 @@ func reloadAccounts() bool {
 		existing.CooldownMsg = ""
 		existing.QuotaKnown = false
 		existing.QuotaExhausted = false
+		existing.ModelStates = nil
 		existing.fingerprint = fp
 		clearDisabledMarker(p)
 		if recovered {
@@ -743,54 +827,122 @@ func accountReloaderLoop() {
 	}
 }
 
-// nextAccount 轮询选择下一个未处于冷却状态且未被禁用的账号。
-// 若全部账号不可用，返回错误并附带说明。
-func nextAccount() (*Account, error) {
+func normalizeModelName(model string) string {
+	return strings.ToLower(strings.TrimSpace(model))
+}
+
+func modelStateLocked(acc *Account, model string) *modelRuntimeState {
+	if acc.ModelStates == nil {
+		acc.ModelStates = make(map[string]*modelRuntimeState)
+	}
+	model = normalizeModelName(model)
+	state := acc.ModelStates[model]
+	if state == nil {
+		state = &modelRuntimeState{CostClass: modelCostUnknown}
+		acc.ModelStates[model] = state
+	}
+	return state
+}
+
+func usableForModelLocked(acc *Account, model string, now time.Time) (accountSelectionKind, bool) {
+	if acc.Disabled || acc.CooldownUntil.After(now) {
+		return "", false
+	}
+	model = normalizeModelName(model)
+	state := acc.ModelStates[model]
+	if state == nil {
+		if !acc.QuotaExhausted {
+			return selectionNormal, true
+		}
+		return selectionProbeExhausted, true
+	}
+	if state.CooldownUntil.After(now) {
+		return "", false
+	}
+	if state.QuotaBlocked {
+		return "", false
+	}
+	if !acc.QuotaExhausted {
+		return selectionNormal, true
+	}
+	if state.CostClass == modelCostFree && !state.QuotaBlocked {
+		return selectionFreeExhausted, true
+	}
+	if state.CostClass == modelCostPaid || now.Before(state.NextProbeAt) {
+		return "", false
+	}
+	return selectionProbeExhausted, true
+}
+
+// nextAccountForModel 按「免费耗尽账号优先 → 有余额账号 → 零余额未知模型受控探测」选号。
+func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, accountSelectionKind, error) {
 	accountMu.Lock()
 	defer accountMu.Unlock()
 
 	if len(accounts) == 0 {
-		return nil, fmt.Errorf("账号池为空")
+		return nil, "", fmt.Errorf("账号池为空")
 	}
 	now := time.Now()
-	disabledCount := 0
-	cooldownCount := 0
-	exhaustedCount := 0
-	for i := 0; i < len(accounts); i++ {
-		idx := (rrIndex + i) % len(accounts)
-		acc := accounts[idx]
-		if acc.Disabled {
-			disabledCount++
-			continue
-		}
-		if acc.CooldownUntil.After(now) {
-			cooldownCount++
-			continue
-		}
-		if acc.QuotaExhausted {
-			exhaustedCount++
-			continue
-		}
-		rrIndex = (idx + 1) % len(accounts)
-		return acc, nil
-	}
-	if exhaustedCount > 0 && exhaustedCount+disabledCount+cooldownCount == len(accounts) {
-		return nil, fmt.Errorf("所有可调度账号额度均已耗尽，等待下一次额度扫描（最多 5 分钟）")
-	}
-	// 全部不可用：优先报告失效账号
-	for _, a := range accounts {
-		if a.Disabled {
-			return nil, fmt.Errorf("账号 %s 已失效（授权过期或已撤销，凭据文件已删除），请重新执行 login 登录", a.Path)
+	for _, wanted := range []accountSelectionKind{selectionFreeExhausted, selectionNormal, selectionProbeExhausted} {
+		for i := 0; i < len(accounts); i++ {
+			idx := (rrIndex + i) % len(accounts)
+			acc := accounts[idx]
+			if attempted != nil && attempted[acc] {
+				continue
+			}
+			kind, ok := usableForModelLocked(acc, model, now)
+			if !ok || kind != wanted {
+				continue
+			}
+			if kind == selectionProbeExhausted {
+				modelStateLocked(acc, model).NextProbeAt = now.Add(modelProbeDelay)
+			}
+			rrIndex = (idx + 1) % len(accounts)
+			return acc, kind, nil
 		}
 	}
-	// 全部冷却：返回最早解封时间
-	earliest := accounts[0].CooldownUntil
-	for _, a := range accounts {
-		if a.CooldownUntil.Before(earliest) {
-			earliest = a.CooldownUntil
+
+	disabled, accountCooling, modelCooling, quotaBlocked, probeWaiting := 0, 0, 0, 0, 0
+	earliest := time.Time{}
+	for _, acc := range accounts {
+		switch {
+		case acc.Disabled:
+			disabled++
+		case acc.CooldownUntil.After(now):
+			accountCooling++
+			if earliest.IsZero() || acc.CooldownUntil.Before(earliest) {
+				earliest = acc.CooldownUntil
+			}
+		default:
+			state := acc.ModelStates[normalizeModelName(model)]
+			if state == nil {
+				if acc.QuotaExhausted {
+					probeWaiting++
+				}
+				continue
+			}
+			if state.CooldownUntil.After(now) {
+				modelCooling++
+				if earliest.IsZero() || state.CooldownUntil.Before(earliest) {
+					earliest = state.CooldownUntil
+				}
+			} else if state.QuotaBlocked || acc.QuotaExhausted && state.CostClass == modelCostPaid {
+				quotaBlocked++
+			} else if acc.QuotaExhausted && now.Before(state.NextProbeAt) {
+				probeWaiting++
+			}
 		}
 	}
-	return nil, fmt.Errorf("所有账号均处于冷却状态，最早解封时间: %s", earliest.Format("2006-01-02 15:04:05"))
+	msg := fmt.Sprintf("当前模型 %s 暂无可用账号：授权失效=%d，账号冷却=%d，模型冷却=%d，额度阻断=%d，等待探测=%d", model, disabled, accountCooling, modelCooling, quotaBlocked, probeWaiting)
+	if !earliest.IsZero() {
+		msg += "，最早恢复=" + earliest.Format("2006-01-02 15:04:05")
+	}
+	return nil, "", fmt.Errorf("%s", msg)
+}
+
+func nextAccount() (*Account, error) {
+	acc, _, err := nextAccountForModel("", nil)
+	return acc, err
 }
 
 // markCooldown 将账号屏蔽至指定时间。
@@ -801,6 +953,27 @@ func markCooldown(acc *Account, until time.Time, msg string) {
 	accountMu.Unlock()
 	log.Printf("[Cooldown] 账号 %s 触发频率限制，自动屏蔽至 %s (提示: %s)",
 		acc.Path, until.Format("2006-01-02 15:04:05"), msg)
+}
+
+func markModelCooldown(acc *Account, model string, until time.Time, msg string) {
+	accountMu.Lock()
+	state := modelStateLocked(acc, model)
+	state.CooldownUntil = until
+	state.LastReason = msg
+	accountMu.Unlock()
+	log.Printf("[ModelCooldown] 账号 %s 模型 %s 触发模型级频率限制，仅屏蔽该模型至 %s；其他模型仍可调度", acc.Path, model, until.Format("2006-01-02 15:04:05"))
+	writeStatusSnapshot()
+}
+
+func markModelQuotaBlocked(acc *Account, model, msg string) {
+	accountMu.Lock()
+	state := modelStateLocked(acc, model)
+	state.CostClass = modelCostPaid
+	state.QuotaBlocked = true
+	state.LastReason = msg
+	state.ObservedAt = time.Now()
+	accountMu.Unlock()
+	log.Printf("[ModelQuota] 账号 %s 模型 %s 返回额度耗尽，仅阻断该账号的当前收费模型；已知免费模型仍可使用", acc.Path, model)
 	writeStatusSnapshot()
 }
 
@@ -1006,6 +1179,11 @@ func isRateLimited(statusCode int, body string) bool {
 	return false
 }
 
+func isModelRateLimited(body string) bool {
+	low := strings.ToLower(body)
+	return strings.Contains(body, `"code":6004`) || strings.Contains(body, "切换其他模型") || strings.Contains(low, "switch to another model")
+}
+
 func isQuotaExhausted(statusCode int, body string) bool {
 	if statusCode != http.StatusTooManyRequests && !strings.Contains(body, `"code":14018`) {
 		return false
@@ -1200,6 +1378,108 @@ func formatQuota(value float64) string {
 	return strings.TrimRight(strings.TrimRight(strconv.FormatFloat(value, 'f', 2, 64), "0"), ".")
 }
 
+func usageCredit(usage map[string]any) (float64, bool) {
+	if usage == nil {
+		return 0, false
+	}
+	value, exists := usage["credit"]
+	if !exists {
+		return 0, false
+	}
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case json.Number:
+		n, err := v.Float64()
+		return n, err == nil
+	case string:
+		n, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func usageFromCompletion(data []byte) map[string]any {
+	var completion map[string]any
+	if json.Unmarshal(data, &completion) != nil {
+		return nil
+	}
+	usage, _ := completion["usage"].(map[string]any)
+	return usage
+}
+
+func usageTotalTokens(usage map[string]any) (int64, bool) {
+	if usage == nil {
+		return 0, false
+	}
+	switch v := usage["total_tokens"].(type) {
+	case float64:
+		return int64(v), true
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case json.Number:
+		n, err := v.Int64()
+		return n, err == nil
+	case string:
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func observeModelCredit(acc *Account, model string, usage map[string]any, reqID uint64) {
+	credit, ok := usageCredit(usage)
+	if !ok || acc == nil {
+		return
+	}
+	// credit=0 只有样本足够大时才判定为免费：极小请求（例如探针）上游也可能记 0，
+	// 那不代表该模型真的免费，不能据此让零余额账号去请求收费模型。
+	if credit <= 0 {
+		total, hasTotal := usageTotalTokens(usage)
+		if !hasTotal || total < modelFreeMinTokens {
+			log.Printf("[ModelCost] requestId=%d 账号 %s 模型 %s credit=0 但样本过小（total_tokens=%d < %d），忽略本次免费判定",
+				reqID, acc.Path, model, total, modelFreeMinTokens)
+			return
+		}
+	}
+	accountMu.Lock()
+	state := modelStateLocked(acc, model)
+	oldClass := state.CostClass
+	if credit <= 0 {
+		state.CostClass = modelCostFree
+		state.QuotaBlocked = false
+	} else {
+		state.CostClass = modelCostPaid
+	}
+	state.ObservedAt = time.Now()
+	quotaExhausted := acc.QuotaExhausted
+	path := acc.Path
+	accountMu.Unlock()
+	recordModelCostClass(model, credit <= 0)
+
+	if credit <= 0 {
+		if oldClass != modelCostFree {
+			log.Printf("[ModelCost] requestId=%d 账号 %s 模型 %s 实测 usage.credit=0，已学习为免费模型", reqID, path, model)
+		}
+		if quotaExhausted {
+			log.Printf("[FreeModel] requestId=%d 请求的是免费模型 %s，已明确使用付费余额耗尽账号 %s 完成请求，usage.credit=0", reqID, model, path)
+		}
+	} else if oldClass != modelCostPaid {
+		log.Printf("[ModelCost] requestId=%d 账号 %s 模型 %s 实测 usage.credit=%s，已学习为收费模型", reqID, path, model, formatQuota(credit))
+	}
+	writeStatusSnapshot()
+}
+
 // refreshAccountQuota 通过用户中心只读计费接口刷新账号额度，不记录或回传 Token。
 func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	if acc == nil {
@@ -1247,6 +1527,12 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	acc.IsPaidUser = paid
 	acc.QuotaKnown = true
 	acc.QuotaExhausted = remaining <= 0
+	if remaining > 0 {
+		for _, state := range acc.ModelStates {
+			state.QuotaBlocked = false
+			state.NextProbeAt = time.Time{}
+		}
+	}
 	accountMu.Unlock()
 	switch {
 	case !wasExhausted && remaining <= 0:
@@ -1587,27 +1873,40 @@ func runRefresh() {
 
 // accountSnapshot 是写入状态快照文件的单个账号状态。
 type accountSnapshot struct {
-	Path           string  `json:"path"`
-	Edition        string  `json:"edition,omitempty"` // 站点标识（cn/intl）
-	Nickname       string  `json:"nickname"`
-	UID            string  `json:"uid"`
-	State          string  `json:"state"` // active | cooldown | expired | disabled
-	CooldownUntil  int64   `json:"cooldownUntil,omitempty"`
-	CooldownMsg    string  `json:"cooldownMsg,omitempty"`
-	DisabledReason string  `json:"disabledReason,omitempty"`
-	TokenExpiresAt int64   `json:"tokenExpiresAt,omitempty"`
-	QuotaTotal     float64 `json:"quotaTotal,omitempty"`
-	QuotaUsed      float64 `json:"quotaUsed,omitempty"`
-	QuotaRemaining float64 `json:"quotaRemaining"`
-	IsPaidUser     bool    `json:"isPaidUser"`
-	QuotaKnown     bool    `json:"quotaKnown,omitempty"`
-	QuotaExhausted bool    `json:"quotaExhausted,omitempty"`
+	Path           string                        `json:"path"`
+	Edition        string                        `json:"edition,omitempty"` // 站点标识（cn/intl）
+	Nickname       string                        `json:"nickname"`
+	UID            string                        `json:"uid"`
+	State          string                        `json:"state"` // active | cooldown | paid_exhausted | expired | disabled
+	CooldownUntil  int64                         `json:"cooldownUntil,omitempty"`
+	CooldownMsg    string                        `json:"cooldownMsg,omitempty"`
+	DisabledReason string                        `json:"disabledReason,omitempty"`
+	TokenExpiresAt int64                         `json:"tokenExpiresAt,omitempty"`
+	QuotaTotal     float64                       `json:"quotaTotal,omitempty"`
+	QuotaUsed      float64                       `json:"quotaUsed,omitempty"`
+	QuotaRemaining float64                       `json:"quotaRemaining"`
+	IsPaidUser     bool                          `json:"isPaidUser"`
+	QuotaKnown     bool                          `json:"quotaKnown,omitempty"`
+	QuotaExhausted bool                          `json:"quotaExhausted,omitempty"`
+	ModelStates    map[string]modelStateSnapshot `json:"modelStates,omitempty"`
+	FreeModels     int                           `json:"freeModels,omitempty"`
+	ModelCooldowns int                           `json:"modelCooldowns,omitempty"`
+}
+
+type modelStateSnapshot struct {
+	CostClass     string `json:"costClass,omitempty"`
+	CooldownUntil int64  `json:"cooldownUntil,omitempty"`
+	QuotaBlocked  bool   `json:"quotaBlocked,omitempty"`
+	NextProbeAt   int64  `json:"nextProbeAt,omitempty"`
+	LastReason    string `json:"lastReason,omitempty"`
+	ObservedAt    int64  `json:"observedAt,omitempty"`
 }
 
 // statusSnapshot 是写入 workbuddy-status.json 的完整快照。
 type statusSnapshot struct {
-	UpdatedAt int64             `json:"updatedAt"`
-	Accounts  []accountSnapshot `json:"accounts"`
+	UpdatedAt int64               `json:"updatedAt"`
+	Accounts  []accountSnapshot   `json:"accounts"`
+	Models    []modelStatSnapshot `json:"models,omitempty"`
 }
 
 // writeStatusSnapshot 将账号池实时状态（含冷却/失效）原子写入状态快照文件。
@@ -1624,6 +1923,22 @@ func writeStatusSnapshot() {
 		as.IsPaidUser = acc.IsPaidUser
 		as.QuotaKnown = acc.QuotaKnown
 		as.QuotaExhausted = acc.QuotaExhausted
+		if len(acc.ModelStates) > 0 {
+			as.ModelStates = make(map[string]modelStateSnapshot, len(acc.ModelStates))
+			for model, state := range acc.ModelStates {
+				if state.CostClass == modelCostFree {
+					as.FreeModels++
+				}
+				if state.CooldownUntil.After(now) {
+					as.ModelCooldowns++
+				}
+				as.ModelStates[model] = modelStateSnapshot{
+					CostClass: state.CostClass, CooldownUntil: unixOrZero(state.CooldownUntil),
+					QuotaBlocked: state.QuotaBlocked, NextProbeAt: unixOrZero(state.NextProbeAt),
+					LastReason: state.LastReason, ObservedAt: unixOrZero(state.ObservedAt),
+				}
+			}
+		}
 		switch {
 		case acc.Disabled:
 			as.State = "disabled"
@@ -1650,7 +1965,7 @@ func writeStatusSnapshot() {
 			as.UID = acc.Auth.Account.UID
 			as.TokenExpiresAt = acc.Auth.Auth.ExpiresAt
 		case acc.QuotaExhausted:
-			as.State = "quota_exhausted"
+			as.State = "paid_exhausted"
 			if acc.Auth != nil {
 				as.Nickname = acc.Auth.Account.Nickname
 				as.UID = acc.Auth.Account.UID
@@ -1666,6 +1981,7 @@ func writeStatusSnapshot() {
 		}
 		snap.Accounts = append(snap.Accounts, as)
 	}
+	snap.Models = buildModelStatSnapshots(now, accounts)
 	accountMu.Unlock()
 
 	data, err := json.MarshalIndent(snap, "", "  ")
@@ -1717,8 +2033,8 @@ func fitCell(s string, width int) string {
 }
 
 func renderAccountTable(accs []accountSnapshot) string {
-	widths := []int{4, 20, 24, 8, 10, 19, 10, 10, 10, 10}
-	headers := []string{"序号", "凭据文件", "账号", "站点", "状态", "Token 有效期", "总额度", "已用", "剩余", "付费用户"}
+	widths := []int{4, 20, 24, 8, 10, 19, 10, 10, 10, 10, 10, 10}
+	headers := []string{"序号", "凭据文件", "账号", "站点", "状态", "Token 有效期", "总额度", "已用", "剩余", "付费用户", "免费模型", "模型冷却"}
 	border := func() string {
 		var b strings.Builder
 		b.WriteByte('+')
@@ -1764,14 +2080,15 @@ func renderAccountTable(accs []accountSnapshot) string {
 			status = "冷却"
 		case "expired":
 			status = "已过期"
-		case "quota_exhausted":
-			status = "额度耗尽"
+		case "quota_exhausted", "paid_exhausted":
+			status = "付费耗尽"
 		case "disabled":
 			status = "失效"
 		}
 		b.WriteString(row([]string{
 			strconv.Itoa(i + 1), filepath.Base(a.Path), ifEmpty(a.Nickname, "-"),
 			profileForEdition(a.Edition).Label, status, expires, total, used, remaining, paid,
+			strconv.Itoa(a.FreeModels), strconv.Itoa(a.ModelCooldowns),
 		}) + "\n")
 	}
 	b.WriteString(border())
@@ -1909,15 +2226,19 @@ func runMonitor() {
 						cooldown++
 					case "expired":
 						expired++
-					case "quota_exhausted":
+					case "quota_exhausted", "paid_exhausted":
 						exhausted++
 					case "disabled":
 						disabled++
 					}
 				}
-				fmt.Printf("账号池: 共 %d 个 | 可用 %d | 冷却 %d | 额度耗尽 %d | 过期 %d | 失效 %d\n",
+				fmt.Printf("账号池: 共 %d 个 | 可用 %d | 冷却 %d | 付费耗尽 %d | 过期 %d | 失效 %d\n",
 					len(snap.Accounts), active, cooldown, exhausted, expired, disabled)
 				fmt.Println(renderAccountTable(snap.Accounts))
+				if len(snap.Models) > 0 {
+					fmt.Printf("\n模型统计 (来源 %s):\n", modelSourceLabel(modelSourceFromSnapshots(snap.Models)))
+					fmt.Println(renderModelTable(snap.Models))
+				}
 			} else {
 				fmt.Println("状态文件解析失败")
 			}
@@ -2291,21 +2612,24 @@ func authMiddleware(next http.Handler) http.Handler {
 // upstreamChat 完成「多账号轮询 + 429 冷却代偿 + 授权失效禁用 + 单账号串行」的上游调度。
 // 成功时返回 200 响应（调用方负责关闭 Body）与命中的账号/站点；失败时函数内部已写回
 // 错误响应并返回 ok=false。Chat Completions 与 Responses 两个入口共用此逻辑。
-func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstreamBytes []byte, startTime time.Time) (*http.Response, *Account, *upstreamProfile, bool) {
+func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelName string, upstreamBytes []byte, startTime time.Time) (*http.Response, *Account, *upstreamProfile, bool) {
 	traceID := w.Header().Get("X-Trace-ID")
 	log.Printf("[业务入口] traceId=%s requestId=%d 业务=上游模型调用 请求体字节数=%d", traceID, reqID, len(upstreamBytes))
+	recordModelRequest(modelName)
 	accountMu.Lock()
 	poolSize := len(accounts)
 	accountMu.Unlock()
 	if poolSize == 0 {
+		recordModelFailure(modelName, "no_auth")
 		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
 		return nil, nil, nil, false
 	}
 
 	var lastRateErr string
 	var lastAuthErr string
+	attempted := make(map[*Account]bool, poolSize)
 	for attempt := 0; attempt < poolSize; attempt++ {
-		acc, err := nextAccount()
+		acc, selection, err := nextAccountForModel(modelName, attempted)
 		if err != nil {
 			// 所有账号均不可用（冷却或失效）
 			msg := fmt.Sprintf("无可用账号: %v", err)
@@ -2316,8 +2640,16 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstream
 				msg += " | 最近一次频率限制: " + truncate(lastRateErr, 200)
 			}
 			log.Printf("[#%d] %s", reqID, msg)
+			recordModelFailure(modelName, "无可用账号")
 			writeOpenAIError(w, http.StatusServiceUnavailable, "no_available_account", msg)
 			return nil, nil, nil, false
+		}
+		attempted[acc] = true
+		switch selection {
+		case selectionFreeExhausted:
+			log.Printf("[FreeModel] requestId=%d 请求的是已知免费模型 %s，选择付费余额耗尽账号 %s 发起请求", reqID, modelName, acc.Path)
+		case selectionProbeExhausted:
+			log.Printf("[ModelProbe] requestId=%d 账号 %s 付费余额已耗尽，但模型 %s 收费属性未知；执行一次受控探测，5分钟内不重复探测", reqID, acc.Path, modelName)
 		}
 		if err := ensureValidTokenFor(acc); err != nil {
 			lastAuthErr = err.Error()
@@ -2337,6 +2669,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstream
 
 		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, prof.chatURL(), bytes.NewReader(upstreamBytes))
 		if err != nil {
+			recordModelFailure(modelName, "req_create_error")
 			writeOpenAIError(w, http.StatusInternalServerError, "req_create_error", err.Error())
 			return nil, nil, nil, false
 		}
@@ -2349,6 +2682,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstream
 		if err != nil {
 			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游网络调用 账号=%s 异常=%v 业务影响=本次模型请求失败 是否已处理=是", traceID, reqID, acc.Path, err)
 			log.Printf("[#%d] 账号 %s [%s] 上游请求失败: %v", reqID, acc.Path, prof.Label, err)
+			recordModelFailure(modelName, "网络错误")
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
 			return nil, nil, nil, false
 		}
@@ -2362,13 +2696,30 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstream
 			log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=失败 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
 
 			if isQuotaExhausted(resp.StatusCode, errStr) {
-				accountMu.Lock()
-				acc.QuotaRemaining = 0
-				acc.QuotaKnown = true
-				acc.QuotaExhausted = true
-				accountMu.Unlock()
-				log.Printf("[Quota] 账号 %s 上游明确返回额度耗尽，已冻结调度；等待后台额度扫描发现恢复后自动解冻", acc.Path)
-				writeStatusSnapshot()
+				markModelQuotaBlocked(acc, modelName, errStr)
+				if selection == selectionProbeExhausted {
+					msg := fmt.Sprintf("当前模型 %s 已在余额耗尽账号 %s 上完成受控探测并确认需要付费额度，本次不再探测其他耗尽账号", modelName, acc.Path)
+					log.Printf("[#%d] %s", reqID, msg)
+					recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
+					writeOpenAIError(w, http.StatusServiceUnavailable, "model_requires_quota", msg)
+					return nil, nil, nil, false
+				}
+				lastRateErr = errStr
+				continue
+			}
+
+			if isModelRateLimited(errStr) {
+				until, ok := parseResetTime(errStr)
+				if !ok {
+					until = time.Now().Add(60 * time.Second)
+				}
+				markModelCooldown(acc, modelName, until, errStr)
+				if selection == selectionProbeExhausted {
+					msg := fmt.Sprintf("当前模型 %s 在余额耗尽账号 %s 的受控探测中触发模型级限流，本次不再探测其他耗尽账号", modelName, acc.Path)
+					recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
+					writeOpenAIError(w, http.StatusServiceUnavailable, "model_rate_limited", msg)
+					return nil, nil, nil, false
+				}
 				lastRateErr = errStr
 				continue
 			}
@@ -2392,15 +2743,18 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstream
 				continue // 尝试下一个账号
 			}
 
+			recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
 			writeOpenAIError(w, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
 			return nil, nil, nil, false
 		}
 
 		log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=成功 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
+		recordModelSuccess(modelName)
 		return resp, acc, prof, true
 	}
 
 	// 理论上不可达（poolSize 次尝试后未成功即已在循环内返回）
+	recordModelFailure(modelName, "all_cooldown")
 	writeOpenAIError(w, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
 	return nil, nil, nil, false
 }
@@ -2462,19 +2816,19 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[#%d] POST /v1/chat/completions -> Upstream [Model: %s, Stream: %v]", reqID, modelName, isStream)
 	}
 
-	resp, acc, prof, ok := upstreamChat(w, r, reqID, upstreamBytes, startTime)
+	resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime)
 	if !ok {
 		return
 	}
 	if isStream {
-		streamChatResponse(w, resp, reqID, acc, prof, startTime)
+		streamChatResponse(w, resp, modelName, reqID, acc, prof, startTime)
 	} else {
 		writeChatAggregate(w, resp, modelName, reqID, acc, prof, startTime)
 	}
 }
 
 // streamChatResponse 将上游 SSE 逐行透传为 OpenAI Chat Completions 流式响应。
-func streamChatResponse(w http.ResponseWriter, resp *http.Response, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
+func streamChatResponse(w http.ResponseWriter, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
 	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -2487,8 +2841,10 @@ func streamChatResponse(w http.ResponseWriter, resp *http.Response, reqID uint64
 		return
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
+	body := newTTFTReader(resp.Body, startTime)
+	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	var usage map[string]any
 	for scanner.Scan() {
 		cleanData := stripDataPrefix(scanner.Text())
 		if cleanData == "" {
@@ -2499,27 +2855,40 @@ func streamChatResponse(w http.ResponseWriter, resp *http.Response, reqID uint64
 			flusher.Flush()
 			break
 		}
+		var chunk map[string]any
+		if json.Unmarshal([]byte(cleanData), &chunk) == nil {
+			if u, ok := chunk["usage"].(map[string]any); ok {
+				usage = u
+			}
+		}
 		if cleanedChunk := cleanChunkJSON(cleanData); cleanedChunk != "" {
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", cleanedChunk)
 			flusher.Flush()
 		}
 	}
-	log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 耗时 %v)", reqID, acc.Path, prof.Label, time.Since(startTime))
+	observeModelCredit(acc, modelName, usage, reqID)
+	recordModelTTFT(modelName, body.duration())
+	recordModelLatency(modelName, time.Since(startTime))
+	log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
 }
 
 // writeChatAggregate 聚合上游 SSE 为完整 Chat Completions JSON 响应。
 func writeChatAggregate(w http.ResponseWriter, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
 	defer resp.Body.Close()
-	completionJSON, err := aggregateCompletion(resp.Body, modelName)
+	body := newTTFTReader(resp.Body, startTime)
+	completionJSON, err := aggregateCompletion(body, modelName)
 	if err != nil {
 		log.Printf("[#%d] 聚合响应失败: %v", reqID, err)
 		writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
 		return
 	}
+	observeModelCredit(acc, modelName, usageFromCompletion(completionJSON), reqID)
+	recordModelTTFT(modelName, body.duration())
+	recordModelLatency(modelName, time.Since(startTime))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(completionJSON)
-	log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v)", reqID, acc.Path, prof.Label, time.Since(startTime))
+	log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
 }
 
 // -----------------------------------------------------------------------------

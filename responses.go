@@ -73,7 +73,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[#%d] POST /v1/responses -> Upstream [Model: %s, Stream: %v]", reqID, modelName, isStream)
 
-	resp, acc, prof, ok := upstreamChat(w, r, reqID, upstreamBytes, startTime)
+	resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime)
 	if !ok {
 		return
 	}
@@ -300,12 +300,16 @@ func convertResponsesToolChoice(tc any) any {
 // writeResponsesAggregate 聚合上游 SSE 后转换为 Responses 非流式响应。
 func writeResponsesAggregate(w http.ResponseWriter, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
 	defer resp.Body.Close()
-	completionJSON, err := aggregateCompletion(resp.Body, modelName)
+	body := newTTFTReader(resp.Body, startTime)
+	completionJSON, err := aggregateCompletion(body, modelName)
 	if err != nil {
 		log.Printf("[#%d] 聚合响应失败: %v", reqID, err)
 		writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
 		return
 	}
+	observeModelCredit(acc, modelName, usageFromCompletion(completionJSON), reqID)
+	recordModelTTFT(modelName, body.duration())
+	recordModelLatency(modelName, time.Since(startTime))
 	out, err := chatCompletionToResponses(completionJSON, modelName)
 	if err != nil {
 		log.Printf("[#%d] Responses 转换失败: %v", reqID, err)
@@ -552,7 +556,8 @@ func streamResponsesResponse(w http.ResponseWriter, resp *http.Response, modelNa
 
 	var usage map[string]any
 
-	scanner := bufio.NewScanner(resp.Body)
+	body := newTTFTReader(resp.Body, startTime)
+	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		data := stripDataPrefix(scanner.Text())
@@ -686,11 +691,14 @@ func streamResponsesResponse(w http.ResponseWriter, resp *http.Response, modelNa
 	if usage != nil {
 		final["usage"] = toResponsesUsage(usage)
 	}
+	observeModelCredit(acc, modelName, usage, reqID)
 	emit("response.completed", map[string]any{"response": final})
 
 	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
-	log.Printf("[#%d] Responses 流式输出完成 (账号 %s [%s], 耗时 %v)", reqID, acc.Path, prof.Label, time.Since(startTime))
+	recordModelTTFT(modelName, body.duration())
+	recordModelLatency(modelName, time.Since(startTime))
+	log.Printf("[#%d] Responses 流式输出完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
 }
 
 // compactUUID 返回去掉连字符的随机 UUID。
