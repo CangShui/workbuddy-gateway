@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	version = "1.10.0"
+	version = "1.11.0"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -198,6 +198,8 @@ type Config struct {
 	JournalService  string // monitor 附加展示的 systemd 服务名（journalctl -u）
 	LogLines        int    // monitor 展示的最近日志行数
 	ModelsRefresh   int    // 官方模型目录刷新间隔（分钟），0 关闭
+	ProbeModels     string // probe 专用：逗号分隔的模型列表
+	ProbeLimit      int    // probe 专用：未显式指定模型时的取用数量
 	HttpClient      *http.Client
 }
 
@@ -328,6 +330,8 @@ func main() {
 	fs.StringVar(&cfg.JournalService, "journal", "", "monitor 附加跟随的 systemd 服务名（Linux 下用 journalctl -u <服务> -f 跟随）")
 	fs.IntVar(&cfg.LogLines, "lines", 15, "monitor 每次刷新展示的最近日志行数")
 	fs.IntVar(&cfg.ModelsRefresh, "models-refresh", 60, "官方模型目录刷新间隔（分钟），0 关闭")
+	fs.StringVar(&cfg.ProbeModels, "models", "", "probe 专用：逗号分隔的待探测模型（默认取目录前几个）")
+	fs.IntVar(&cfg.ProbeLimit, "limit", 5, "probe 专用：未指定 -models 时探测的模型数量上限")
 	_ = fs.Parse(args)
 
 	// 检测 -auth 是否被显式指定：
@@ -355,6 +359,8 @@ func main() {
 		runRefresh()
 	case "monitor":
 		runMonitor()
+	case "probe":
+		runProbe()
 	case "version", "-v", "--version":
 		fmt.Printf("WorkBuddy Local Gateway v%s\n", version)
 	default:
@@ -396,6 +402,7 @@ func printHelp() {
   status      查看账号池状态（含站点、冷却状态与过期时间）
   refresh     手动立即刷新所有账号访问令牌 (Access Token)
   monitor     前台实时监控：周期刷新展示账号状态 + 最近日志 (Ctrl+C 退出)
+  probe       主动探测账号对指定模型的免费/收费属性（需 serve 正在运行）
   version     查看版本信息
   help        查看帮助说明
 
@@ -411,6 +418,12 @@ func printHelp() {
                     新增/更新/删除的凭据文件，免重启生效
   -models-refresh <min>
                     官方模型目录刷新间隔（默认 60 分钟，0 关闭）
+
+probe 选项:
+  -auth <path>      只探测指定凭据文件（文件名或路径均可）；默认探测全部账号
+  -models <m1,m2>   指定要探测的模型；默认取模型目录前几个
+  -limit <n>        未指定 -models 时探测的模型数量（默认 5，上限 50）
+  -addr/-port       需与运行中的 serve 一致；-api-key 启用时 probe 会自动携带
   -api-key <key>    设置后，调用网关必须携带 Bearer <key> 鉴权
   -proxy <url>      设置上游转发代理 (例如 http://127.0.0.1:7890 或 socks5://...)
   -verbose          输出详细调试日志 (请求/响应体)
@@ -1465,7 +1478,7 @@ func observeModelCredit(acc *Account, model string, usage map[string]any, reqID 
 	quotaExhausted := acc.QuotaExhausted
 	path := acc.Path
 	accountMu.Unlock()
-	recordModelCostClass(model, credit <= 0)
+	recordModelCostClass(model, acc.Profile().Key, credit <= 0)
 
 	if credit <= 0 {
 		if oldClass != modelCostFree {
@@ -2425,6 +2438,7 @@ func runServe() {
 	mux.HandleFunc("/models", handleModels)
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/ping", handleHealth)
+	mux.HandleFunc("/admin/probe", handleAdminProbe)
 	mux.HandleFunc("/", handleIndex)
 
 	listenAddr := fmt.Sprintf("%s:%d", cfg.Addr, cfg.Port)
@@ -3275,6 +3289,19 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	return json.Marshal(result)
 }
 
+// cleanChunkJSON 清洗单个上游 chat 分片，使其符合 OpenAI 流式分片规范后再透传。
+//
+// 上游是「类 OpenAI」实现，分片里带有若干偏离规范的噪声。普通 OpenAI 客户端能忍，
+// 但 Anthropic 协议翻译层（Claude Code 链路）会据此误判流状态，导致工具不执行：
+//
+//  1. finish_reason:"" → null（本 bug 的直接原因）。规范要求中间分片为 null、只有终止分片
+//     给出真实原因；上游却在整条流的每一个分片上都下发 finish_reason:""。
+//     翻译层会取流中「第一个非 null 的 finish_reason」作为最终 stop_reason，
+//     于是首个分片就把 stop_reason 锁成 end_turn，真实终止分片的 "tool_calls" 不再被采纳。
+//     Claude Code 只在 stop_reason=tool_use 时才执行工具，表现为「网关日志成功但客户端没结果」。
+//  2. 旧版 function_call 空壳：上游在含工具调用的终止片追加
+//     {"function_call":{"name":"","arguments":""}}，属同类非规范噪声，一并清除。
+//  3. delta 中的空值字段（content:""、tool_calls:[] 等）。
 func cleanChunkJSON(s string) string {
 	var obj map[string]any
 	if json.Unmarshal([]byte(s), &obj) != nil {
@@ -3286,8 +3313,16 @@ func cleanChunkJSON(s string) string {
 			if !ok {
 				continue
 			}
+			// 空 finish_reason 归一化为 null：只有终止分片才应携带真实原因。
+			if fr, ok := choice["finish_reason"].(string); ok && fr == "" {
+				choice["finish_reason"] = nil
+			}
 			if delta, ok := choice["delta"].(map[string]any); ok {
 				for k, v := range delta {
+					if k == "function_call" && isEmptyFunctionCall(v) {
+						delete(delta, k)
+						continue
+					}
 					if isEmptyValue(v) {
 						delete(delta, k)
 					}
@@ -3300,6 +3335,18 @@ func cleanChunkJSON(s string) string {
 		return s
 	}
 	return string(out)
+}
+
+// isEmptyFunctionCall 判断是否为旧版 function_call 空壳（name 与 arguments 均为空）。
+// 真正的旧版函数调用会带 name 或 arguments，不应误删。
+func isEmptyFunctionCall(v any) bool {
+	fc, ok := v.(map[string]any)
+	if !ok {
+		return false
+	}
+	name, _ := fc["name"].(string)
+	args, _ := fc["arguments"].(string)
+	return strings.TrimSpace(name) == "" && strings.TrimSpace(args) == ""
 }
 
 func isEmptyValue(v any) bool {

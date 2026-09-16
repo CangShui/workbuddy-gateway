@@ -27,8 +27,11 @@ type modelStat struct {
 	LatencySamples int64
 	LastRequestAt  time.Time
 	LastStatus     string
-	FreeSeen       bool
-	PaidSeen       bool
+	// 站点维度的免费/收费观测：同一个模型名在 cn 与 intl 可能一个免费一个收费。
+	CNFreeSeen   bool
+	CNPaidSeen   bool
+	IntlFreeSeen bool
+	IntlPaidSeen bool
 }
 
 var (
@@ -95,13 +98,22 @@ func recordModelLatency(model string, d time.Duration) {
 	modelStatsMu.Unlock()
 }
 
-func recordModelCostClass(model string, free bool) {
+// recordModelCostClass 记录一次免费/收费观测，按站点分别累计。
+func recordModelCostClass(model, edition string, free bool) {
 	modelStatsMu.Lock()
 	stat := modelStatLocked(model)
-	if free {
-		stat.FreeSeen = true
+	if edition == "intl" {
+		if free {
+			stat.IntlFreeSeen = true
+		} else {
+			stat.IntlPaidSeen = true
+		}
 	} else {
-		stat.PaidSeen = true
+		if free {
+			stat.CNFreeSeen = true
+		} else {
+			stat.CNPaidSeen = true
+		}
 	}
 	modelStatsMu.Unlock()
 }
@@ -159,9 +171,11 @@ func extractBusinessCode(body string) string {
 
 // modelStatSnapshot 是写入状态快照的单个模型统计。
 type modelStatSnapshot struct {
-	ID                string `json:"id"`
-	Source            string `json:"source,omitempty"`
-	Free              string `json:"free,omitempty"` // 是 | 否 | 混合 | -
+	ID       string `json:"id"`
+	Source   string `json:"source,omitempty"`
+	CNFree   string `json:"cnFree,omitempty"`   // 国内站：是 | 否 | 混合 | -
+	IntlFree string `json:"intlFree,omitempty"` // 国际站：是 | 否 | 混合 | -
+	// AvailableAccounts 为两个站点合计的可服务账号数。
 	AvailableAccounts int    `json:"availableAccounts"`
 	Requests          int64  `json:"requests,omitempty"`
 	Success           int64  `json:"success,omitempty"`
@@ -242,17 +256,30 @@ func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot
 		}
 		seen[id] = true
 		row := modelStatSnapshot{ID: id, Source: source}
-		freeSeen, paidSeen := false, false
+		// 免费/收费按站点分别聚合：同一模型名在 cn 与 intl 结论可能不同，
+		// 若混在一起会显示成无意义的“混合”。
+		var cnFree, cnPaid, intlFree, intlPaid bool
 		for _, acc := range accs {
 			if modelServableLocked(acc, id, now) {
 				row.AvailableAccounts++
 			}
-			if state := acc.ModelStates[id]; state != nil {
-				switch state.CostClass {
-				case modelCostFree:
-					freeSeen = true
-				case modelCostPaid:
-					paidSeen = true
+			state := acc.ModelStates[id]
+			if state == nil {
+				continue
+			}
+			isIntl := acc.Profile().Key == "intl"
+			switch state.CostClass {
+			case modelCostFree:
+				if isIntl {
+					intlFree = true
+				} else {
+					cnFree = true
+				}
+			case modelCostPaid:
+				if isIntl {
+					intlPaid = true
+				} else {
+					cnPaid = true
 				}
 			}
 		}
@@ -260,8 +287,10 @@ func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot
 			row.Requests = stat.Requests
 			row.Success = stat.Success
 			row.Failed = stat.Failed
-			freeSeen = freeSeen || stat.FreeSeen
-			paidSeen = paidSeen || stat.PaidSeen
+			cnFree = cnFree || stat.CNFreeSeen
+			cnPaid = cnPaid || stat.CNPaidSeen
+			intlFree = intlFree || stat.IntlFreeSeen
+			intlPaid = intlPaid || stat.IntlPaidSeen
 			row.LastStatus = stat.LastStatus
 			row.LastRequestAt = unixOrZero(stat.LastRequestAt)
 			if stat.TTFTSamples > 0 {
@@ -273,7 +302,8 @@ func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot
 				row.HasLatency = true
 			}
 		}
-		row.Free = freeLabel(freeSeen, paidSeen)
+		row.CNFree = freeLabel(cnFree, cnPaid)
+		row.IntlFree = freeLabel(intlFree, intlPaid)
 		rows = append(rows, row)
 	}
 
@@ -298,8 +328,8 @@ func formatMilliseconds(ms int64, has bool) string {
 
 // renderModelTable 渲染 /v1/models 统计附表。
 func renderModelTable(rows []modelStatSnapshot) string {
-	widths := []int{26, 21, 6, 8, 8, 11, 9, 9, 12, 15}
-	headers := []string{"模型", "来源", "免费", "可用账号", "请求", "成功/失败", "首字", "平均", "最近状态", "最近请求"}
+	widths := []int{26, 21, 8, 8, 8, 8, 11, 9, 9, 12, 15}
+	headers := []string{"模型", "来源", "国内免费", "国际免费", "可用账号", "请求", "成功/失败", "首字", "平均", "最近状态", "最近请求"}
 	border := func() string {
 		var b strings.Builder
 		b.WriteByte('+')
@@ -334,7 +364,7 @@ func renderModelTable(rows []modelStatSnapshot) string {
 			status = "-"
 		}
 		b.WriteString(row([]string{
-			r.ID, modelSourceLabel(r.Source), r.Free, strconv.Itoa(r.AvailableAccounts),
+			r.ID, modelSourceLabel(r.Source), r.CNFree, r.IntlFree, strconv.Itoa(r.AvailableAccounts),
 			strconv.FormatInt(r.Requests, 10),
 			fmt.Sprintf("%d/%d", r.Success, r.Failed),
 			formatMilliseconds(r.AvgTTFTMs, r.HasTTFT),
