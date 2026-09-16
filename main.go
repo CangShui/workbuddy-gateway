@@ -2906,6 +2906,24 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	return json.Marshal(result)
 }
 
+// cleanChunkJSON 清洗单个上游 chat 分片，使其符合 OpenAI 流式分片规范后再透传。
+//
+// 上游是"类 OpenAI"实现，分片里带有若干偏离规范的噪声。普通 OpenAI 客户端能忍，
+// 但 Anthropic 协议翻译层（Claude Code 链路）会据此误判流状态，导致工具不执行：
+//
+//  1. finish_reason:"" → null（本 bug 的直接原因）。规范要求中间分片为 null、只有终止分片
+//     给出真实原因；上游却在整条流的 **每一个** 分片上都下发 finish_reason:""。
+//     翻译层会取流中「第一个非 null 的 finish_reason」作为最终 stop_reason，
+//     于是首个分片（{delta:{role:"assistant"}, finish_reason:""}）就把 stop_reason
+//     锁成了 end_turn，等真实终止分片的 finish_reason:"tool_calls" 到达时已不再被采纳。
+//     Claude Code 只在 stop_reason=tool_use 时才执行工具，于是工具永不执行、
+//     终端只剩一句开场白（表现为"网关日志全部成功但客户端没有任何结果"）。
+//     固定分片序列回放实测（经 cc-switch 翻译）：任一分片带 "" → end_turn；
+//     全部 null 且终止分片为 "tool_calls" → tool_use。
+//  2. 旧版 function_call 空壳：上游在含工具调用的响应终止片追加
+//     {"function_call":{"name":"","arguments":""}}，属同一类非规范噪声，一并清除
+//     （与 stop_reason 判定无关，仅为流整洁性）；
+//  3. delta 中的空值字段（content:""、tool_calls:[] 等）。
 func cleanChunkJSON(s string) string {
 	var obj map[string]any
 	if json.Unmarshal([]byte(s), &obj) != nil {
@@ -2917,8 +2935,15 @@ func cleanChunkJSON(s string) string {
 			if !ok {
 				continue
 			}
+			if fr, ok := choice["finish_reason"].(string); ok && fr == "" {
+				choice["finish_reason"] = nil
+			}
 			if delta, ok := choice["delta"].(map[string]any); ok {
 				for k, v := range delta {
+					if k == "function_call" && isEmptyFunctionCall(v) {
+						delete(delta, k)
+						continue
+					}
 					if isEmptyValue(v) {
 						delete(delta, k)
 					}
@@ -2931,6 +2956,18 @@ func cleanChunkJSON(s string) string {
 		return s
 	}
 	return string(out)
+}
+
+// isEmptyFunctionCall 判断是否为旧版 function_call 空壳（name 与 arguments 均为空）。
+// 真正的旧版函数调用会带 name 或 arguments，不应误删。
+func isEmptyFunctionCall(v any) bool {
+	fc, ok := v.(map[string]any)
+	if !ok {
+		return false
+	}
+	name, _ := fc["name"].(string)
+	args, _ := fc["arguments"].(string)
+	return strings.TrimSpace(name) == "" && strings.TrimSpace(args) == ""
 }
 
 func isEmptyValue(v any) bool {
