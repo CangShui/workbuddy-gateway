@@ -17,16 +17,26 @@ import (
 // 统计只服务于 monitor 展示，不参与调度决策。
 // -----------------------------------------------------------------------------
 
-type modelStat struct {
-	Requests       int64
-	Success        int64
-	Failed         int64
+// statsWindow 是"平均首字 / 平均总耗时"的滚动统计窗口。
+const statsWindow = 5 * time.Hour
+
+// hourlyBucket 保存某个整点小时内累计的 TTFT / 耗时样本。
+type hourlyBucket struct {
+	Hour           int64 // 该小时起点（Unix 秒）
 	TTFTSum        time.Duration
 	TTFTSamples    int64
 	LatencySum     time.Duration
 	LatencySamples int64
-	LastRequestAt  time.Time
-	LastStatus     string
+}
+
+type modelStat struct {
+	Requests      int64
+	Success       int64
+	Failed        int64
+	LastRequestAt time.Time
+	LastStatus    string
+	// 最近 statsWindow 内按小时分桶的延迟样本（自动淘汰过期桶）。
+	Buckets []hourlyBucket
 	// 站点维度的免费/收费观测：同一个模型名在 cn 与 intl 可能一个免费一个收费。
 	CNFreeSeen   bool
 	CNPaidSeen   bool
@@ -38,6 +48,53 @@ var (
 	modelStatsMu sync.Mutex
 	modelStats   = map[string]*modelStat{}
 )
+
+func hourStart(t time.Time) int64 {
+	return t.Truncate(time.Hour).Unix()
+}
+
+// bucketLocked 返回当前小时的桶，并淘汰窗口外的旧桶。
+func (st *modelStat) bucketLocked(now time.Time) *hourlyBucket {
+	cur := hourStart(now)
+	// 淘汰超出窗口的桶
+	kept := st.Buckets[:0]
+	for _, b := range st.Buckets {
+		if now.Unix()-b.Hour < int64(statsWindow/time.Second) {
+			kept = append(kept, b)
+		}
+	}
+	st.Buckets = kept
+	for i := range st.Buckets {
+		if st.Buckets[i].Hour == cur {
+			return &st.Buckets[i]
+		}
+	}
+	st.Buckets = append(st.Buckets, hourlyBucket{Hour: cur})
+	return &st.Buckets[len(st.Buckets)-1]
+}
+
+// windowAveragesLocked 汇总窗口内的平均首字与平均总耗时。
+func (st *modelStat) windowAveragesLocked(now time.Time) (ttft time.Duration, hasTTFT bool, latency time.Duration, hasLatency bool) {
+	var tSum, lSum time.Duration
+	var tN, lN int64
+	cutoff := now.Unix() - int64(statsWindow/time.Second)
+	for _, b := range st.Buckets {
+		if b.Hour < cutoff {
+			continue
+		}
+		tSum += b.TTFTSum
+		tN += b.TTFTSamples
+		lSum += b.LatencySum
+		lN += b.LatencySamples
+	}
+	if tN > 0 {
+		ttft, hasTTFT = tSum/time.Duration(tN), true
+	}
+	if lN > 0 {
+		latency, hasLatency = lSum/time.Duration(lN), true
+	}
+	return
+}
 
 func modelStatLocked(model string) *modelStat {
 	model = normalizeModelName(model)
@@ -82,8 +139,8 @@ func recordModelTTFT(model string, d time.Duration) {
 	}
 	modelStatsMu.Lock()
 	stat := modelStatLocked(model)
-	stat.TTFTSum += d
-	stat.TTFTSamples++
+	stat.bucketLocked(time.Now()).TTFTSum += d
+	stat.bucketLocked(time.Now()).TTFTSamples++
 	modelStatsMu.Unlock()
 }
 
@@ -93,8 +150,9 @@ func recordModelLatency(model string, d time.Duration) {
 	}
 	modelStatsMu.Lock()
 	stat := modelStatLocked(model)
-	stat.LatencySum += d
-	stat.LatencySamples++
+	b := stat.bucketLocked(time.Now())
+	b.LatencySum += d
+	b.LatencySamples++
 	modelStatsMu.Unlock()
 }
 
@@ -171,10 +229,12 @@ func extractBusinessCode(body string) string {
 
 // modelStatSnapshot 是写入状态快照的单个模型统计。
 type modelStatSnapshot struct {
-	ID       string `json:"id"`
-	Source   string `json:"source,omitempty"`
-	CNFree   string `json:"cnFree,omitempty"`   // 国内站：是 | 否 | 混合 | -
-	IntlFree string `json:"intlFree,omitempty"` // 国际站：是 | 否 | 混合 | -
+	ID             string `json:"id"`
+	Source         string `json:"source,omitempty"`
+	CNFree         string `json:"cnFree,omitempty"`         // 国内站：是 | 否 | 混合 | -
+	IntlFree       string `json:"intlFree,omitempty"`       // 国际站：是 | 否 | 混合 | -
+	CNMultiplier   string `json:"cnMultiplier,omitempty"`   // 国内站倍率展示值，如 0.29x / 0.00x / -
+	IntlMultiplier string `json:"intlMultiplier,omitempty"` // 国际站倍率展示值
 	// AvailableAccounts 为两个站点合计的可服务账号数。
 	AvailableAccounts int    `json:"availableAccounts"`
 	Requests          int64  `json:"requests,omitempty"`
@@ -293,17 +353,22 @@ func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot
 			intlPaid = intlPaid || stat.IntlPaidSeen
 			row.LastStatus = stat.LastStatus
 			row.LastRequestAt = unixOrZero(stat.LastRequestAt)
-			if stat.TTFTSamples > 0 {
-				row.AvgTTFTMs = (stat.TTFTSum / time.Duration(stat.TTFTSamples)).Milliseconds()
-				row.HasTTFT = true
-			}
-			if stat.LatencySamples > 0 {
-				row.AvgLatencyMs = (stat.LatencySum / time.Duration(stat.LatencySamples)).Milliseconds()
-				row.HasLatency = true
+			// 平均值按最近 statsWindow（5 小时）滚动窗口计算。
+			if ttft, okT, latency, okL := stat.windowAveragesLocked(now); true {
+				if okT {
+					row.AvgTTFTMs = ttft.Milliseconds()
+					row.HasTTFT = true
+				}
+				if okL {
+					row.AvgLatencyMs = latency.Milliseconds()
+					row.HasLatency = true
+				}
 			}
 		}
 		row.CNFree = freeLabel(cnFree, cnPaid)
 		row.IntlFree = freeLabel(intlFree, intlPaid)
+		row.CNMultiplier = modelDisplayMultiplier("cn", id, row.CNFree)
+		row.IntlMultiplier = modelDisplayMultiplier("intl", id, row.IntlFree)
 		rows = append(rows, row)
 	}
 
@@ -328,8 +393,8 @@ func formatMilliseconds(ms int64, has bool) string {
 
 // renderModelTable 渲染 /v1/models 统计附表。
 func renderModelTable(rows []modelStatSnapshot) string {
-	widths := []int{26, 21, 8, 8, 8, 8, 11, 9, 9, 12, 15}
-	headers := []string{"模型", "来源", "国内免费", "国际免费", "可用账号", "请求", "成功/失败", "首字", "平均", "最近状态", "最近请求"}
+	widths := []int{26, 16, 16, 8, 8, 13, 15}
+	headers := []string{"模型", "国内倍率", "国际倍率", "可用账号", "请求", "平均首字(5h)", "平均总耗时(5h)"}
 	border := func() string {
 		var b strings.Builder
 		b.WriteByte('+')
@@ -355,23 +420,31 @@ func renderModelTable(rows []modelStatSnapshot) string {
 	b.WriteString(row(headers) + "\n")
 	b.WriteString(border() + "\n")
 	for _, r := range rows {
-		last := "-"
-		if r.LastRequestAt > 0 {
-			last = time.Unix(r.LastRequestAt, 0).Format("01-02 15:04:05")
+		cnMult := r.CNMultiplier
+		if cnMult == "" {
+			cnMult = "-"
 		}
-		status := r.LastStatus
-		if status == "" {
-			status = "-"
+		intlMult := r.IntlMultiplier
+		if intlMult == "" {
+			intlMult = "-"
 		}
 		b.WriteString(row([]string{
-			r.ID, modelSourceLabel(r.Source), r.CNFree, r.IntlFree, strconv.Itoa(r.AvailableAccounts),
+			r.ID, cnMult, intlMult, strconv.Itoa(r.AvailableAccounts),
 			strconv.FormatInt(r.Requests, 10),
-			fmt.Sprintf("%d/%d", r.Success, r.Failed),
 			formatMilliseconds(r.AvgTTFTMs, r.HasTTFT),
 			formatMilliseconds(r.AvgLatencyMs, r.HasLatency),
-			status, last,
 		}) + "\n")
 	}
 	b.WriteString(border())
 	return b.String()
+}
+
+// modelRequestCount 返回某模型的客户端请求次数（用于判断是否值得做价格探测）。
+func modelRequestCount(model string) int64 {
+	modelStatsMu.Lock()
+	defer modelStatsMu.Unlock()
+	if stat := modelStats[normalizeModelName(model)]; stat != nil {
+		return stat.Requests
+	}
+	return 0
 }

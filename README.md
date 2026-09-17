@@ -1,323 +1,444 @@
 # WorkBuddy Local Gateway
+
 <img width="1378" height="328" alt="image" src="https://github.com/user-attachments/assets/ae5a3b1c-a46c-4c5e-8fd3-05a7e4c23e74" />
 
+基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。无 Web UI，全部通过命令行（CLI）完成登录、凭据续期与服务控制。
 
-
-基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。无 Web UI，仅通过命令行（CLI）完成登录、凭据续期与服务控制。
-
-**同时支持两个上游站点**（同一套协议，凭据按站点隔离，账号池可混挂轮询）：
+**同时支持两个上游站点**（同一套 `/v2/plugin/*` 协议，凭据按站点隔离，账号池可混挂轮询）：
 
 | 站点 | 上游 | 登录方式 | 登录命令 |
 |---|---|---|---|
-| 国内站 | `copilot.tencent.com` | 微信 / 企业微信扫码 | `login` |
-| 国际站 | `www.workbuddy.ai` | 浏览器内登录（邮箱 / 验证码 / SSO 等） | `login -intl` |
+| 国内站 | `copilot.tencent.com` / `www.codebuddy.cn` | 微信 / 企业微信扫码 | `login` |
+| 国际站 | `www.workbuddy.ai` | 浏览器内登录（邮箱 / 验证码 / SSO） | `login -intl` |
+
+---
+
+## 目录
+
+- [核心特性](#核心特性)
+- [命令总览](#命令总览)
+- [serve](#serve)
+- [login](#login)
+- [status](#status)
+- [refresh](#refresh)
+- [monitor](#monitor)
+- [probe](#probe)
+- [reset](#reset)
+- [version / help](#version--help)
+- [多账号池](#多账号池)
+- [模型列表与倍率](#模型列表与倍率)
+- [客户端接入](#客户端接入)
+- [各平台部署](#各平台部署)
+- [安全提示](#安全提示)
+- [从源码构建](#从源码构建)
+
+---
 
 ## 核心特性
 
-- **国内 / 国际双站反代**：国际站 `www.workbuddy.ai` 与国内站走同一套 `/v2/plugin/*` 协议，凭据文件通过 `edition` 字段区分站点，刷新 / 对话自动路由到各自上游。
-- **模型完全透传**：客户端（OpenAI SDK、Cursor、Claude Code、DSH 等）传什么 `model`（如 `hy4-preview`、`hy3-preview-agent`、`hy3`、`deepseek-v4-pro`、`glm-5.2`…），网关原样透传至腾讯上游，无白名单限制。
-- **模型列表低流量动态同步**：`/v1/models` 每 60 分钟查询一次官方 CLI npm 版本（版本未变只消耗约 4 KB）；版本变化时优先从 unpkg 下载约 20 KB 的 `product.cloudhosted.json`，失败才回退到限流 80 MiB 的 npm tgz 流式提取，成功后缓存并对失败版本指数退避。
-- **纯 CLI 控制**：终端内嵌 ASCII 二维码，国内站微信 / 企业微信扫码登录；`status` / `refresh` / `serve` 子命令完成全部管理。
-- **多账号池 + 轮询负载均衡**：支持同时挂载多个 CodeBuddy 账号（`-auth` 逗号分隔或 `-auth-dir` 目录），请求按轮询（round-robin）均匀分配到各账号，保持多账号额度使用一致；**国内站与国际站账号可混挂在同一池中**。
-- **凭据热加载（免重启）**：`serve` 运行期间自动扫描凭据来源（默认每 5 秒，`-reload-interval` 可调）：新增凭据文件自动入池、重新登录/手动更新凭据原地生效、删除凭据自动移出，全程无需重启服务。
-- **模型级 429 自动冷却**：`code 6004` 按“账号 + 模型”解析重置时间并只屏蔽触发模型，其他模型仍可使用该账号；无法归因到模型的通用 429 才进入账号级冷却。
-- **授权失效自动禁用**：账号授权过期、被撤销或令牌刷新失败（HTTP 401/403 / invalid token / 登录已过期）时，自动将该账号**禁止调度并删除凭据文件**，同时写入持久化失效标记；`status` / 启动日志会明确提示该账号失效原因与重新登录命令，重新 `login` 后自动恢复调度。
-- **后台自动续期**：运行期间每 5 分钟检查所有账号 Token，距过期不足 15 分钟自动刷新并持久化回各自凭据文件。
-- **国内站每日自动签到**：服务启动、新凭据热加载时立即补签，之后每天 `UTC+8 09:00` 自动签到；重复签到按幂等成功处理，国际站因无已确认可用的签到体系而明确跳过。
-- **OpenAI 兼容协议**：`POST /v1/chat/completions`（SSE 流式 + 非流式聚合）、`POST /v1/responses`（OpenAI Responses API，支持流式语义事件、非流式与 function tools）、`GET /v1/models`、`GET /health`。
-- **深度思考透传规则**：仅当客户端显式请求 `reasoning_effort` 时转发；绝不强制注入，避免触发上游内容安全策略。
-- **反审查净化**：自动改写 Claude Code 等框架被上游逐字拉黑的固定 Prompt 语句。
-- **流式分片规范化**：上游在每个分片都下发 `finish_reason:""`（规范要求中间分片为 `null`），会被 Anthropic 协议翻译层误判为最终 `stop_reason=end_turn`，导致 Claude Code 工具不执行。网关将其归一化为 `null`，仅保留终止分片的真实原因，并清除旧版 `function_call` 空壳。
-- **主动探测模型属性 (probe)**：余额耗尽的账号不会被正常调度，因而学不到「该账号该模型是否免费」。`probe` 子命令可主动探测并写入账本。
-- **会话结构自动归一化**：自动保证首条消息为 `system`，修复部分非 harness 客户端（以 `assistant` 续写或以 `tool` 回传工具结果开头）触发的上游 `first message is not system prompt` (code 11128) 报错；同时兼容 OpenAI 新版 `developer` 角色。
-- **单账号串行化**：同一账号请求自动排队，避免并发双发触发上游风控；不同账号之间可并行。
+- **国内 / 国际双站反代**：两个站点走同一套协议，凭据通过 `edition` 字段区分，刷新与对话自动路由到各自上游。
+- **模型完全透传**：客户端传什么 `model` 就原样中继到上游，无白名单限制。`/v1/models` 仅用于客户端自动补全，不影响实际转发。
+- **模型列表双来源合并**：实时接口 + npm 静态目录，按 ID 去重、接口优先；失败用本地缓存，两边都失败且无缓存时该站点本轮不展示模型（不影响调用）。
+- **模型倍率与价格探测**：促销生效时展示 `credits` × factor；促销过期或接口无有效倍率时由余额未耗尽的同站点账号实测（启动即探测、重置后立即探测、每模型 12 小时一轮）。
+- **多账号池 + 轮询负载均衡**：`-auth` 逗号分隔或 `-auth-dir` 目录，请求按 round-robin 分发；国内站与国际站账号可混挂。
+- **模型级隔离**：`6004` 只冷却触发它的账号 + 模型，`14018` 只阻断该账号的当前收费模型，不再因为一个模型拖垮整个账号。
+- **免费站点优先**：同一模型若「一个站点免费、另一个站点收费」，优先使用免费站点账号直至其受限；两个站点都收费（仅倍率不同）时不做倾斜，正常轮询。
+- **免费/收费学习**：按「账号 + 模型」从响应 `usage.credit` 学习；`credit=0` 且样本足够（`total_tokens ≥ 100`）才判定免费，避免小样本误判。
+- **国内站每日自动签到**：服务启动、凭据热加载时立即补签，之后每天 `UTC+8 09:00` 自动签到；国际站跳过。
+- **凭据热加载（免重启）**：默认每 5 秒扫描凭据来源，新增 / 更新 / 删除凭据免重启生效。
+- **授权失效自动禁用**：401/403 / `invalid token` / 登录过期时禁止调度、删除凭据文件并写入失效标记，重新 `login` 后自动恢复。
+- **后台自动续期**：每 5 分钟检查 Token，距过期不足 15 分钟自动刷新并写回凭据文件。
+- **流式分片规范化**：把上游每个分片携带的 `finish_reason:""` 归一化为 `null`，避免 Anthropic 翻译层误判 `stop_reason` 导致工具不执行。
+- **OpenAI 兼容协议**：`/v1/chat/completions`（SSE 流式 + 非流式聚合）、`/v1/responses`（Responses API）、`/v1/models`、`/health`。
 
-## 快速上手
+---
 
-### 1. 扫码登录
+## 命令总览
 
-首次使用或凭据失效时执行（需微信 / 企业微信扫码）：
+```text
+workbuddy-gateway [command] [options]
 
-```bash
-# Windows
-.\workbuddy-gateway-windows-amd64.exe login
-
-# Linux / macOS
-./workbuddy-gateway-linux-amd64 login
-./workbuddy-gateway-darwin-arm64 login
-
-#指定保存凭据到某个目录（多账号模式下建议使用）
-workbuddy-gateway login -auth /opt/workbuddy-gateway/workbuddy001.json
+命令:
+  serve     启动本地网关（默认命令，不带子命令时等同 serve）
+  login     登录并获取 / 更新凭据
+  status    查看账号池状态
+  refresh   手动刷新所有账号访问令牌
+  monitor   前台实时监控：账号表格 + 模型统计附表 + 最近日志
+  probe     主动探测账号对指定模型的免费 / 收费属性（需 serve 运行中）
+  reset     清空除登录凭据外的全部本地数据，并重新拉取模型与倍率
+  version   查看版本信息
+  help      查看帮助
 ```
 
-终端将打印 ASCII 二维码与浏览器直达链接，扫码后凭据自动保存到当前目录 `workbuddy.json`（请勿提交到代码仓库）。
+全局选项（对所有命令可用）：
 
-> 提示：建议在 **CodeBuddy 控制台（网页端）** 扫码登录获取更高权限评级的 Token；若使用 `login` 命令扫码，账号渠道可能受限（`azp=invite`）。
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `-addr <ip>` | `127.0.0.1` | 网关监听地址 |
+| `-port <port>` | `8317` | 网关监听端口 |
+| `-auth <path>` | 自动发现 | 凭据文件路径，支持逗号分隔多个 |
+| `-auth-dir <dir>` | 空 | 凭据目录，自动加载目录内所有 `workbuddy*.json` |
+| `-api-key <key>` | 空 | 设置后调用网关必须携带 `Authorization: Bearer <key>` |
+| `-proxy <url>` | 空 | 上游请求代理，如 `http://127.0.0.1:7890`、`socks5://...` |
+| `-verbose` | `false` | 输出详细调试日志 |
+| `-intl` | `false` | 仅 `login` 生效：登录国际站 |
+| `-reload-interval <sec>` | `5` | 凭据热加载扫描间隔，`0` 关闭 |
+| `-models-refresh <min>` | `60` | 模型目录刷新间隔，`0` 关闭 |
 
-### 1b. 登录国际站（workbuddy.ai）
+---
+
+## serve
+
+启动本地网关，默认命令。
 
 ```bash
-# 登录国际站账号（保存到指定文件以便与国内站账号区分）
+# 默认监听 127.0.0.1:8317，自动加载当前目录下所有 workbuddy*.json
+workbuddy-gateway serve
+
+# 自定义端口与监听地址
+workbuddy-gateway serve -port 9000 -addr 0.0.0.0
+
+# 显式指定多个凭据文件（逗号分隔，轮询）
+workbuddy-gateway serve -auth workbuddy.json,workbuddy2.json
+
+# 目录模式：加载目录内所有 workbuddy*.json
+workbuddy-gateway serve -auth-dir ./auths
+
+# 上游走代理 + 开启客户端鉴权 + 详细日志
+workbuddy-gateway serve -proxy http://127.0.0.1:7890 -api-key sk-xxx -verbose
+
+# 关闭凭据热加载
+workbuddy-gateway serve -reload-interval 0
+
+# 关闭模型目录自动刷新
+workbuddy-gateway serve -models-refresh 0
+```
+
+启动后提供的端点：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/v1/chat/completions`、`/chat/completions` | Chat Completions，支持 SSE 流式与非流式 |
+| POST | `/v1/responses`、`/responses` | OpenAI Responses API |
+| GET | `/v1/models`、`/models` | 模型列表，响应头 `X-Model-Source` 标注来源 |
+| GET | `/health`、`/ping` | 健康检查，返回 `version`、`model_count`、`model_source` |
+| POST | `/admin/probe` | 供 `probe` 命令调用，**仅接受回环来源** |
+| GET | `/` | 简单文本说明 |
+
+后台任务（`serve` 启动后自动运行）：
+
+| 任务 | 周期 | 说明 |
+|---|---|---|
+| Token 续期检查 | 5 分钟 | 距过期不足 15 分钟自动刷新 |
+| 额度扫描 | 5 分钟 | 每凭据 10 秒超时，超时保留旧值；`剩余=0` 标记付费耗尽 |
+| 模型目录刷新 | 60 分钟 | 实时接口 + npm 目录，合并去重后写缓存 |
+| 模型价格探测 | 30 分钟检查 / 每模型 12 小时一轮 | 单轮最多 5 个，仅探测需要确认的模型 |
+| 每日签到 | 每天 `UTC+8 09:00` | 仅国内站 |
+| 状态快照 | 3 秒 | 写 `workbuddy-status.json` 供 `monitor` 读取 |
+| 凭据热加载 | 5 秒 | 扫描凭据新增 / 更新 / 删除 |
+
+---
+
+## login
+
+登录并保存凭据。国内站输出终端 ASCII 二维码；国际站在浏览器内完成。
+
+```bash
+# 国内站（微信 / 企业微信扫码）
+workbuddy-gateway login
+
+# 保存到指定文件（多账号推荐）
+workbuddy-gateway login -auth workbuddy2.json
+
+# 国际站（浏览器内完成，邮箱 / 验证码 / SSO）
 workbuddy-gateway login -intl
 workbuddy-gateway login -intl -auth workbuddy-intl.json
 ```
 
-国际站登录流程与国内站不同：网关生成登录链接后，**需要你在浏览器里完成登录**（支持邮箱、验证码、SSO 等方式），流程如下：
+说明：
 
-1. 终端打印二维码与直达链接（手机扫码或电脑打开均可）；
-2. 在浏览器中完成登录，页面显示 **Login Successful** 即可（无需理会跳转 App 的提示）；
-3. 网关自动轮询拿到 Token 并保存到凭据文件（`edition: "intl"`），等待窗口 15 分钟。
+- 默认保存到 `workbuddy.json`；`-auth` 可指定其他路径。
+- 国际站凭据写入 `edition: "intl"`，与国内站凭据可混挂在同一账号池。
+- 重新登录会覆盖原凭据并自动清除该账号的失效标记，无需重启服务（热加载会生效）。
 
-启动服务无需任何额外参数——凭据文件内已记录站点标识，`serve` / `refresh` 会自动路由到对应上游；**登录成功后新账号由凭据热加载自动加入运行中的账号池，无需重启服务**：
+---
 
-```bash
-workbuddy-gateway serve    # 自动发现目录下所有 workbuddy*.json（含国际站账号，混挂轮询）
-```
+## status
 
-> 说明：国际站 `www.workbuddy.ai` 与国内站 `copilot.tencent.com` 是同一协议的两套部署（登录 platform 为 `workbuddy-ai`，等待授权时轮询返回 code 11217）。国际站账号是否可用各模型、额度与风控策略由腾讯国际站侧决定。
-
-### 2. 查看凭据状态
+查看账号池状态，包含站点、冷却、额度与 Token 过期时间。
 
 ```bash
 workbuddy-gateway status
-```
-
-### 3. 启动本地网关
-
-```bash
-# 默认监听 127.0.0.1:8317
-workbuddy-gateway serve
-
-# 自定义端口 / 地址 / 详细日志
-workbuddy-gateway serve -port 8317 -verbose
-
-# 通过出口代理转发（可选，降低上游风控概率）
-workbuddy-gateway serve -proxy http://127.0.0.1:7890
-
-# 开启客户端鉴权
-workbuddy-gateway serve -api-key sk-localsecret
-```
-
-## 多账号池与 429 自动冷却
-
-### 配置多个账号
-
-网关支持同时挂载多个 CodeBuddy 账号，请求按**轮询（round-robin）**方式均匀分发，保持各账号额度消耗一致。三种配置方式：
-
-```bash
-# 方式一（推荐）：自动发现 — 把多个凭据文件放进工作目录即可，无需任何参数
-# 网关启动时自动加载当前目录下所有 workbuddy*.json（如 workbuddy.json、workbuddy2.json…）
-cd /opt/workbuddy-gateway
-workbuddy-gateway serve -addr 0.0.0.0 -port 8317
-# 启动日志会显示: 已就绪账号池: 2 个账号 (有效 2, 失效 0)
-
-# 方式二：-auth 逗号分隔多个凭据文件
-workbuddy-gateway serve -auth workbuddy.json,workbuddy-2.json,workbuddy-3.json
-
-# 方式三：-auth-dir 指定凭据目录（自动加载目录下所有 workbuddy*.json）
-mkdir -p auths
-workbuddy-gateway login -auth auths/workbuddy-1.json   # 依次为每个账号扫码登录
-workbuddy-gateway login -auth auths/workbuddy-2.json
-workbuddy-gateway serve -auth-dir ./auths
-```
-
-### 429 频率限制自动冷却
-
-当某个账号触发上游频率限制（HTTP 429，消息形如 `您的使用量已超出频率限制，将在 2026-09-04 07:48:15 UTC+8 重置`）时，网关会：
-
-1. **自动解析消息中的重置时间**，立即将该账号屏蔽（冷却）至该时间点；
-2. **自动改用下一个可用账号重试**当前请求（代偿），无需客户端干预；
-3. 冷却期间该账号不参与轮询，**冷却到期后自动恢复**；
-4. 若消息中无法解析重置时间，默认冷却 60 秒后重试；
-5. 当所有账号均处于冷却状态时，返回 HTTP 429 并附上最早解封时间。
-
-```bash
-# 查看各账号状态（含冷却状态与解封时间）
-workbuddy-gateway status
-
-# 手动刷新所有账号令牌
-workbuddy-gateway refresh
-```
-
-### 授权失效自动禁用
-
-当账号出现以下任一情况时，网关会**自动禁用该账号调度并删除其凭据文件**：
-
-- 令牌刷新失败且返回授权类错误（HTTP 401/403、`invalid token`、`unauthorized`、`登录已过期` 等）；
-- 上游请求返回 401/403（token 被撤销或已过期）；
-- 凭据缺少 RefreshToken 且已无法刷新。
-
-处理流程：
-
-1. 将该账号标记为 **授权失效**，立即移出轮询调度；
-2. **删除对应的凭据文件**（如 `workbuddy.json`），并写入持久化失效标记（`workbuddy.json.disabled`）；
-3. 控制台（`status` / 启动日志 / 运行日志）明确显示失效原因，并给出重新登录命令；
-4. 失效期间其余账号正常代偿；**重新执行 login 后自动清除失效标记并恢复调度**。
-
-```bash
-# 查看失效账号与原因
-workbuddy-gateway status
-# 输出示例：
-# --- 账号 #1 ---
-# 凭据文件:     workbuddy-2.json
-# 站点:         国内站 (copilot.tencent.com)
-# 用户昵称:     tester
-# 用户 UID:     uid-xxx
-# 账号状态:     授权失效（禁止调度）
-# 失效原因:     令牌刷新失败 (HTTP 401): invalid token
-# 处理建议:     凭据文件已删除，请重新执行: workbuddy-gateway login -auth workbuddy-2.json
-
-# 失效账号重新登录后自动恢复
-workbuddy-gateway login -auth workbuddy-2.json
-workbuddy-gateway status   # 该账号恢复为可用
-```
-
-### 与单账号模式的兼容性
-
-- 不传 `-auth` / `-auth-dir` 时，自动发现当前工作目录下所有 `workbuddy*.json`；目录中只有一个凭据文件时行为与旧版完全一致；
-- 只有一个账号时，请求始终使用该账号，429 冷却逻辑同样生效（冷却期间请求将返回 429 提示）；
-- 账号之间使用独立的串行锁：同一账号请求严格排队，不同账号可并行，兼顾风控与吞吐。
-
-### 凭据热加载（免重启增减账号）
-
-`serve` 运行期间默认每 5 秒扫描一次凭据来源（`-reload-interval` 可调，设为 `0` 关闭），自动完成：
-
-- **新增账号**：把新的 `workbuddy*.json` 放进凭据目录（或对运行中的网关执行 `login -auth 新文件.json`），几秒内自动加入轮询池；
-- **重新登录 / 更新凭据**：对已有凭据文件重新 `login` 后，网关原地替换凭据并自动恢复调度（含曾因授权失效被禁用的账号）；
-- **删除账号**：删除凭据文件即自动移出轮询池（已写入失效标记的账号保留提示，重新登录后自动恢复）。
-
-日志示例：
-
-```text
-[Reload] 发现新账号凭据 workbuddy4.json（国际站），已自动加入账号池
-[Reload] 账号 workbuddy2.json 重新登录成功，已自动恢复调度
-[Reload] 凭据文件 workbuddy3.json 已删除，已移出账号池
-```
-
-## 前台实时监控 (monitor)
-
-网关以 systemd / 后台方式运行时，可用 **`monitor` 命令在前台实时查看所有账号的最新状态与最近日志**（Ctrl+C 退出）：
-
-```bash
-# 基本用法：每 3 秒刷新展示账号池状态（可用/冷却/过期/失效 + Token 完整有效期）
-cd /opt/workbuddy-gateway        # 必须与 serve 同一工作目录（读取 workbuddy-status.json）
-workbuddy-gateway monitor
-
-# 自定义刷新间隔（秒）
-workbuddy-gateway monitor -interval 2
-
-# 同时展示 systemd 服务最近日志（Linux）
-workbuddy-gateway monitor -journal workbuddy-gateway
-
-# 或展示指定日志文件最近内容
-workbuddy-gateway monitor -logfile /var/log/workbuddy-gateway.log
-
-# 控制每次展示的日志行数
-workbuddy-gateway monitor -journal workbuddy-gateway -lines 8
-```
-
-展示内容（实时刷新）：
-
-```text
-================ WorkBuddy 实时监控 ================
-按 Ctrl+C 退出 | 状态文件: workbuddy-status.json
----------------------------------------------------------------
-更新时间: 2026-09-04 09:35:12
-账号池: 共 2 个 | 可用 1 | 冷却 0 | 付费耗尽 1 | 过期 0 | 失效 0
-+------+----------------------+--------------------------+----------+------------+---------------------+------------+------------+------------+------------+------------+------------+
-| 序号 | 凭据文件             | 账号                     | 站点     | 状态       | Token 有效期        | 总额度     | 已用       | 剩余       | 付费用户   | 免费模型   | 模型冷却   |
-+------+----------------------+--------------------------+----------+------------+---------------------+------------+------------+------------+------------+------------+------------+
-| 1    | workbuddy.json       | user-a                   | 国内站   | 可用       | 2026-09-10 20:43:00 | 2000       | 1500       | 500        | 否         | 1          | 0          |
-| 2    | workbuddy2.json      | user-b                   | 国际站   | 付费耗尽   | 2027-09-05 01:57:00 | 1100       | 1100       | 0          | 否         | 2          | 1          |
-+------+----------------------+--------------------------+----------+------------+---------------------+------------+------------+------------+------------+------------+------------+
-
-模型统计 (来源 official-cli@2.151.0):
-+----------------------------+---------------------+----------+----------+----------+----------+-------------+-----------+-----------+--------------+-----------------+
-| 模型                       | 来源                | 国内免费 | 国际免费 | 可用账号 | 请求     | 成功/失败   | 首字      | 平均      | 最近状态     | 最近请求        |
-+----------------------------+---------------------+----------+----------+----------+----------+-------------+-----------+-----------+--------------+-----------------+
-| hy3                        | official-cli@2.151.0 | 是       | 否       | 3        | 6        | 6/0         | 2.1s      | 8.7s      | 成功         | 09-16 22:34:58  |
-| deepseek-v4.1-flash        | official-cli@2.151.0 | 否       | -        | 8        | 12       | 12/0        | 820ms     | 3.4s      | 成功         | 09-16 20:23:28  |
-+----------------------------+---------------------+----------+----------+----------+----------+-------------+-----------+-----------+--------------+-----------------+
-
-最近日志 (journalctl -u workbuddy-gateway):
-  9月 04 09:34:31 ... [Cooldown] 账号 workbuddy2.json 触发频率限制...
----------------------------------------------------------------
-```
-
-> 原理：`serve` 后台每 3 秒（及状态变化时）将账号池实时状态原子写入同目录 `workbuddy-status.json`，`monitor` 前台读取该文件并周期刷新展示；Token 每 5 分钟检查一次，距离过期不足 15 分钟时自动刷新；账号额度在服务启动、凭据池发生变化时立即查询，此后每 300 秒更新。每个凭据查询最多等待 10 秒（包含等待账号锁和 HTTP 请求），超时保留旧结果并等待下一轮；新一轮扫描开始时会取消上一轮尚未完成的请求，避免扫描堆积。额度支持小数并按上游原值展示；余额为 0 时仅阻断已确认收费或已返回 `14018` 的模型，已确认免费模型仍可调度。运行日志同时写入 `logs/gateway-YYYY-MM-DD.log`，也可通过 `journalctl` 查看。额度表格中的数值来自用户中心只读计费接口；首次查询失败时显示 `-`。
-
-模型限制按“账号 + 模型”隔离：`code 6004` 只冷却触发模型，其他模型仍可调用；`code 14018` 只阻断该账号的当前收费模型。成功响应明确携带 `usage.credit=0` 且 `total_tokens >= 100` 时，网关才学习该账号下该模型为免费模型（避免极小探针请求被上游记 0 而误判）；付费余额耗尽账号仍可优先服务已确认免费的模型，并通过 `[FreeModel]` 日志明确记录。
-
-由于免费/收费按账号学习，而账号分属国内站与国际站，同一模型名在两个站点可能结论不同，因此附表的免费结论按站点分列（国内免费 / 国际免费），不会合并成无法解释的“混合”。调度层同样按账号（含站点）+ 模型隔离，两个站点的结论互不影响。
-
-监视界面下半部分是 **模型统计附表**，汇总 `/v1/models` 目录中的模型（含未请求过的模型，显示 0 请求）：
-
-| 列 | 含义 |
-|---|---|
-| 模型 | 模型 ID |
-| 来源 | 官方目录版本（official-cli@x.y.z）或静态兜底 |
-| 国内免费 | 国内站账号对该模型的实测结论：是 / 否 / 混合 / - |
-| 国际免费 | 国际站账号对该模型的实测结论：是 / 否 / 混合 / - |
-| 可用账号 | 当前真正可调度该模型的账号数（已计入账号冷却、模型冷却、模型额度阻断；国内站与国际站合计） |
-| 请求 | 客户端请求次数 |
-| 成功/失败 | 计数 |
-| 首字 | 平均首字响应时间 TTFT（上游响应体首个非空读取，流式与非流式都统计） |
-| 平均 | 平均总耗时 |
-| 最近状态 | 成功 / 失败:业务码（如 14018、6004、11102） |
-| 最近请求 | 最近一次请求时间 |
-
-统计仅用于展示，不参与调度决策，随 `workbuddy-status.json` 一并写入。
-
-## 主动探测模型属性 (probe)
-
-免费/收费属性是**按「账号（含站点）+ 模型」**学习的，只有该账号真正请求过该模型才会写入账本。默认调度优先使用有余额的账号，因此**余额耗尽的账号（典型如国际站）几乎不会被选中，也就学不到属性**。
-
-`probe` 子命令用于主动补课：对指定账号 + 指定模型发一次最小请求，读取上游 `usage.credit` 并更新账本。
-
-```bash
-# 探测全部账号，每个账号取模型目录前 5 个模型
-workbuddy-gateway probe
-
-# 只探测国际站账号，指定模型
-workbuddy-gateway probe -auth workbuddy4.json -models hy3,deepseek-v4.1-flash
-
-# 指定探测模型数量上限
-workbuddy-gateway probe -auth workbuddy4.json -limit 8
-
-# 服务启用了 -api-key 时，probe 会自动携带；-addr/-port 需与 serve 一致
-workbuddy-gateway probe -port 8317
 ```
 
 输出示例：
 
 ```text
+================== WorkBuddy 账号池状态 ==================
+账号总数: 2
+
+--- 账号 #1 ---
+凭据文件:     workbuddy.json
+站点:         国内站 (copilot.tencent.com)
+用户昵称:     user-a
+用户 UID:     uid-xxx
+企业 ID:      (个人账号)
+认证域名:     www.codebuddy.cn
+冷却状态:     可用
+Token 状态:   有效
+过期时间:     2026-09-22 12:32:07 (剩余 119h30m0s)
+```
+
+---
+
+## refresh
+
+立即刷新所有账号的 Access Token（正常情况下由后台每 5 分钟自动检查，无需手动执行）。
+
+```bash
+workbuddy-gateway refresh
+```
+
+- 成功 / 失败 / 跳过（授权失效）会分别统计。
+- 刷新失败若属于授权类错误，会禁用该账号并删除凭据文件。
+
+---
+
+## monitor
+
+前台实时监控，周期刷新展示「账号表格 + 模型统计附表 + 最近日志」，`Ctrl+C` 退出。
+
+```bash
+# 必须在 serve 的工作目录执行（读取 workbuddy-status.json）
+cd /opt/workbuddy-gateway
+workbuddy-gateway monitor
+
+# 附加展示 systemd 服务最近日志（Linux）
+workbuddy-gateway monitor -journal workbuddy-gateway
+
+# 附加展示指定日志文件
+workbuddy-gateway monitor -logfile /var/log/workbuddy-gateway.log
+
+# 调整刷新间隔与日志行数
+workbuddy-gateway monitor -interval 2 -lines 20
+```
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `-interval <sec>` | `3` | 状态刷新间隔 |
+| `-journal <svc>` | 空 | 同时展示 `journalctl -u <svc>` 最近日志 |
+| `-logfile <path>` | 空 | 同时展示指定日志文件末尾内容 |
+| `-lines <n>` | `15` | 每次展示的日志行数 |
+
+**账号表格**
+
+```text
+账号池: 共 2 个 | 可用 1 | 冷却 0 | 付费耗尽 1 | 过期 0 | 失效 0
++------+----------------+------------+--------+------------+---------------------+----------+----------+--------+------------+------------+------------+
+| 序号 | 凭据文件       | 账号       | 站点   | 状态       | Token 有效期        | 总额度   | 已用     | 剩余   | 付费用户   | 免费模型   | 模型冷却   |
++------+----------------+------------+--------+------------+---------------------+----------+----------+--------+------------+------------+------------+
+| 1    | workbuddy.json | user-a     | 国内站 | 可用       | 2026-09-22 12:32:07 | 2300     | 1200     | 1100   | 否         | 1          | 0          |
+| 2    | workbuddy2.json| user-b     | 国际站 | 付费耗尽   | 2027-09-05 01:57:00 | 1100     | 1100     | 0      | 否         | 0          | 0          |
++------+----------------+------------+--------+------------+---------------------+----------+----------+--------+------------+------------+------------+
+```
+
+状态取值：`可用`、`冷却`、`付费耗尽`、`已过期`、`失效`。
+
+**模型统计附表**
+
+```text
+模型统计 (来源 live-api@2026-09-17 14:04):
++----------------------------+----------+----------+----------+----------+-----------+-----------+
+| 模型                       | 国内倍率 | 国际倍率 | 可用账号 | 请求     | 首字      | 平均      |
++----------------------------+----------+----------+----------+----------+-----------+-----------+
+| hy3                        | 0.00x    | 0.00x    | 7        | 6        | 2.1s      | 8.7s      |
+| deepseek-v4.1-flash        | 0.03x    | 0.00x    | 5        | 12       | 820ms     | 3.4s      |
+| hy4-preview                | 0.00x    | -        | 7        | 4        | 1.3s      | 4.1s      |
++----------------------------+----------+----------+----------+----------+-----------+-----------+
+```
+
+| 列 | 含义 |
+|---|---|
+| 模型 | 模型 ID |
+| 国内倍率 | 国内站生效倍率（`credits` × 促销 factor）；免费显示 `0.00x`，促销过期或接口无有效倍率时显示 `-`，实测确认收费显示 `收费(倍率未知)` |
+| 国际倍率 | 国际站同上 |
+| 可用账号 | 当前可调度该模型的账号数（已计入账号冷却、模型冷却、模型额度阻断） |
+| 请求 | 客户端请求次数 |
+| 首字 | 平均首字响应时间（TTFT） |
+| 平均 | 平均总耗时 |
+
+---
+
+## probe
+
+免费 / 收费属性按「账号（含站点）+ 模型」学习，只有该账号真正请求过该模型才会写入账本。默认调度优先使用有余额账号，**余额耗尽的账号几乎不会被选中，也就学不到属性**。`probe` 用于主动补课。
+
+> 注意：额度耗尽的账号会被上游整体拒绝（`14018 Credits exhausted`），此时连免费模型也会失败。要验证某模型是否免费，请使用**额度未耗尽**的账号。
+
+```bash
+# 探测全部账号，每个账号取模型目录前 5 个模型
+workbuddy-gateway probe
+
+# 只探测指定账号
+workbuddy-gateway probe -auth workbuddy4.json
+
+# 指定模型
+workbuddy-gateway probe -auth workbuddy4.json -models hy3,deepseek-v4.1-flash
+
+# 指定数量上限（默认 5，上限 50）
+workbuddy-gateway probe -auth workbuddy4.json -limit 8
+```
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `-auth <path>` | 全部账号 | 只探测指定凭据（文件名或路径均可） |
+| `-models <m1,m2>` | 目录前几个 | 指定要探测的模型 |
+| `-limit <n>` | `5` | 未指定 `-models` 时探测的模型数量，上限 50 |
+
+输出示例：
+
+```text
 正在请求 http://127.0.0.1:8317/admin/probe（账号=workbuddy4.json，模型=hy3）...
-账号                   站点     模型                     结果         credit   tokens   说明
-workbuddy4.json        国际站   hy3                      paid         0.42     820      usage.credit=0.42，收费
+
+账号                   站点   模型     结果     credit  tokens  说明
+workbuddy4.json        intl   hy3      paid     0.42    820     usage.credit=0.42，收费
 
 汇总: paid=1
 ```
 
-结果状态含义：
+结果状态：
 
 | 状态 | 含义 |
 |---|---|
-| `free` | `usage.credit=0` 且 `total_tokens >= 100`，已学习为免费 |
+| `free` | `usage.credit=0` 且 `total_tokens ≥ 100`，已学习为免费 |
 | `paid` | `usage.credit > 0`，已学习为收费 |
-| `unknown` | 上游未返回 `credit`，或 `credit=0` 但样本过小（不判定免费） |
-| `quota` | 返回 `14018`，记为该账号该模型收费并阻断该模型 |
-| `rate_limited` | 返回 `6004`，仅冷却该模型 |
+| `unknown` | 未返回 `credit`，或 `credit=0` 但样本过小 |
+| `quota` | `14018` 额度耗尽，记为该账号该模型收费并阻断该模型 |
+| `rate_limited` | `6004` 模型级限流，只冷却该模型 |
 | `auth_failed` | 授权失效（probe 不会自动禁用账号） |
 | `skipped` | 账号失效或无凭据 |
-| `error` | 网络/协议错误 |
+| `error` | 网络 / 协议错误 |
 
-> 说明：probe 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存里，独立进程直接写状态文件会被服务周期快照覆盖，所以探测必须由运行中的服务执行。该接口只接受本机回环来源；服务启用 `-api-key` 时同样需要鉴权。
+> 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源；服务启用 `-api-key` 时同样需要鉴权。
 
-探测失败只记录日志，不会禁用账号、不会冻结调度；`quota` / `rate_limited` 会按模型级规则写入账本，属于有效学习结果。
+---
+
+## reset
+
+清空**除登录凭据以外**的全部本地数据，并重新拉取模型与倍率。
+
+```bash
+workbuddy-gateway reset
+```
+
+清理范围：
+
+- `workbuddy-status.json`（账号与模型状态快照）
+- `wb-models-cache.json`（模型目录、倍率、价格探测结论）
+- `*.disabled` / `*.json.disabled`（授权失效标记）
+- `logs/`（运行日志）
+
+保留：`workbuddy*.json` 登录凭据。
+
+清理后会立即重新拉取模型目录与倍率。账号账本同时存在于 `serve` 进程内存中，若服务正在运行，请重启使其同步归零：
+
+```bash
+systemctl restart workbuddy-gateway
+```
+
+---
+
+## version / help
+
+```bash
+workbuddy-gateway version    # 输出 WorkBuddy Local Gateway vX.Y.Z
+workbuddy-gateway help       # 输出完整帮助
+workbuddy-gateway -v         # 同 version
+workbuddy-gateway -h         # 同 help
+```
+
+---
+
+## 多账号池
+
+三种配置方式：
+
+```bash
+# 方式一（推荐）：自动发现
+# 把多个凭据文件放进工作目录，无需任何参数
+workbuddy-gateway serve
+
+# 方式二：-auth 逗号分隔
+workbuddy-gateway serve -auth workbuddy.json,workbuddy2.json
+
+# 方式三：-auth-dir 目录
+workbuddy-gateway serve -auth-dir ./auths
+```
+
+行为说明：
+
+- **轮询**：请求按 round-robin 在可用账号间分发。
+- **429 冷却**：`6004` 只冷却触发模型；无法归因到模型的 429 才进入账号级冷却，冷却到期自动恢复。
+- **授权失效**：401/403 类错误禁用账号并删除凭据文件，同时写 `*.disabled` 标记；重新 `login` 后自动恢复。
+- **额度耗尽**：`剩余=0` 标记「付费耗尽」，仍可服务已确认免费的模型。
+- **热加载**：默认每 5 秒扫描，新增 / 更新 / 删除凭据免重启。
+- **串行化**：同一账号请求严格排队，避免并发双发触发风控；不同账号可并行。
+
+---
+
+## 模型列表与倍率
+
+**列表来源**：实时接口 `GET {Base}/v2/enterprises/personal/models` 与 npm 包静态目录，按模型 ID 去重、**接口优先**。
+
+```text
+两路都成功  → 合并去重
+一路成功    → 使用成功那路
+两路都失败  → 使用本地缓存 wb-models-cache.json
+失败且无缓存→ 该站点本轮不展示模型（不影响模型调用）
+```
+
+**免费站点优先**：若某模型出现「一个站点免费、另一个站点收费」，调度优先使用免费站点的账号，直到该站点账号全部不可用（冷却 / 耗尽 / 失效）才回退到另一站点；若两个站点都免费或都收费（只是倍率不同），则不设优先，保持正常轮询。
+
+**倍率**：
+
+```text
+1. 促销生效中：生效倍率 = credits × factor（factor=0 → 0.00x）
+2. 促销已过期：接口 credits 不可信（上游常把促销价固化进 credits），
+   探测出结果前显示 -，随后由实测决定
+3. 模型不在接口目录中：同样交由实测决定
+4. 无促销且 credits 有值：直接展示该倍率
+```
+
+**价格探测**：由「余额未耗尽」的同站点账号发一次最小请求实测。
+
+```text
+探测免费 → 展示 0.00x，并每 12 小时复测确认
+探测收费 → 展示 收费(倍率未知)，直到接口重新给出未过期的 0.00x
+14018 / 无 usage.credit / 样本过小 → 不覆盖，保持未知
+```
+
+探测调度：
+
+| 时机 | 说明 |
+|---|---|
+| 服务启动 | 启动后约 20 秒执行首轮 |
+| 首次 / 重置后 | 单轮最多 30 个，快速补齐结论 |
+| 收敛后 | 单轮最多 5 个，每模型 12 小时最多一次 |
+| 待探测未清空 | 用 2 分钟短间隔追赶，清空后回到 30 分钟 |
+| 目录刷新成功 | 立即触发一轮 |
+| 凭据变化 | 立即触发一轮（含「原本没有某站点账号、后来加入」的情况） |
+
+仅探测被实际请求过、或接口明确需要确认的模型，避免无谓消耗额度。
+
+`/v1/models` 响应头 `X-Model-Source` 与 `/health` 的 `model_source` 会标注目录来源。
+
+---
 
 ## 客户端接入
 
 网关启动后服务地址为 `http://127.0.0.1:8317/v1`。
+
+curl：
 
 ```bash
 curl -N -s http://127.0.0.1:8317/v1/chat/completions \
@@ -338,7 +459,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-DSH (`~/.dsh/settings.yaml`)：
+DSH（`~/.dsh/settings.yaml`）：
 
 ```yaml
 llm-pi-ai:
@@ -353,50 +474,51 @@ llm-pi-ai:
           maxTokens: 128000
 ```
 
-## 各平台使用方法
+---
+
+## 各平台部署
 
 ### Windows
 
 1. 从 [Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载 `workbuddy-gateway-windows-amd64.exe`。
 2. 在 PowerShell / CMD 中进入文件所在目录：
+
    ```powershell
    .\workbuddy-gateway-windows-amd64.exe login
    .\workbuddy-gateway-windows-amd64.exe serve -port 8317
    ```
-3. 如需开机自启：`Win+R` → `shell:startup`，将 exe 的快捷方式放入启动文件夹即可（命令行加 `serve` 参数需通过快捷方式"目标"追加）。
 
-### Linux (amd64 / arm64)
+3. 开机自启：`Win+R` → `shell:startup`，把 exe 快捷方式放入启动文件夹，并在快捷方式“目标”后追加 `serve`。
 
-1. 从 [Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载对应架构二进制，赋执行权限并放入 PATH：
-   ```bash
-   # x86_64
-   wget https://github.com/CangShui/workbuddy-gateway/releases/latest/download/workbuddy-gateway-linux-amd64
-   sudo install -m 755 workbuddy-gateway-linux-amd64 /usr/local/bin/workbuddy-gateway
-   # ARM64 (树莓派 / 飞腾 / Apple silicon 云主机等)
-   wget https://github.com/CangShui/workbuddy-gateway/releases/latest/download/workbuddy-gateway-linux-arm64
-   sudo install -m 755 workbuddy-gateway-linux-arm64 /usr/local/bin/workbuddy-gateway
-   ```
-2. 登录并启动：
-   ```bash
-   workbuddy-gateway login      # 终端二维码扫码（可用 tmux 保持）
-   workbuddy-gateway serve -addr 127.0.0.1 -port 8317
-   ```
+### Linux
 
-#### Linux 注册为 systemd 服务（推荐，开机自启 + 崩溃自动拉起）
+```bash
+# x86_64
+wget https://github.com/CangShui/workbuddy-gateway/releases/latest/download/workbuddy-gateway-linux-amd64
+sudo install -m 755 workbuddy-gateway-linux-amd64 /usr/local/bin/workbuddy-gateway
+
+# ARM64
+wget https://github.com/CangShui/workbuddy-gateway/releases/latest/download/workbuddy-gateway-linux-arm64
+sudo install -m 755 workbuddy-gateway-linux-arm64 /usr/local/bin/workbuddy-gateway
+
+workbuddy-gateway login
+workbuddy-gateway serve -addr 127.0.0.1 -port 8317
+```
+
+#### systemd 服务（推荐）
 
 创建 `/etc/systemd/system/workbuddy-gateway.service`：
 
 ```ini
 [Unit]
-Description=WorkBuddy Local Gateway (CodeBuddy/Hunyuan OpenAI-compatible proxy)
+Description=WorkBuddy Local Gateway (CodeBuddy OpenAI-compatible proxy)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# 二进制与 workbuddy.json 所在目录；请按实际部署路径修改
 WorkingDirectory=/opt/workbuddy-gateway
-ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 127.0.0.1 -port 8317
+ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 8317
 Restart=on-failure
 RestartSec=5
 User=root
@@ -408,62 +530,53 @@ ProtectHome=false
 WantedBy=multi-user.target
 ```
 
-部署文件：
+部署与启动：
 
 ```bash
 sudo mkdir -p /opt/workbuddy-gateway
-sudo cp workbuddy-gateway /opt/workbuddy-gateway/      # 对应架构的二进制
-# 首次登录（会生成 workbuddy.json）
+sudo cp workbuddy-gateway /opt/workbuddy-gateway/
 sudo /opt/workbuddy-gateway/workbuddy-gateway login
-# 登录第二个账号（可选）：生成 workbuddy2.json
-sudo /opt/workbuddy-gateway/workbuddy-gateway login -auth /opt/workbuddy-gateway/workbuddy2.json
-```
-
-> **多账号自动发现**：服务通过 `WorkingDirectory` 固定在 `/opt/workbuddy-gateway`，
-> 无需修改 ExecStart——把多个凭据文件（`workbuddy.json`、`workbuddy2.json`…）放进该目录，
-> 即可自动组成轮询池；凭据热加载会让新增/更新/删除的凭据文件免重启生效。确认方式：
-> ```bash
-> sudo journalctl -u workbuddy-gateway | grep 账号池
-> # 输出示例: 已就绪账号池: 2 个账号 (有效 2, 失效 0)
-> ```
-
-启用并启动服务：
-
-```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now workbuddy-gateway
-sudo systemctl status workbuddy-gateway     # 查看状态
-sudo journalctl -u workbuddy-gateway -f     # 查看实时日志
+sudo systemctl status workbuddy-gateway
+sudo journalctl -u workbuddy-gateway -f
 ```
 
-常用运维命令：
+> `WorkingDirectory` 决定自动发现的凭据目录。把多个凭据文件放进该目录即可组成账号池，新增 / 更新 / 删除会自动热加载。
+
+常用运维：
 
 ```bash
-sudo systemctl restart workbuddy-gateway    # 重启（如更换凭据后）
-sudo systemctl stop workbuddy-gateway       # 停止
-sudo systemctl disable workbuddy-gateway    # 取消开机自启
+sudo systemctl restart workbuddy-gateway
+sudo systemctl stop workbuddy-gateway
+sudo systemctl disable workbuddy-gateway
 ```
 
-如需对外开放（例如给局域网其他设备使用），将 `-addr` 改为 `0.0.0.0`，**并务必**配合 `-api-key` 设置访问密钥：
+对外开放时（例如局域网其他设备）把 `-addr` 改为 `0.0.0.0`，并**务必**设置 `-api-key`：
 
-```bash
+```ini
 ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 8317 -api-key sk-changeme
 ```
 
-### macOS (Apple Silicon / Intel)
+### macOS
 
-1. 从 [Releases](https://github.com/CangShui/workbuddy-gateway/releases) 下载 `workbuddy-gateway-darwin-arm64`（M 系列）或 `workbuddy-gateway-darwin-amd64`（Intel）。
-2. 首次运行需移除隔离属性：
+1. 下载 `workbuddy-gateway-darwin-arm64`（Apple Silicon）或 `workbuddy-gateway-darwin-amd64`（Intel）。
+2. 移除隔离属性：
+
    ```bash
    chmod +x workbuddy-gateway-darwin-arm64
    xattr -d com.apple.quarantine workbuddy-gateway-darwin-arm64 2>/dev/null || true
    ```
+
 3. 登录与启动：
+
    ```bash
    ./workbuddy-gateway-darwin-arm64 login
    ./workbuddy-gateway-darwin-arm64 serve
    ```
+
 4. 开机自启（launchd）：创建 `~/Library/LaunchAgents/com.workbuddy.gateway.plist`：
+
    ```xml
    <?xml version="1.0" encoding="UTF-8"?>
    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -482,24 +595,21 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
    </dict>
    </plist>
    ```
+
    ```bash
    launchctl load ~/Library/LaunchAgents/com.workbuddy.gateway.plist
    ```
 
+---
+
 ## 安全提示
 
-- `workbuddy.json` 包含真实 CodeBuddy 访问凭据（Access Token / Refresh Token），**严禁提交到 Git 仓库或公开分享**；本仓库 `.gitignore` 已将其排除。
-- 网关默认只监听 `127.0.0.1`。需要局域网 / 公网访问时请改用 `-addr 0.0.0.0` 并配合 `-api-key` 鉴权，或置于反向代理（如 nginx）之后。
-- 若不再需要某账号的授权，请删除对应 `workbuddy.json` 并在 CodeBuddy 控制台撤销应用授权。
+- `workbuddy*.json` 包含真实访问凭据（Access Token / Refresh Token），**严禁提交到 Git 或公开分享**；本仓库 `.gitignore` 已排除。
+- 网关默认只监听 `127.0.0.1`。需要局域网 / 公网访问时改用 `-addr 0.0.0.0` 并配合 `-api-key`，或置于反向代理之后。
+- `/admin/probe` 仅接受回环来源调用。
+- 不再需要某账号授权时，删除对应凭据文件并在 CodeBuddy 控制台撤销授权。
 
-## 命令行速查
-
-```
-命令:  serve | login | status | refresh | monitor | version | help
-选项:  -addr <ip> · -port <port> · -auth <path> · -auth-dir <dir> · -intl · -reload-interval <sec> · -api-key <key> · -proxy <url> · -verbose
-       （-intl 仅 login 生效：登录国际站 www.workbuddy.ai；-reload-interval 默认 5，0 关闭热加载）
-monitor: -interval <sec> · -journal <svc> · -logfile <path> · -lines <n>
-```
+---
 
 ## 从源码构建
 
@@ -508,8 +618,19 @@ monitor: -interval <sec> · -journal <svc> · -logfile <path> · -lines <n>
 ```bash
 git clone https://github.com/CangShui/workbuddy-gateway.git
 cd workbuddy-gateway
-CGO_ENABLED=0 go build -ldflags="-s -w" -o workbuddy-gateway .
+
+go vet ./...
+go test ./...
+
+# 当前平台
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o workbuddy-gateway .
+
+# 交叉编译示例
+GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-linux-amd64 .
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-windows-amd64.exe .
 ```
+
+---
 
 ## 免责声明
 

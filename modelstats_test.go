@@ -98,6 +98,30 @@ func TestModelFreeSplitBySite(t *testing.T) {
 	}
 }
 
+func TestMultiplierCellUsesFreeThenOfficial(t *testing.T) {
+	resetModelStats()
+	modelsMu.Lock()
+	catalogModels = map[string][]catalogModel{
+		"cn":   {{ID: "hy3", Multiplier: 0.20, HasMultiplier: true}},
+		"intl": {{ID: "hy3", Multiplier: 0.51, HasMultiplier: true}},
+	}
+	modelsMu.Unlock()
+	defer resetModelsStateT(t)
+
+	if got := modelDisplayMultiplier("cn", "hy3", "是"); got != "0.00x" {
+		t.Fatalf("free model should show 0.00x, got %s", got)
+	}
+	if got := modelDisplayMultiplier("cn", "hy3", "否"); got != "0.20x" {
+		t.Fatalf("paid cn should show official multiplier, got %s", got)
+	}
+	if got := modelDisplayMultiplier("intl", "hy3", "-"); got != "0.51x" {
+		t.Fatalf("unknown intl should show official multiplier, got %s", got)
+	}
+	if got := modelDisplayMultiplier("_", "missing", "-"); got != "-" {
+		t.Fatalf("unknown model should show -, got %s", got)
+	}
+}
+
 func TestModelTableHasEqualDisplayWidth(t *testing.T) {
 	resetModelStats()
 	recordModelRequest("glm-5.2")
@@ -111,7 +135,7 @@ func TestModelTableHasEqualDisplayWidth(t *testing.T) {
 			t.Fatalf("line %d width=%d want=%d:\n%s", i, got, want, table)
 		}
 	}
-	for _, h := range []string{"模型", "来源", "国内免费", "国际免费", "可用账号", "请求", "成功/失败", "首字", "平均", "最近状态", "最近请求"} {
+	for _, h := range []string{"模型", "国内倍率", "国际倍率", "可用账号", "请求", "首字", "平均"} {
 		if !strings.Contains(table, h) {
 			t.Fatalf("table missing header %q", h)
 		}
@@ -152,5 +176,51 @@ func TestTTFTReader(t *testing.T) {
 	}
 	if r.duration() <= 0 {
 		t.Fatal("ttft should be recorded on first read")
+	}
+}
+
+// 平均首字/平均总耗时必须是最近 5 小时的滚动窗口，旧样本要被淘汰。
+func TestWindowAveragesRollingFiveHours(t *testing.T) {
+	resetModelStats()
+	now := time.Now()
+
+	modelStatsMu.Lock()
+	stat := modelStatLocked("m")
+	// 窗口内：1 小时前，TTFT 200ms，耗时 1s
+	cur := stat.bucketLocked(now)
+	cur.TTFTSum, cur.TTFTSamples = 200*time.Millisecond, 1
+	cur.LatencySum, cur.LatencySamples = 1*time.Second, 1
+	// 窗口外：10 小时前，TTFT 10s，耗时 20s（应被淘汰）
+	stat.Buckets = append(stat.Buckets, hourlyBucket{
+		Hour:    hourStart(now.Add(-10 * time.Hour)),
+		TTFTSum: 10 * time.Second, TTFTSamples: 1,
+		LatencySum: 20 * time.Second, LatencySamples: 1,
+	})
+	ttft, okT, latency, okL := stat.windowAveragesLocked(now)
+	modelStatsMu.Unlock()
+
+	if !okT || ttft != 200*time.Millisecond {
+		t.Fatalf("stale TTFT sample must be excluded, got %v ok=%v", ttft, okT)
+	}
+	if !okL || latency != 1*time.Second {
+		t.Fatalf("stale latency sample must be excluded, got %v ok=%v", latency, okL)
+	}
+}
+
+func TestModelTableHeadersMentionWindow(t *testing.T) {
+	resetModelStats()
+	rows := buildModelStatSnapshots(time.Now(), []*Account{{Path: "a.json", Auth: &StoredAuth{}}})
+	table := renderModelTable(rows)
+	for _, h := range []string{"平均首字(5h)", "平均总耗时(5h)"} {
+		if !strings.Contains(table, h) {
+			t.Fatalf("table missing header %q", h)
+		}
+	}
+	lines := strings.Split(table, "\n")
+	want := displayWidth(lines[0])
+	for i, line := range lines {
+		if got := displayWidth(line); got != want {
+			t.Fatalf("line %d width=%d want=%d:\n%s", i, got, want, table)
+		}
 	}
 }

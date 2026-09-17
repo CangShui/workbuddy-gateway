@@ -329,7 +329,7 @@ func main() {
 	fs.StringVar(&cfg.LogFile, "logfile", "", "monitor 附加跟随的日志文件路径（如 -logfile /var/log/workbuddy-gateway.log）")
 	fs.StringVar(&cfg.JournalService, "journal", "", "monitor 附加跟随的 systemd 服务名（Linux 下用 journalctl -u <服务> -f 跟随）")
 	fs.IntVar(&cfg.LogLines, "lines", 15, "monitor 每次刷新展示的最近日志行数")
-	fs.IntVar(&cfg.ModelsRefresh, "models-refresh", 60, "官方模型目录刷新间隔（分钟），0 关闭")
+	fs.IntVar(&cfg.ModelsRefresh, "models-refresh", 60, "模型目录刷新间隔（分钟），0 关闭（实时接口 + npm 合并）")
 	fs.StringVar(&cfg.ProbeModels, "models", "", "probe 专用：逗号分隔的待探测模型（默认取目录前几个）")
 	fs.IntVar(&cfg.ProbeLimit, "limit", 5, "probe 专用：未指定 -models 时探测的模型数量上限")
 	_ = fs.Parse(args)
@@ -361,6 +361,8 @@ func main() {
 		runMonitor()
 	case "probe":
 		runProbe()
+	case "reset":
+		runReset()
 	case "version", "-v", "--version":
 		fmt.Printf("WorkBuddy Local Gateway v%s\n", version)
 	default:
@@ -403,6 +405,7 @@ func printHelp() {
   refresh     手动立即刷新所有账号访问令牌 (Access Token)
   monitor     前台实时监控：周期刷新展示账号状态 + 最近日志 (Ctrl+C 退出)
   probe       主动探测账号对指定模型的免费/收费属性（需 serve 正在运行）
+  reset       清空除登录凭据外的全部本地数据（状态/缓存/日志/失效标记），并重新拉取模型与倍率
   version     查看版本信息
   help        查看帮助说明
 
@@ -417,7 +420,8 @@ func printHelp() {
                     账号池热加载扫描间隔（默认 5 秒，0 关闭）：运行期自动发现
                     新增/更新/删除的凭据文件，免重启生效
   -models-refresh <min>
-                    官方模型目录刷新间隔（默认 60 分钟，0 关闭）
+                    模型目录刷新间隔（默认 60 分钟，0 关闭）
+                    （目录来源：实时接口 + npm 静态包，合并去重）
 
 probe 选项:
   -auth <path>      只探测指定凭据文件（文件名或路径均可）；默认探测全部账号
@@ -836,6 +840,10 @@ func accountReloaderLoop() {
 			writeStatusSnapshot() // 立即刷新 monitor 状态文件
 			requestQuotaScan()
 			requestCheckin()
+			// 目录刷新成功后会自动触发价格探测；这里再直接触发一次，
+			// 保证「原本没有某站点账号、后来加入」时也能立刻对该站点模型探测。
+			requestModelsScan()
+			requestModelsProbe()
 		}
 	}
 }
@@ -889,6 +897,11 @@ func usableForModelLocked(acc *Account, model string, now time.Time) (accountSel
 
 // nextAccountForModel 按「免费耗尽账号优先 → 有余额账号 → 零余额未知模型受控探测」选号。
 func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, accountSelectionKind, error) {
+	// 站点优先级必须在加锁前计算：preferredFreeSites 会读取账号账本并自行获取 accountMu，
+	// 若在持锁期间调用会自锁。语义：该模型「一个站点免费、另一个站点收费」时优先用免费站点，
+	// 直到该站点账号全部不可用；其余情况不搞优先，正常轮询。
+	preferred := preferredFreeSites(model)
+
 	accountMu.Lock()
 	defer accountMu.Unlock()
 
@@ -896,23 +909,40 @@ func nextAccountForModel(model string, attempted map[*Account]bool) (*Account, a
 		return nil, "", fmt.Errorf("账号池为空")
 	}
 	now := time.Now()
-	for _, wanted := range []accountSelectionKind{selectionFreeExhausted, selectionNormal, selectionProbeExhausted} {
-		for i := 0; i < len(accounts); i++ {
-			idx := (rrIndex + i) % len(accounts)
-			acc := accounts[idx]
-			if attempted != nil && attempted[acc] {
-				continue
+
+	pick := func(siteFilter func(string) bool) (*Account, accountSelectionKind, bool) {
+		for _, wanted := range []accountSelectionKind{selectionFreeExhausted, selectionNormal, selectionProbeExhausted} {
+			for i := 0; i < len(accounts); i++ {
+				idx := (rrIndex + i) % len(accounts)
+				acc := accounts[idx]
+				if attempted != nil && attempted[acc] {
+					continue
+				}
+				if siteFilter != nil && !siteFilter(accSiteLocked(acc)) {
+					continue
+				}
+				kind, ok := usableForModelLocked(acc, model, now)
+				if !ok || kind != wanted {
+					continue
+				}
+				if kind == selectionProbeExhausted {
+					modelStateLocked(acc, model).NextProbeAt = now.Add(modelProbeDelay)
+				}
+				rrIndex = (idx + 1) % len(accounts)
+				return acc, kind, true
 			}
-			kind, ok := usableForModelLocked(acc, model, now)
-			if !ok || kind != wanted {
-				continue
-			}
-			if kind == selectionProbeExhausted {
-				modelStateLocked(acc, model).NextProbeAt = now.Add(modelProbeDelay)
-			}
-			rrIndex = (idx + 1) % len(accounts)
+		}
+		return nil, "", false
+	}
+
+	if len(preferred) > 0 {
+		if acc, kind, ok := pick(func(site string) bool { return preferred[site] }); ok {
 			return acc, kind, nil
 		}
+		log.Printf("[FreeSite] 模型 %s 的免费站点账号当前均不可用，回退到其余站点代偿", model)
+	}
+	if acc, kind, ok := pick(nil); ok {
+		return acc, kind, nil
 	}
 
 	disabled, accountCooling, modelCooling, quotaBlocked, probeWaiting := 0, 0, 0, 0, 0
@@ -2398,7 +2428,6 @@ func runLogin() {
 
 func runServe() {
 	loadModelsCache()
-	initModelsHTTPClient()
 	if err := loadAccounts(); err != nil {
 		fmt.Printf("警告: 未检测到有效凭据 (%v)。\n请先执行: workbuddy-gateway login 扫码登录，或确保凭据文件存在。\n\n", err)
 	} else {
@@ -2420,6 +2449,8 @@ func runServe() {
 	if cfg.ModelsRefresh > 0 {
 		go modelsRefreshLoop(time.Duration(cfg.ModelsRefresh) * time.Minute)
 	}
+	// 价格探测独立于目录刷新：即使关闭目录刷新，也仍可基于缓存探测价格。
+	go modelPriceProbeLoop()
 
 	// 启动状态快照协程（monitor 命令实时读取展示）
 	go statusSnapshotLoop()
@@ -3395,4 +3426,15 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// accSiteLocked 返回账号所属站点 key；调用方需持有 accountMu。
+func accSiteLocked(acc *Account) string {
+	if acc == nil {
+		return ""
+	}
+	if acc.Auth != nil {
+		return profileForEdition(acc.Auth.Edition).Key
+	}
+	return profileForEdition(acc.Edition).Key
 }
