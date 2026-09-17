@@ -1,6 +1,7 @@
 # WorkBuddy Local Gateway
 
-<img width="1378" height="328" alt="image" src="https://github.com/user-attachments/assets/ae5a3b1c-a46c-4c5e-8fd3-05a7e4c23e74" />
+<img width="917" height="754" alt="image" src="https://github.com/user-attachments/assets/7dcfc461-1357-4991-9565-279047687898" />
+
 
 基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。无 Web UI，全部通过命令行（CLI）完成登录、凭据续期与服务控制。
 
