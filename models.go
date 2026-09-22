@@ -327,7 +327,15 @@ func parseLiveCatalog(data []byte) ([]catalogModel, int, error) {
 func fetchNPMCatalogVersion() (string, error) {
 	var lastErr error
 	for _, base := range npmBases {
-		resp, err := cfg.HttpClient.Get(base + "/latest")
+		ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, base+"/latest", nil)
+		if reqErr != nil {
+			cancel()
+			lastErr = reqErr
+			continue
+		}
+		resp, err := cfg.HttpClient.Do(req)
+		cancel()
 		if err != nil {
 			lastErr = err
 			continue
@@ -409,7 +417,13 @@ func fetchNPMCatalog(version, file string) ([]catalogModel, string, error) {
 }
 
 func fetchNPMCatalogJSON(url string) ([]catalogModel, error) {
-	resp, err := cfg.HttpClient.Get(url)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := cfg.HttpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -456,7 +470,13 @@ func readLimited(r io.Reader, limit int64) ([]byte, error) {
 }
 
 func fetchNPMCatalogTarball(url, file string) ([]catalogModel, error) {
-	resp, err := cfg.HttpClient.Get(url)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := cfg.HttpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -586,10 +606,15 @@ func mergedModelIDs() ([]string, string) {
 	ids := make([]string, 0, 64)
 	for _, site := range catalogSites {
 		for _, m := range catalogs[site] {
-			if !seen[m.ID] {
-				seen[m.ID] = true
-				ids = append(ids, m.ID)
+			if seen[m.ID] {
+				continue
 			}
+			// 被配置禁用的模型不出现在任何模型列表（/v1/models、monitor 统计表、health 计数）。
+			if disabled, _ := modelDisabled(m.ID); disabled {
+				continue
+			}
+			seen[m.ID] = true
+			ids = append(ids, m.ID)
 		}
 	}
 	return ids, source

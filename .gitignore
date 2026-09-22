@@ -8,6 +8,7 @@ last-*.json
 .workbuddy-*.json
 wb-models-cache.json
 wb-models-cache.json.tmp
+config.json
 
 # 本地编译产物
 workbuddy-gateway

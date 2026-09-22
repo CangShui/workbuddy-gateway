@@ -2,13 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,18 +33,25 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reqID := atomic.AddUint64(&reqCounter, 1)
-	startTime := time.Now()
+	reqID := requestIDFor(r)
+	startTime := requestStartFor(r)
 
+	readStarted := debugBodyReadStarted(r)
 	bodyBytes, err := io.ReadAll(r.Body)
+	readDuration := debugElapsedSince(readStarted)
 	if err != nil {
+		debugBodyReadFailed(r, bodyBytes, readStarted, err)
 		writeOpenAIError(w, http.StatusBadRequest, "read_error", "读取请求体失败")
 		return
 	}
 	defer r.Body.Close()
 
 	var respReq map[string]any
-	if err := json.Unmarshal(bodyBytes, &respReq); err != nil {
+	decodeStarted := time.Now()
+	decodeErr := json.Unmarshal(bodyBytes, &respReq)
+	decodeDuration := time.Since(decodeStarted)
+	if decodeErr != nil {
+		debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, false, decodeErr)
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_json", "无效的 JSON 请求体")
 		return
 	}
@@ -53,6 +61,21 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		modelName = "hy4-preview"
 	}
 	isStream, _ := respReq["stream"].(bool)
+	debugSetModelAndStream(r, modelName, isStream)
+	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
+
+	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
+	if disabled, reason := modelDisabled(modelName); disabled {
+		log.Printf("[请求被拒绝] traceId=%s requestId=%d 拦截层=模型黑白名单 模型=%s 结果=拒绝 原因=%s 返回状态码=403 业务影响=请求未进入上游调用",
+			w.Header().Get("X-Trace-ID"), reqID, modelName, reason)
+		debugEvent(r, "warn", "model_blocked_by_config", map[string]any{
+			"status_code":     http.StatusForbidden,
+			"reason":          reason,
+			"business_impact": "模型被网关配置禁用，请求未进入上游调用",
+		})
+		writeOpenAIError(w, http.StatusForbidden, "model_disabled", reason)
+		return
+	}
 
 	chatReq, err := responsesToChatRequest(respReq, modelName)
 	if err != nil {
@@ -64,6 +87,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	applyThinkingRules(chatReq, modelName)
 	sanitizeMessages(chatReq)
 	ensureLeadingSystemMessage(chatReq)
+	repairReport := repairToolMessageSequence(chatReq)
+	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
 
 	upstreamBytes, err := json.Marshal(chatReq)
 	if err != nil {
@@ -78,9 +103,9 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isStream {
-		streamResponsesResponse(w, resp, modelName, reqID, acc, prof, startTime)
+		streamResponsesResponse(w, r, resp, modelName, reqID, acc, prof, startTime)
 	} else {
-		writeResponsesAggregate(w, resp, modelName, reqID, acc, prof, startTime)
+		writeResponsesAggregate(w, r, resp, modelName, reqID, acc, prof, startTime)
 	}
 }
 
@@ -163,8 +188,9 @@ func convertResponsesInputItem(item map[string]any) []any {
 			"tool_call_id": callID,
 			"content":      stringifyToolOutput(item["output"]),
 		}}
-	case "reasoning":
-		// 上游无法接收 reasoning item，忽略（历史上下文不影响后续对话）
+	case "reasoning", "web_search_call":
+		// 上游无法接收这些 Responses 历史项；尤其不能把 web_search_call 误转为空 user 消息，
+		// 否则会插入并行 function_call 与 output 之间并触发 11148。
 		return nil
 	}
 
@@ -298,20 +324,30 @@ func convertResponsesToolChoice(tc any) any {
 }
 
 // writeResponsesAggregate 聚合上游 SSE 后转换为 Responses 非流式响应。
-func writeResponsesAggregate(w http.ResponseWriter, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
+func writeResponsesAggregate(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
 	defer resp.Body.Close()
 	body := newTTFTReader(resp.Body, startTime)
 	completionJSON, err := aggregateCompletion(body, modelName)
 	if err != nil {
+		debugEvent(r, "error", "aggregate_response_failed", map[string]any{
+			"error_type": debugErrorType(err),
+			"error":      safeDebugError(err),
+		})
 		log.Printf("[#%d] 聚合响应失败: %v", reqID, err)
 		writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
 		return
 	}
-	observeModelCredit(acc, modelName, usageFromCompletion(completionJSON), reqID)
+	usage := usageFromCompletion(completionJSON)
+	observeModelCredit(acc, modelName, usage, reqID)
+	recordModelTokens(modelName, usage, reqID)
 	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	out, err := chatCompletionToResponses(completionJSON, modelName)
 	if err != nil {
+		debugEvent(r, "error", "response_translation_failed", map[string]any{
+			"error_type": debugErrorType(err),
+			"error":      safeDebugError(err),
+		})
 		log.Printf("[#%d] Responses 转换失败: %v", reqID, err)
 		writeOpenAIError(w, http.StatusInternalServerError, "translate_error", "转换 Responses 响应失败: "+err.Error())
 		return
@@ -319,6 +355,10 @@ func writeResponsesAggregate(w http.ResponseWriter, resp *http.Response, modelNa
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
+	debugEvent(r, "info", "aggregate_response_completed", map[string]any{
+		"status_code":    http.StatusOK,
+		"response_bytes": len(out),
+	})
 	log.Printf("[#%d] Responses 非流式响应完成 (账号 %s [%s], 耗时 %v)", reqID, acc.Path, prof.Label, time.Since(startTime))
 }
 
@@ -465,7 +505,7 @@ func numOr0(v any) float64 {
 }
 
 // streamResponsesResponse 将上游 Chat Completions SSE 实时转译为 Responses 语义事件流。
-func streamResponsesResponse(w http.ResponseWriter, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
+func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
 	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -641,6 +681,27 @@ func streamResponsesResponse(w http.ResponseWriter, resp *http.Response, modelNa
 			}
 		}
 	}
+	scanErr := scanner.Err()
+	if scanErr != nil {
+		debugEvent(r, "error", "stream_response_failed", map[string]any{
+			"error_type": debugErrorType(scanErr),
+			"error":      safeDebugError(scanErr),
+		})
+		// 上游流中断时不能伪造 response.completed 与 [DONE]：那会让下游把残缺输出
+		// 当成完整结果。改为下发一个 failed 事件并直接返回，明确告知本次响应不完整。
+		reason := "上游流式响应中断，本次回复不完整"
+		if errors.Is(scanErr, context.DeadlineExceeded) {
+			reason = fmt.Sprintf("上游超过 %v 无数据，判定连接卡死并中断，本次回复不完整", upstreamIdleTimeout)
+		}
+		failed := buildResponsesEnvelope(respID, modelName, created)
+		failed["status"] = "failed"
+		failed["error"] = map[string]any{"code": "stream_interrupted", "message": reason}
+		emit("response.failed", map[string]any{"response": failed})
+		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流式读取 账号=%s 异常=%v 业务影响=本次响应不完整，已下发 response.failed 而非伪造完成", debugTraceID(r), reqID, acc.Path, scanErr)
+		recordModelTTFT(modelName, body.duration())
+		recordModelLatency(modelName, time.Since(startTime))
+		return
+	}
 
 	// 若无任何输出，补一个空 message，保证 output 非空且事件序列完整
 	if !reasoningOpen && !msgOpen && len(toolOrder) == 0 {
@@ -692,10 +753,14 @@ func streamResponsesResponse(w http.ResponseWriter, resp *http.Response, modelNa
 		final["usage"] = toResponsesUsage(usage)
 	}
 	observeModelCredit(acc, modelName, usage, reqID)
+	recordModelTokens(modelName, usage, reqID)
 	emit("response.completed", map[string]any{"response": final})
 
 	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
+	if scanErr == nil {
+		debugEvent(r, "info", "stream_response_completed", map[string]any{"status_code": http.StatusOK})
+	}
 	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	log.Printf("[#%d] Responses 流式输出完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())

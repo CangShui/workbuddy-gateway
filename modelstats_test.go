@@ -41,6 +41,8 @@ func TestModelStatsRecordingAndSnapshot(t *testing.T) {
 	recordModelTTFT("glm-5.2", 400*time.Millisecond)
 	recordModelTTFT("glm-5.2", 600*time.Millisecond)
 	recordModelLatency("glm-5.2", 2*time.Second)
+	recordModelTokens("glm-5.2", map[string]any{"total_tokens": float64(1_500_000)}, 1)
+	recordModelTokens("glm-5.2", map[string]any{"prompt_tokens": int64(200_000), "completion_tokens": int64(50_000)}, 2)
 	recordModelCostClass("glm-5.2", "cn", false)
 	recordModelCostClass("glm-5.2", "intl", true)
 
@@ -67,6 +69,48 @@ func TestModelStatsRecordingAndSnapshot(t *testing.T) {
 	}
 	if !target.HasLatency || target.AvgLatencyMs != 2000 {
 		t.Fatalf("unexpected latency: %+v", target)
+	}
+	if target.Tokens != 1_750_000 {
+		t.Fatalf("unexpected tokens: %+v", target)
+	}
+	table := renderModelTable([]modelStatSnapshot{*target})
+	if !strings.Contains(table, "1.75M") {
+		t.Fatalf("table missing token total:\n%s", table)
+	}
+	recordModelTokens("glm-5.2", nil, 3)
+	recordModelTokens("glm-5.2", map[string]any{"credit": float64(1)}, 4)
+	rows = buildModelStatSnapshots(time.Now(), []*Account{acc})
+	for i := range rows {
+		if rows[i].ID == "glm-5.2" && rows[i].Tokens != 1_750_000 {
+			t.Fatalf("missing usage must not change tokens: %+v", rows[i])
+		}
+	}
+}
+
+func TestUsageTotalTokensFallback(t *testing.T) {
+	n, ok := usageTotalTokens(map[string]any{"total_tokens": float64(15)})
+	if !ok || n != 15 {
+		t.Fatalf("total_tokens=15 got %d ok=%v", n, ok)
+	}
+	n, ok = usageTotalTokens(map[string]any{"prompt_tokens": int64(10), "completion_tokens": int64(5)})
+	if !ok || n != 15 {
+		t.Fatalf("prompt+completion fallback got %d ok=%v", n, ok)
+	}
+	n, ok = usageTotalTokens(map[string]any{"credit": float64(1)})
+	if ok || n != 0 {
+		t.Fatalf("missing usage must not invent tokens, got %d ok=%v", n, ok)
+	}
+}
+
+func TestFormatTokensM(t *testing.T) {
+	if got := formatTokensM(0); got != "0.00M" {
+		t.Fatalf("zero = %s", got)
+	}
+	if got := formatTokensM(1_750_000); got != "1.75M" {
+		t.Fatalf("1.75M = %s", got)
+	}
+	if got := formatTokensM(1200); got != "0.0012M" {
+		t.Fatalf("small = %s", got)
 	}
 }
 
@@ -135,13 +179,16 @@ func TestModelTableHasEqualDisplayWidth(t *testing.T) {
 			t.Fatalf("line %d width=%d want=%d:\n%s", i, got, want, table)
 		}
 	}
-	for _, h := range []string{"模型", "国内倍率", "国际倍率", "可用账号", "请求", "首字", "平均"} {
+	for _, h := range []string{"模型", "国内倍率", "国际倍率", "可用账号", "请求", "首字", "平均", "总Token"} {
 		if !strings.Contains(table, h) {
 			t.Fatalf("table missing header %q", h)
 		}
 	}
 	if !strings.Contains(table, "glm-5.2") {
 		t.Fatalf("table missing model row")
+	}
+	if !strings.Contains(table, "0.00M") {
+		t.Fatalf("table missing zero token total:\n%s", table)
 	}
 }
 
@@ -211,7 +258,7 @@ func TestModelTableHeadersMentionWindow(t *testing.T) {
 	resetModelStats()
 	rows := buildModelStatSnapshots(time.Now(), []*Account{{Path: "a.json", Auth: &StoredAuth{}}})
 	table := renderModelTable(rows)
-	for _, h := range []string{"平均首字(5h)", "平均总耗时(5h)"} {
+	for _, h := range []string{"平均首字(5h)", "平均总耗时(5h)", "总Token(M)"} {
 		if !strings.Contains(table, h) {
 			t.Fatalf("table missing header %q", h)
 		}

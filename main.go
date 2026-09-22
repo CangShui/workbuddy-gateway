@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -22,7 +23,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	version = "1.12.0"
+	version = "1.13.0"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -41,6 +41,29 @@ const (
 	// defaultSystemPrompt 是当客户端首条消息不是 system 时注入的保底系统提示，
 	// 用于满足腾讯上游「首条消息必须是 system prompt」的硬性要求 (code 11128)。
 	defaultSystemPrompt = "You are a helpful assistant."
+
+	// upstreamHeaderTimeout 限定「请求发送完成 → 收到上游响应头」的等待上限。
+	//
+	// 该值必须足够宽松：上游对 3MB+ 大请求的排队与预处理本身就可能接近 1 分钟
+	// （实测 2.3MB 请求出现过 50.8s 才回响应头）。早期版本用 60s 会误杀这类
+	// 正常但缓慢的请求，表现为 502「timeout awaiting response headers」。
+	// 默认 5 分钟，只用于兜底「上游彻底无响应」；长时间无数据的流由
+	// upstreamIdleTimeout 的空闲看门狗负责中断。可在 config.json 覆盖。
+	upstreamHeaderTimeoutDefault = 5 * time.Minute
+
+	// upstreamIdleTimeoutDefault 是流式响应的「空闲读超时」：只要持续有数据到达
+	// 就永不超时，一旦超过该时长没有任何新数据，才判定上游卡死并中断。
+	upstreamIdleTimeoutDefault = 120 * time.Second
+
+	// defaultRequestTimeout 用于令牌刷新、额度查询、模型目录等控制类短请求。
+	defaultRequestTimeout = 60 * time.Second
+)
+
+// 生效的超时值（默认取上面的 Default，可由 config.json 的 upstream 段覆盖）。
+// 定义为变量既便于测试调小阈值，也便于运维按网络状况调整。
+var (
+	upstreamHeaderTimeout = upstreamHeaderTimeoutDefault
+	upstreamIdleTimeout   = upstreamIdleTimeoutDefault
 )
 
 // -----------------------------------------------------------------------------
@@ -174,8 +197,13 @@ type quotaPackage struct {
 }
 
 type quotaSummaryData struct {
-	Packages   []quotaPackage `json:"Packages"`
-	IsPaidUser bool           `json:"IsPaidUser"`
+	Packages []quotaPackage `json:"Packages"`
+	// IsPaidUser 为上游「正式付费订阅」标记；Pro 试用用户该字段同样为 false。
+	IsPaidUser bool `json:"IsPaidUser"`
+	// ProTrialStatus 为上游 Pro 试用状态：1=试用中，0=无/已结束；国内站可能不返回。
+	ProTrialStatus any `json:"ProTrialStatus"`
+	// SubscriptionPackageCode 为当前订阅包编码，非空表示存在订阅包。
+	SubscriptionPackageCode string `json:"SubscriptionPackageCode"`
 }
 
 // -----------------------------------------------------------------------------
@@ -192,6 +220,7 @@ type Config struct {
 	APIKey          string
 	ProxyURL        string
 	Verbose         bool
+	DebugEnabled    bool   // 仅由工作目录 config.json 的 debug.enabled 控制
 	ReloadInterval  int    // 账号池热加载扫描间隔（秒），0 关闭
 	MonitorInterval int    // monitor 状态刷新间隔（秒）
 	LogFile         string // monitor 附加展示的日志文件路径
@@ -217,7 +246,8 @@ type Account struct {
 	QuotaTotal     float64                       // 最近一次额度查询返回的周期总额度
 	QuotaUsed      float64                       // 最近一次额度查询返回的已用额度
 	QuotaRemaining float64                       // 最近一次额度查询返回的剩余额度
-	IsPaidUser     bool                          // 是否为付费用户
+	IsPaidUser     bool                          // 是否为付费用户（上游 IsPaidUser 原值）
+	PlanLabel      string                        // 套餐展示：Pro试用 | pro | 免费
 	QuotaKnown     bool                          // 是否已成功获取过额度
 	QuotaExhausted bool                          // 已确认额度为 0；额度扫描发现恢复后自动解除
 	ModelStates    map[string]*modelRuntimeState // 按模型隔离的成本、限流和额度阻断状态
@@ -342,11 +372,27 @@ func main() {
 			cfg.AuthExplicit = true
 		}
 	})
+	serveCommand := command == "serve" || command == "run" || command == "start"
+	if serveCommand {
+		if err := loadRuntimeConfig(runtimeConfigFile); err != nil {
+			fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	// 初始化 HTTP 客户端
 	initHTTPClient()
 	closeLog := initFileLogging(command)
 	defer closeLog()
+	closeDebug := func() {}
+	if serveCommand {
+		var err error
+		closeDebug, err = initDebugLogging()
+		if err != nil {
+			log.Fatalf("[Debug] 调试日志初始化失败: %v", err)
+		}
+	}
+	defer closeDebug()
 
 	switch command {
 	case "serve", "run", "start":
@@ -477,6 +523,8 @@ func initHTTPClient() {
 		IdleConnTimeout:     90 * time.Second,
 		MaxIdleConnsPerHost: 10,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
+		// 只约束到「收到响应头」为止；流式响应体的长时间传输由 upstreamIdleTimeout 的空闲看门狗保护。
+		ResponseHeaderTimeout: upstreamHeaderTimeout,
 	}
 	if cfg.ProxyURL != "" {
 		pURL, err := url.Parse(cfg.ProxyURL)
@@ -485,11 +533,72 @@ func initHTTPClient() {
 		}
 		transport.Proxy = http.ProxyURL(pURL)
 	}
+	// 注意：这里刻意不设置 http.Client.Timeout。
+	// 总超时会给整条流设一个硬上限（原为 180s），大请求长时间但持续有输出的流会被中途掐断，
+	// 导致上游 usage 丢失、客户端收到不完整响应，并被 CPA 判为 provider 故障而触发 503。
 	cfg.HttpClient = &http.Client{
-		Timeout:   180 * time.Second,
 		Transport: transport,
 		Jar:       jar,
 	}
+}
+
+// idleReadCloser 为上游流式响应体提供「空闲读超时」保护。
+// 只要持续有数据到达就不断顺延截止时间；一旦超过 timeout 没有任何新数据，
+// 就取消上游请求上下文，使阻塞中的 Read 立即返回错误，从而中断卡死的流。
+type idleReadCloser struct {
+	rc      io.ReadCloser
+	timeout time.Duration
+	cancel  context.CancelFunc
+	mu      sync.Mutex
+	timer   *time.Timer
+	last    time.Time // 最近一次读到数据的时刻
+	stopped bool
+}
+
+func newIdleReadCloser(rc io.ReadCloser, timeout time.Duration, cancel context.CancelFunc) *idleReadCloser {
+	b := &idleReadCloser{rc: rc, timeout: timeout, cancel: cancel, last: time.Now()}
+	b.mu.Lock()
+	b.timer = time.AfterFunc(timeout, b.check)
+	b.mu.Unlock()
+	return b
+}
+
+// check 在计时到期时判断是否真的空闲超时；若期间有新数据到达则按剩余时间续期，
+// 避免「数据刚好到达」与「计时器触发」之间的竞态导致误杀活跃流。
+func (b *idleReadCloser) check() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.stopped {
+		return
+	}
+	idle := time.Since(b.last)
+	if idle >= b.timeout {
+		b.stopped = true
+		b.cancel()
+		return
+	}
+	b.timer.Reset(b.timeout - idle)
+}
+
+func (b *idleReadCloser) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	if n > 0 {
+		b.mu.Lock()
+		b.last = time.Now() // 有数据到达即视为活跃
+		b.mu.Unlock()
+	}
+	return n, err
+}
+
+func (b *idleReadCloser) Close() error {
+	b.mu.Lock()
+	b.stopped = true
+	if b.timer != nil {
+		b.timer.Stop()
+	}
+	b.mu.Unlock()
+	b.cancel()
+	return b.rc.Close()
 }
 
 // -----------------------------------------------------------------------------
@@ -691,6 +800,7 @@ func restoreAccountRuntimeStateLocked() {
 		acc.QuotaUsed = state.QuotaUsed
 		acc.QuotaRemaining = state.QuotaRemaining
 		acc.IsPaidUser = state.IsPaidUser
+		acc.PlanLabel = state.PlanLabel
 		acc.QuotaKnown = state.QuotaKnown
 		acc.QuotaExhausted = state.QuotaExhausted
 		if len(state.ModelStates) == 0 {
@@ -698,12 +808,32 @@ func restoreAccountRuntimeStateLocked() {
 		}
 		acc.ModelStates = make(map[string]*modelRuntimeState, len(state.ModelStates))
 		for model, saved := range state.ModelStates {
-			acc.ModelStates[normalizeModelName(model)] = &modelRuntimeState{
+			restored := &modelRuntimeState{
 				CostClass: saved.CostClass, CooldownUntil: timeFromUnix(saved.CooldownUntil),
 				QuotaBlocked: saved.QuotaBlocked, NextProbeAt: timeFromUnix(saved.NextProbeAt),
 				LastReason: saved.LastReason, ObservedAt: timeFromUnix(saved.ObservedAt),
 			}
+			sanitizeRestoredModelState(restored)
+			acc.ModelStates[normalizeModelName(model)] = restored
 		}
+	}
+}
+
+// sanitizeRestoredModelState 修正历史版本写入快照的脏数据。
+//
+// 旧版本在收到 14018（账号额度耗尽）时会错误地把 CostClass 覆盖成 paid，
+// 但 14018 只说明该账号没额度，不能证明模型收费。快照里若出现
+// 「QuotaBlocked=true + CostClass=paid + 原因是 14018」这一旧版本特征组合，
+// 就把收费属性降回 unknown，交给后续 usage.credit 证据重新学习。
+// 新版本不会再产生这种组合（markModelQuotaBlocked 不再改 CostClass）。
+func sanitizeRestoredModelState(state *modelRuntimeState) {
+	if state == nil || !state.QuotaBlocked || state.CostClass != modelCostPaid {
+		return
+	}
+	reason := strings.ToLower(state.LastReason)
+	if strings.Contains(reason, "14018") || strings.Contains(reason, "credits exhausted") ||
+		strings.Contains(state.LastReason, "额度已用尽") {
+		state.CostClass = modelCostUnknown
 	}
 }
 
@@ -1008,15 +1138,22 @@ func markModelCooldown(acc *Account, model string, until time.Time, msg string) 
 	writeStatusSnapshot()
 }
 
+// markModelQuotaBlocked 记录一次「账号额度耗尽」观测。
+//
+// 注意：14018 的语义是「该账号的额度用光了」，与模型是否收费无关。
+// 上游对额度为 0 的账号会整体拒绝（实测连免费模型也返回 14018），
+// 因此这里只标记 QuotaBlocked（该账号暂时无法服务该模型），
+// 绝不覆盖 CostClass —— 模型收费属性只能由 usage.credit 证据决定。
 func markModelQuotaBlocked(acc *Account, model, msg string) {
 	accountMu.Lock()
 	state := modelStateLocked(acc, model)
-	state.CostClass = modelCostPaid
+	oldClass := state.CostClass
 	state.QuotaBlocked = true
 	state.LastReason = msg
 	state.ObservedAt = time.Now()
 	accountMu.Unlock()
-	log.Printf("[ModelQuota] 账号 %s 模型 %s 返回额度耗尽，仅阻断该账号的当前收费模型；已知免费模型仍可使用", acc.Path, model)
+	log.Printf("[ModelQuota] 账号 %s 模型 %s 返回额度耗尽(14018)：仅阻断该账号对该模型的调度，账号额度恢复后自动解除；模型收费属性保持=%s，未被本次错误覆盖",
+		acc.Path, model, ifEmpty(oldClass, modelCostUnknown))
 	writeStatusSnapshot()
 }
 
@@ -1389,29 +1526,61 @@ func parseQuotaCapacity(value string) (float64, error) {
 	return strconv.ParseFloat(value, 64)
 }
 
-func parseQuotaSummary(data []byte) (total, used, remaining float64, paid bool, err error) {
+// planLabelFromSummary 把上游套餐字段归一化为展示值：Pro试用 | pro | 免费。
+// 规则：ProTrialStatus=1 → Pro试用；IsPaidUser=true → pro；其余（含字段缺失、
+// 类型异常等识别不出的情况）→ 免费。
+func planLabelFromSummary(summary quotaSummaryData) string {
+	if isProTrialActive(summary.ProTrialStatus) {
+		return "Pro试用"
+	}
+	if summary.IsPaidUser {
+		return "pro"
+	}
+	return "免费"
+}
+
+// isProTrialActive 判断 ProTrialStatus 是否为「试用中」，兼容数字与字符串两种编码。
+func isProTrialActive(value any) bool {
+	switch v := value.(type) {
+	case float64:
+		return v == 1
+	case int:
+		return v == 1
+	case int64:
+		return v == 1
+	case json.Number:
+		n, err := v.Int64()
+		return err == nil && n == 1
+	case string:
+		return strings.TrimSpace(v) == "1"
+	default:
+		return false
+	}
+}
+
+func parseQuotaSummary(data []byte) (total, used, remaining float64, paid bool, plan string, err error) {
 	var summary quotaSummaryData
 	if err = json.Unmarshal(data, &summary); err != nil {
-		return 0, 0, 0, false, fmt.Errorf("解析额度响应失败: %w", err)
+		return 0, 0, 0, false, "", fmt.Errorf("解析额度响应失败: %w", err)
 	}
 	for _, pkg := range summary.Packages {
 		pkgTotal, parseErr := parseQuotaCapacity(pkg.CycleTotalCapacity)
 		if parseErr != nil {
-			return 0, 0, 0, false, fmt.Errorf("解析总额度 %q 失败: %w", pkg.CycleTotalCapacity, parseErr)
+			return 0, 0, 0, false, "", fmt.Errorf("解析总额度 %q 失败: %w", pkg.CycleTotalCapacity, parseErr)
 		}
 		pkgUsed, parseErr := parseQuotaCapacity(pkg.CycleUsedCapacity)
 		if parseErr != nil {
-			return 0, 0, 0, false, fmt.Errorf("解析已用额度 %q 失败: %w", pkg.CycleUsedCapacity, parseErr)
+			return 0, 0, 0, false, "", fmt.Errorf("解析已用额度 %q 失败: %w", pkg.CycleUsedCapacity, parseErr)
 		}
 		pkgRemaining, parseErr := parseQuotaCapacity(pkg.CycleRemainCapacity)
 		if parseErr != nil {
-			return 0, 0, 0, false, fmt.Errorf("解析剩余额度 %q 失败: %w", pkg.CycleRemainCapacity, parseErr)
+			return 0, 0, 0, false, "", fmt.Errorf("解析剩余额度 %q 失败: %w", pkg.CycleRemainCapacity, parseErr)
 		}
 		total += pkgTotal
 		used += pkgUsed
 		remaining += pkgRemaining
 	}
-	return total, used, remaining, summary.IsPaidUser, nil
+	return total, used, remaining, summary.IsPaidUser, planLabelFromSummary(summary), nil
 }
 
 func formatQuota(value float64) string {
@@ -1458,12 +1627,14 @@ func usageFromCompletion(data []byte) map[string]any {
 	return usage
 }
 
-func usageTotalTokens(usage map[string]any) (int64, bool) {
+func usageNumber(usage map[string]any, key string) (int64, bool) {
 	if usage == nil {
 		return 0, false
 	}
-	switch v := usage["total_tokens"].(type) {
+	switch v := usage[key].(type) {
 	case float64:
+		return int64(v), true
+	case float32:
 		return int64(v), true
 	case int:
 		return int64(v), true
@@ -1471,13 +1642,34 @@ func usageTotalTokens(usage map[string]any) (int64, bool) {
 		return v, true
 	case json.Number:
 		n, err := v.Int64()
-		return n, err == nil
+		if err == nil {
+			return n, true
+		}
+		f, err := v.Float64()
+		return int64(f), err == nil
 	case string:
-		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
-		return n, err == nil
+		s := strings.TrimSpace(v)
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err == nil {
+			return n, true
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		return int64(f), err == nil
 	default:
 		return 0, false
 	}
+}
+
+func usageTotalTokens(usage map[string]any) (int64, bool) {
+	if n, ok := usageNumber(usage, "total_tokens"); ok {
+		return n, true
+	}
+	prompt, hasPrompt := usageNumber(usage, "prompt_tokens")
+	completion, hasCompletion := usageNumber(usage, "completion_tokens")
+	if hasPrompt || hasCompletion {
+		return prompt + completion, true
+	}
+	return 0, false
 }
 
 func observeModelCredit(acc *Account, model string, usage map[string]any, reqID uint64) {
@@ -1557,7 +1749,7 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 		log.Printf("[Quota] 账号 %s 查询额度失败，HTTP=%d，原因=%v，保留上一次额度数据", path, status, err)
 		return err
 	}
-	total, used, remaining, paid, err := parseQuotaSummary(data)
+	total, used, remaining, paid, plan, err := parseQuotaSummary(data)
 	if err != nil {
 		log.Printf("[Quota] 账号 %s 查询额度响应无法解析，原因=%v，保留上一次额度数据", path, err)
 		return err
@@ -1568,6 +1760,7 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	acc.QuotaUsed = used
 	acc.QuotaRemaining = remaining
 	acc.IsPaidUser = paid
+	acc.PlanLabel = plan
 	acc.QuotaKnown = true
 	acc.QuotaExhausted = remaining <= 0
 	if remaining > 0 {
@@ -1579,11 +1772,11 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	accountMu.Unlock()
 	switch {
 	case !wasExhausted && remaining <= 0:
-		log.Printf("[Quota] 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t；账号已冻结调度，等待额度恢复", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid)
+		log.Printf("[Quota] 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s；账号已冻结调度，等待额度恢复", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
 	case wasExhausted && remaining > 0:
-		log.Printf("[Quota] 账号 %s 额度已恢复，总额度=%s，已用=%s，剩余=%s，付费用户=%t；账号已自动解除冻结并恢复调度", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid)
+		log.Printf("[Quota] 账号 %s 额度已恢复，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s；账号已自动解除冻结并恢复调度", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
 	default:
-		log.Printf("[Quota] 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid)
+		log.Printf("[Quota] 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
 	}
 	return nil
 }
@@ -1843,6 +2036,10 @@ func formatAccountStatus(acc *Account, idx int, now time.Time) string {
 	sb.WriteString(fmt.Sprintf("用户 UID:     %s\n", acc.Auth.Account.UID))
 	sb.WriteString(fmt.Sprintf("企业 ID:      %s\n", ifEmpty(acc.Auth.Account.EnterpriseID, "(个人账号)")))
 	sb.WriteString(fmt.Sprintf("认证域名:     %s\n", ifEmpty(acc.Auth.Auth.Domain, "www.codebuddy.cn")))
+	sb.WriteString(fmt.Sprintf("套餐:         %s\n", ifEmpty(acc.PlanLabel, "免费")))
+	if acc.QuotaKnown {
+		sb.WriteString(fmt.Sprintf("额度:         总额度 %s / 已用 %s / 剩余 %s\n", formatQuota(acc.QuotaTotal), formatQuota(acc.QuotaUsed), formatQuota(acc.QuotaRemaining)))
+	}
 	if acc.CooldownUntil.After(now) {
 		sb.WriteString(fmt.Sprintf("冷却状态:     冷却中 (解封: %s, 剩余 %v)\n",
 			acc.CooldownUntil.Format("2006-01-02 15:04:05"),
@@ -1929,6 +2126,7 @@ type accountSnapshot struct {
 	QuotaUsed      float64                       `json:"quotaUsed,omitempty"`
 	QuotaRemaining float64                       `json:"quotaRemaining"`
 	IsPaidUser     bool                          `json:"isPaidUser"`
+	PlanLabel      string                        `json:"planLabel,omitempty"` // 套餐展示：Pro试用 | pro | 免费
 	QuotaKnown     bool                          `json:"quotaKnown,omitempty"`
 	QuotaExhausted bool                          `json:"quotaExhausted,omitempty"`
 	ModelStates    map[string]modelStateSnapshot `json:"modelStates,omitempty"`
@@ -1964,6 +2162,7 @@ func writeStatusSnapshot() {
 		as.QuotaUsed = acc.QuotaUsed
 		as.QuotaRemaining = acc.QuotaRemaining
 		as.IsPaidUser = acc.IsPaidUser
+		as.PlanLabel = acc.PlanLabel
 		as.QuotaKnown = acc.QuotaKnown
 		as.QuotaExhausted = acc.QuotaExhausted
 		if len(acc.ModelStates) > 0 {
@@ -2077,7 +2276,7 @@ func fitCell(s string, width int) string {
 
 func renderAccountTable(accs []accountSnapshot) string {
 	widths := []int{4, 20, 24, 8, 10, 19, 10, 10, 10, 10, 10, 10}
-	headers := []string{"序号", "凭据文件", "账号", "站点", "状态", "Token 有效期", "总额度", "已用", "剩余", "付费用户", "免费模型", "模型冷却"}
+	headers := []string{"序号", "凭据文件", "账号", "站点", "状态", "Token 有效期", "总额度", "已用", "剩余", "套餐", "免费模型", "模型冷却"}
 	border := func() string {
 		var b strings.Builder
 		b.WriteByte('+')
@@ -2105,15 +2304,12 @@ func renderAccountTable(accs []accountSnapshot) string {
 	for i, a := range accs {
 		status := "可用"
 		expires := "-"
-		total, used, remaining, paid := "-", "-", "-", "-"
+		total, used, remaining, plan := "-", "-", "-", "-"
 		if a.QuotaKnown {
 			total = formatQuota(a.QuotaTotal)
 			used = formatQuota(a.QuotaUsed)
 			remaining = formatQuota(a.QuotaRemaining)
-			paid = "否"
-			if a.IsPaidUser {
-				paid = "是"
-			}
+			plan = ifEmpty(a.PlanLabel, "免费")
 		}
 		if a.TokenExpiresAt > 0 {
 			expires = time.Unix(a.TokenExpiresAt, 0).Format("2006-01-02 15:04:05")
@@ -2130,7 +2326,7 @@ func renderAccountTable(accs []accountSnapshot) string {
 		}
 		b.WriteString(row([]string{
 			strconv.Itoa(i + 1), filepath.Base(a.Path), ifEmpty(a.Nickname, "-"),
-			profileForEdition(a.Edition).Label, status, expires, total, used, remaining, paid,
+			profileForEdition(a.Edition).Label, status, expires, total, used, remaining, plan,
 			strconv.Itoa(a.FreeModels), strconv.Itoa(a.ModelCooldowns),
 		}) + "\n")
 	}
@@ -2474,10 +2670,13 @@ func runServe() {
 
 	listenAddr := fmt.Sprintf("%s:%d", cfg.Addr, cfg.Port)
 	server := &http.Server{
-		Addr:         listenAddr,
-		Handler:      requestAuditMiddleware(corsMiddleware(authMiddleware(mux))),
-		ReadTimeout:  120 * time.Second,
-		WriteTimeout: 300 * time.Second,
+		Addr:        listenAddr,
+		Handler:     requestAuditMiddleware(corsMiddleware(authMiddleware(mux))),
+		ReadTimeout: 120 * time.Second,
+		// WriteTimeout 覆盖「读完请求头 → 响应写完」的总时长。流式对话可能持续数分钟，
+		// 原来的 300s 会给长流设硬上限并中途掐断，因此这里不限总时长，
+		// 改由上游 idleReadCloser 的空闲超时和客户端自身取消来控制。
+		WriteTimeout: 0,
 	}
 
 	fmt.Println("================================================================")
@@ -2500,6 +2699,19 @@ func runServe() {
 	}
 	if cfg.ProxyURL != "" {
 		fmt.Printf("   上游出口代理:  %s\n", cfg.ProxyURL)
+	}
+	if cfg.DebugEnabled {
+		fmt.Printf("   JSON 调试日志: 已开启 (%s)\n", filepath.Join(logDir, "debug-YYYY-MM-DD.jsonl"))
+	} else {
+		fmt.Printf("   JSON 调试日志: 已关闭 (%s 中 debug.enabled=false)\n", runtimeConfigFile)
+	}
+	fmt.Printf("   上游超时:      响应头等待 %v / 流空闲 %v (%s 可覆盖)\n",
+		upstreamHeaderTimeout, upstreamIdleTimeout, runtimeConfigFile)
+	if modelFilterConfigured() {
+		blocked, allowed := modelFilterSummary()
+		fmt.Printf("   模型黑白名单:  已启用 (黑名单 %d 个 / 白名单 %d 个，被禁模型已从列表隐藏并拒绝请求)\n", blocked, allowed)
+	} else {
+		fmt.Printf("   模型黑白名单:  未启用 (%s 中 models 段可配置)\n", runtimeConfigFile)
 	}
 
 	// 启动时展示所有账号状态（与 status 命令一致）
@@ -2605,12 +2817,22 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 			traceID = uuid.NewString()
 		}
 		w.Header().Set("X-Trace-ID", traceID)
+		if debugLoggingEnabled() {
+			ensureDebugRequestContext(r, traceID, start)
+			debugEvent(r, "info", "request_received", map[string]any{
+				"message": "请求已进入网关，准备执行中间件与路由处理",
+			})
+		}
 		aw := &auditResponseWriter{ResponseWriter: w}
 		log.Printf("[请求到达] traceId=%s 方法=%s 路径=%s 来源=%s 说明=请求已进入网关", traceID, r.Method, r.URL.Path, r.RemoteAddr)
 		next.ServeHTTP(aw, r)
 		if aw.status == 0 {
 			aw.status = http.StatusOK
 		}
+		debugEvent(r, "info", "response_returned", map[string]any{
+			"status_code": aw.status,
+			"result":      http.StatusText(aw.status),
+		})
 		log.Printf("[响应返回] traceId=%s 状态码=%d 耗时=%v 结果=%s", traceID, aw.status, time.Since(start), http.StatusText(aw.status))
 	})
 }
@@ -2625,10 +2847,15 @@ func corsMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "*")
 		if r.Method == http.MethodOptions {
+			debugEvent(r, "info", "cors_preflight_completed", map[string]any{
+				"result":  "allowed",
+				"message": "CORS 预检已直接返回，请求未进入业务逻辑",
+			})
 			log.Printf("[中间件-CORS] traceId=%s 结果=通过并直接响应 说明=预检请求未进入业务方法", w.Header().Get("X-Trace-ID"))
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		debugEvent(r, "debug", "cors_check_passed", map[string]any{"result": "allowed"})
 		log.Printf("[中间件-CORS] traceId=%s 结果=通过", w.Header().Get("X-Trace-ID"))
 		next.ServeHTTP(w, r)
 	})
@@ -2640,11 +2867,17 @@ func authMiddleware(next http.Handler) http.Handler {
 			authHeader := r.Header.Get("Authorization")
 			token := strings.TrimPrefix(authHeader, "Bearer ")
 			if token != cfg.APIKey {
+				debugEvent(r, "warn", "authentication_rejected", map[string]any{
+					"status_code":     http.StatusUnauthorized,
+					"reason":          "invalid_api_key",
+					"business_impact": "请求未进入业务逻辑",
+				})
 				log.Printf("[请求被拦截] traceId=%s 拦截层=API鉴权 结果=拒绝 原因=未提供有效API密钥 返回状态码=401 业务影响=请求未进入业务方法", w.Header().Get("X-Trace-ID"))
 				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "未提供有效 API 密钥")
 				return
 			}
 		}
+		debugEvent(r, "debug", "authentication_passed", map[string]any{"result": "allowed"})
 		log.Printf("[中间件-鉴权] traceId=%s 结果=通过", w.Header().Get("X-Trace-ID"))
 		next.ServeHTTP(w, r)
 	})
@@ -2665,6 +2898,11 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 	poolSize := len(accounts)
 	accountMu.Unlock()
 	if poolSize == 0 {
+		debugEvent(r, "warn", "request_rejected_no_account", map[string]any{
+			"status_code":     http.StatusUnauthorized,
+			"reason":          "no_auth",
+			"business_impact": "没有可用登录凭据，未调用上游模型",
+		})
 		recordModelFailure(modelName, "no_auth")
 		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
 		return nil, nil, nil, false
@@ -2685,11 +2923,21 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 				msg += " | 最近一次频率限制: " + truncate(lastRateErr, 200)
 			}
 			log.Printf("[#%d] %s", reqID, msg)
+			debugEvent(r, "warn", "request_rejected_no_available_account", map[string]any{
+				"status_code":     http.StatusServiceUnavailable,
+				"reason":          "no_available_account",
+				"business_impact": "未调用上游模型",
+			})
 			recordModelFailure(modelName, "无可用账号")
 			writeOpenAIError(w, http.StatusServiceUnavailable, "no_available_account", msg)
 			return nil, nil, nil, false
 		}
 		attempted[acc] = true
+		debugSetAccount(r, acc.Path)
+		debugEvent(r, "debug", "account_selected", map[string]any{
+			"selection": string(selection),
+			"attempt":   attempt + 1,
+		})
 		switch selection {
 		case selectionFreeExhausted:
 			log.Printf("[FreeModel] requestId=%d 请求的是已知免费模型 %s，选择付费余额耗尽账号 %s 发起请求", reqID, modelName, acc.Path)
@@ -2712,8 +2960,14 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		// 按账号所属站点（国内站/国际站）路由上游与指纹 Header
 		prof := acc.Profile()
 
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, prof.chatURL(), bytes.NewReader(upstreamBytes))
+		upstreamCtx, upstreamCancel := context.WithCancel(r.Context())
+		upstreamReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, prof.chatURL(), bytes.NewReader(upstreamBytes))
 		if err != nil {
+			upstreamCancel()
+			debugEvent(r, "error", "upstream_request_create_failed", map[string]any{
+				"error_type": debugErrorType(err),
+				"error":      safeDebugError(err),
+			})
 			recordModelFailure(modelName, "req_create_error")
 			writeOpenAIError(w, http.StatusInternalServerError, "req_create_error", err.Error())
 			return nil, nil, nil, false
@@ -2722,9 +2976,24 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
 		acc.lock.Lock()
 		backendHeaders(upstreamReq, acc.Auth, prof)
+		if cfg.DebugEnabled {
+			upstreamReq.Header.Set("X-Trace-ID", debugTraceID(r))
+			upstreamReq.Header.Set("X-Parent-Request-ID", strconv.FormatUint(reqID, 10))
+		}
+		debugEvent(r, "info", "upstream_request_started", map[string]any{
+			"upstream_host": prof.Base,
+			"attempt":       attempt + 1,
+			"payload_bytes": len(upstreamBytes),
+		})
 		resp, err := cfg.HttpClient.Do(upstreamReq)
 		acc.lock.Unlock()
 		if err != nil {
+			upstreamCancel()
+			debugEvent(r, "error", "upstream_request_failed", map[string]any{
+				"upstream_host": prof.Base,
+				"error_type":    debugErrorType(err),
+				"error":         safeDebugError(err),
+			})
 			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游网络调用 账号=%s 异常=%v 业务影响=本次模型请求失败 是否已处理=是", traceID, reqID, acc.Path, err)
 			log.Printf("[#%d] 账号 %s [%s] 上游请求失败: %v", reqID, acc.Path, prof.Label, err)
 			recordModelFailure(modelName, "网络错误")
@@ -2736,7 +3005,13 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		if resp.StatusCode >= 400 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			upstreamCancel()
 			errStr := string(errBody)
+			debugEvent(r, "warn", "upstream_response_rejected", map[string]any{
+				"upstream_host": prof.Base,
+				"status_code":   resp.StatusCode,
+				"error_code":    modelStatusFromError(resp.StatusCode, errStr),
+			})
 			log.Printf("[#%d] 账号 %s [%s] 上游返回 HTTP %d: %s (耗时 %v)", reqID, acc.Path, prof.Label, resp.StatusCode, errStr, time.Since(startTime))
 			log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=失败 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
 
@@ -2793,13 +3068,25 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			return nil, nil, nil, false
 		}
 
+		debugEvent(r, "info", "upstream_response_received", map[string]any{
+			"upstream_host": prof.Base,
+			"status_code":   resp.StatusCode,
+		})
 		log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=成功 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
 		recordModelSuccess(modelName)
+		// 用空闲看门狗包装响应体：持续有数据就永不超时，超过 upstreamIdleTimeout 无数据才中断。
+		// 关闭响应体时会一并取消上游 context，完成清理。
+		resp.Body = newIdleReadCloser(resp.Body, upstreamIdleTimeout, upstreamCancel)
 		return resp, acc, prof, true
 	}
 
 	// 理论上不可达（poolSize 次尝试后未成功即已在循环内返回）
 	recordModelFailure(modelName, "all_cooldown")
+	debugEvent(r, "warn", "request_rejected_all_cooldown", map[string]any{
+		"status_code":     http.StatusTooManyRequests,
+		"reason":          "all_accounts_cooldown",
+		"business_impact": "未调用上游模型",
+	})
 	writeOpenAIError(w, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
 	return nil, nil, nil, false
 }
@@ -2810,18 +3097,25 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reqID := atomic.AddUint64(&reqCounter, 1)
-	startTime := time.Now()
+	reqID := requestIDFor(r)
+	startTime := requestStartFor(r)
 
+	readStarted := debugBodyReadStarted(r)
 	bodyBytes, err := io.ReadAll(r.Body)
+	readDuration := debugElapsedSince(readStarted)
 	if err != nil {
+		debugBodyReadFailed(r, bodyBytes, readStarted, err)
 		writeOpenAIError(w, http.StatusBadRequest, "read_error", "读取请求体失败")
 		return
 	}
 	defer r.Body.Close()
 
 	var reqObj map[string]any
-	if err := json.Unmarshal(bodyBytes, &reqObj); err != nil {
+	decodeStarted := time.Now()
+	decodeErr := json.Unmarshal(bodyBytes, &reqObj)
+	decodeDuration := time.Since(decodeStarted)
+	if decodeErr != nil {
+		debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, false, decodeErr)
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_json", "无效的 JSON 请求体")
 		return
 	}
@@ -2835,6 +3129,21 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	isStream, _ := reqObj["stream"].(bool)
+	debugSetModelAndStream(r, modelName, isStream)
+	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
+
+	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
+	if disabled, reason := modelDisabled(modelName); disabled {
+		log.Printf("[请求被拒绝] traceId=%s requestId=%d 拦截层=模型黑白名单 模型=%s 结果=拒绝 原因=%s 返回状态码=403 业务影响=请求未进入上游调用",
+			w.Header().Get("X-Trace-ID"), reqID, modelName, reason)
+		debugEvent(r, "warn", "model_blocked_by_config", map[string]any{
+			"status_code":     http.StatusForbidden,
+			"reason":          reason,
+			"business_impact": "模型被网关配置禁用，请求未进入上游调用",
+		})
+		writeOpenAIError(w, http.StatusForbidden, "model_disabled", reason)
+		return
+	}
 
 	// 腾讯上游强制要求 stream 必须为 true，非流式会被拦截 (code 11101)
 	reqObj["stream"] = true
@@ -2848,6 +3157,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 会话结构归一化：保证首条消息为 system，修复部分非 harness 客户端
 	//（以 assistant / tool 续写或回传工具结果）触发的上游 11128 错误
 	ensureLeadingSystemMessage(reqObj)
+	repairReport := repairToolMessageSequence(reqObj)
+	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
 
 	upstreamBytes, err := json.Marshal(reqObj)
 	if err != nil {
@@ -2866,14 +3177,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isStream {
-		streamChatResponse(w, resp, modelName, reqID, acc, prof, startTime)
+		streamChatResponse(w, r, resp, modelName, reqID, acc, prof, startTime)
 	} else {
-		writeChatAggregate(w, resp, modelName, reqID, acc, prof, startTime)
+		writeChatAggregate(w, r, resp, modelName, reqID, acc, prof, startTime)
 	}
 }
 
 // streamChatResponse 将上游 SSE 逐行透传为 OpenAI Chat Completions 流式响应。
-func streamChatResponse(w http.ResponseWriter, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
+func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
 	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -2911,28 +3222,64 @@ func streamChatResponse(w http.ResponseWriter, resp *http.Response, modelName st
 			flusher.Flush()
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		// 流被中断（上游卡死 / 超时 / 客户端取消）时，绝不补发 [DONE]：
+		// 补发等于告诉下游「正常结束」，会让残缺的工具调用被当成完整结果执行。
+		// 改为下发一条标准错误事件，让 CPA / 客户端明确知道这次响应不完整。
+		debugEvent(r, "error", "stream_response_failed", map[string]any{
+			"error_type": debugErrorType(err),
+			"error":      safeDebugError(err),
+		})
+		reason := "上游流式响应中断，本次回复不完整"
+		if errors.Is(err, context.DeadlineExceeded) {
+			reason = fmt.Sprintf("上游超过 %v 无数据，判定连接卡死并中断，本次回复不完整", upstreamIdleTimeout)
+		}
+		errPayload, _ := json.Marshal(map[string]any{
+			"error": map[string]any{
+				"message": reason,
+				"type":    "upstream_stream_interrupted",
+				"code":    "stream_interrupted",
+			},
+		})
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", errPayload)
+		flusher.Flush()
+		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流式读取 账号=%s 异常=%v 业务影响=本次响应不完整，已向客户端下发中断错误而非伪造结束", debugTraceID(r), reqID, acc.Path, err)
+	} else {
+		debugEvent(r, "info", "stream_response_completed", map[string]any{"status_code": http.StatusOK})
+	}
 	observeModelCredit(acc, modelName, usage, reqID)
+	recordModelTokens(modelName, usage, reqID)
 	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
 }
 
 // writeChatAggregate 聚合上游 SSE 为完整 Chat Completions JSON 响应。
-func writeChatAggregate(w http.ResponseWriter, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
+func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
 	defer resp.Body.Close()
 	body := newTTFTReader(resp.Body, startTime)
 	completionJSON, err := aggregateCompletion(body, modelName)
 	if err != nil {
+		debugEvent(r, "error", "aggregate_response_failed", map[string]any{
+			"error_type": debugErrorType(err),
+			"error":      safeDebugError(err),
+		})
 		log.Printf("[#%d] 聚合响应失败: %v", reqID, err)
 		writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
 		return
 	}
-	observeModelCredit(acc, modelName, usageFromCompletion(completionJSON), reqID)
+	usage := usageFromCompletion(completionJSON)
+	observeModelCredit(acc, modelName, usage, reqID)
+	recordModelTokens(modelName, usage, reqID)
 	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(completionJSON)
+	debugEvent(r, "info", "aggregate_response_completed", map[string]any{
+		"status_code":    http.StatusOK,
+		"response_bytes": len(completionJSON),
+	})
 	log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
 }
 
@@ -3144,7 +3491,11 @@ func commonHeaders(req *http.Request, prof *upstreamProfile) {
 }
 
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
-	return doJSONContext(context.Background(), client, method, fullURL, headers, body)
+	// 控制类请求（令牌刷新、额度查询、模型目录等）必须有明确上限，避免卡死；
+	// 上游对话流不经过这里，因此不会误伤长流。
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+	return doJSONContext(ctx, client, method, fullURL, headers, body)
 }
 
 func doJSONContext(ctx context.Context, client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {

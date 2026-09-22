@@ -1,0 +1,9 @@
+{
+  "debug": {
+    "enabled": false
+  },
+  "models": {
+    "blocklist": [],
+    "allowlist": []
+  }
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,7 +13,7 @@ import (
 // -----------------------------------------------------------------------------
 // 模型级统计（/v1/models 附表）
 //
-// 记录每个模型被请求的次数、成功/失败、首字响应时间（TTFT）、平均耗时、
+// 记录每个模型被请求的次数、成功/失败、上游 usage token 累计、首字响应时间（TTFT）、平均耗时、
 // 最近请求时间、最近状态，以及该模型当前可服务账号数。
 // 统计只服务于 monitor 展示，不参与调度决策。
 // -----------------------------------------------------------------------------
@@ -33,6 +34,7 @@ type modelStat struct {
 	Requests      int64
 	Success       int64
 	Failed        int64
+	Tokens        int64 // 上游 usage 累计的 total_tokens（无 usage 的请求不计入）
 	LastRequestAt time.Time
 	LastStatus    string
 	// 最近 statsWindow 内按小时分桶的延迟样本（自动淘汰过期桶）。
@@ -156,6 +158,37 @@ func recordModelLatency(model string, d time.Duration) {
 	modelStatsMu.Unlock()
 }
 
+// recordModelTokens 把一次成功响应的上游 usage token 数累加到该模型。
+// 优先 usage.total_tokens；没有则用 prompt_tokens + completion_tokens。
+// 上游没给 usage 时不估算，避免把猜的数字写进表里。
+func recordModelTokens(model string, usage map[string]any, reqID uint64) {
+	direct, hasDirect := usageNumber(usage, "total_tokens")
+	prompt, hasPrompt := usageNumber(usage, "prompt_tokens")
+	completion, hasCompletion := usageNumber(usage, "completion_tokens")
+	n, ok := usageTotalTokens(usage)
+	if !ok || n <= 0 {
+		log.Printf("[模型Token累计] requestId=%d 模型=%s 结果=跳过 原因=上游usage无有效token 有total=%v 有prompt=%v 有completion=%v 业务影响=本次不计入总消耗",
+			reqID, normalizeModelName(model), hasDirect, hasPrompt, hasCompletion)
+		return
+	}
+	source := "usage.total_tokens"
+	if !hasDirect {
+		source = fmt.Sprintf("prompt_tokens(%d)+completion_tokens(%d)", prompt, completion)
+	}
+	modelStatsMu.Lock()
+	stat := modelStatLocked(model)
+	before := stat.Tokens
+	stat.Tokens += n
+	after := stat.Tokens
+	modelStatsMu.Unlock()
+	log.Printf("[模型Token累计] requestId=%d 模型=%s 来源=%s 本次token=%d 累计前=%d 累计后=%d 展示=%s 说明=已按上游usage计入总消耗",
+		reqID, normalizeModelName(model), source, n, before, after, formatTokensM(after))
+	if hasDirect && (hasPrompt || hasCompletion) && direct != prompt+completion {
+		log.Printf("[模型Token累计] requestId=%d 模型=%s 分支=total与分项不一致 判断结果=仍采用total_tokens 原因=上游同时给了total和分项但不相等 total=%d prompt=%d completion=%d 合计=%d",
+			reqID, normalizeModelName(model), direct, prompt, completion, prompt+completion)
+	}
+}
+
 // recordModelCostClass 记录一次免费/收费观测，按站点分别累计。
 func recordModelCostClass(model, edition string, free bool) {
 	modelStatsMu.Lock()
@@ -240,6 +273,7 @@ type modelStatSnapshot struct {
 	Requests          int64  `json:"requests,omitempty"`
 	Success           int64  `json:"success,omitempty"`
 	Failed            int64  `json:"failed,omitempty"`
+	Tokens            int64  `json:"tokens,omitempty"`
 	AvgTTFTMs         int64  `json:"avgTtftMs,omitempty"`
 	HasTTFT           bool   `json:"hasTtft,omitempty"`
 	AvgLatencyMs      int64  `json:"avgLatencyMs,omitempty"`
@@ -314,6 +348,10 @@ func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot
 		if id == "" || seen[id] {
 			return
 		}
+		// 被配置禁用的模型在统计附表中直接隐藏（即使历史上有过请求）。
+		if disabled, _ := modelDisabled(id); disabled {
+			return
+		}
 		seen[id] = true
 		row := modelStatSnapshot{ID: id, Source: source}
 		// 免费/收费按站点分别聚合：同一模型名在 cn 与 intl 结论可能不同，
@@ -347,6 +385,7 @@ func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot
 			row.Requests = stat.Requests
 			row.Success = stat.Success
 			row.Failed = stat.Failed
+			row.Tokens = stat.Tokens
 			cnFree = cnFree || stat.CNFreeSeen
 			cnPaid = cnPaid || stat.CNPaidSeen
 			intlFree = intlFree || stat.IntlFreeSeen
@@ -391,10 +430,22 @@ func formatMilliseconds(ms int64, has bool) string {
 	return fmt.Sprintf("%.1fs", float64(ms)/1000)
 }
 
+// formatTokensM 把 token 数格式化为百万单位，供模型统计表展示。
+func formatTokensM(n int64) string {
+	if n <= 0 {
+		return "0.00M"
+	}
+	m := float64(n) / 1_000_000
+	if m < 0.01 {
+		return fmt.Sprintf("%.4fM", m)
+	}
+	return fmt.Sprintf("%.2fM", m)
+}
+
 // renderModelTable 渲染 /v1/models 统计附表。
 func renderModelTable(rows []modelStatSnapshot) string {
-	widths := []int{26, 16, 16, 8, 8, 13, 15}
-	headers := []string{"模型", "国内倍率", "国际倍率", "可用账号", "请求", "平均首字(5h)", "平均总耗时(5h)"}
+	widths := []int{26, 16, 16, 8, 8, 13, 15, 10}
+	headers := []string{"模型", "国内倍率", "国际倍率", "可用账号", "请求", "平均首字(5h)", "平均总耗时(5h)", "总Token(M)"}
 	border := func() string {
 		var b strings.Builder
 		b.WriteByte('+')
@@ -433,6 +484,7 @@ func renderModelTable(rows []modelStatSnapshot) string {
 			strconv.FormatInt(r.Requests, 10),
 			formatMilliseconds(r.AvgTTFTMs, r.HasTTFT),
 			formatMilliseconds(r.AvgLatencyMs, r.HasLatency),
+			formatTokensM(r.Tokens),
 		}) + "\n")
 	}
 	b.WriteString(border())

@@ -351,11 +351,102 @@ func TestMarkModelQuotaBlockedDoesNotOverwriteAccountBalance(t *testing.T) {
 	remaining := acc.QuotaRemaining
 	exhausted := acc.QuotaExhausted
 	accountMu.Unlock()
-	if state == nil || !state.QuotaBlocked || state.CostClass != modelCostPaid {
+	if state == nil || !state.QuotaBlocked {
 		t.Fatalf("model block missing: %+v", state)
 	}
 	if remaining != 123 || exhausted {
 		t.Fatalf("model 14018 must not overwrite account balance: remaining=%v exhausted=%v", remaining, exhausted)
+	}
+}
+
+// 14018 只表示账号额度耗尽，与模型收费属性无关。
+// 已知免费模型遇到 14018 时，必须保持 free 分类，不能被错误改写成 paid。
+func TestQuotaBlockedMustNotRewriteFreeModelAsPaid(t *testing.T) {
+	chdirTemp(t)
+	acc := &Account{Path: "free.json", Auth: &StoredAuth{Edition: "intl"}, QuotaExhausted: true,
+		ModelStates: map[string]*modelRuntimeState{
+			"deepseek-v4.1-flash": {CostClass: modelCostFree},
+		}}
+	accountMu.Lock()
+	oldAccounts := accounts
+	accounts = []*Account{acc}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+
+	markModelQuotaBlocked(acc, "deepseek-v4.1-flash", "14018 Credits exhausted")
+
+	accountMu.Lock()
+	state := acc.ModelStates["deepseek-v4.1-flash"]
+	accountMu.Unlock()
+	if state.CostClass != modelCostFree {
+		t.Fatalf("14018 must not overwrite a free model's cost class, got %q", state.CostClass)
+	}
+	if !state.QuotaBlocked {
+		t.Fatal("14018 should still block this account for the model until quota recovers")
+	}
+	// 未知模型遇到 14018 也应保持 unknown，不得被当成 paid。
+	acc2 := &Account{Path: "unknown.json", Auth: &StoredAuth{Edition: "intl"}, QuotaExhausted: true,
+		ModelStates: map[string]*modelRuntimeState{"mystery": {CostClass: modelCostUnknown}}}
+	markModelQuotaBlocked(acc2, "mystery", "14018")
+	accountMu.Lock()
+	got := acc2.ModelStates["mystery"].CostClass
+	accountMu.Unlock()
+	if got != modelCostUnknown {
+		t.Fatalf("14018 must not turn an unknown model into paid, got %q", got)
+	}
+}
+
+// 旧版本快照里可能残留「14018 被误写成 paid」的脏数据；恢复时必须降回 unknown。
+func TestSanitizeRestoredModelStateFixesLegacyPaidFromQuotaBlock(t *testing.T) {
+	legacy := &modelRuntimeState{
+		CostClass:    modelCostPaid,
+		QuotaBlocked: true,
+		LastReason:   `{"error":{"data":{"code":14018,"msg":"Credits exhausted."}}}`,
+	}
+	sanitizeRestoredModelState(legacy)
+	if legacy.CostClass != modelCostUnknown {
+		t.Fatalf("legacy 14018-derived paid should be reset to unknown, got %q", legacy.CostClass)
+	}
+	if !legacy.QuotaBlocked {
+		t.Fatal("quota block should be preserved")
+	}
+
+	// 真正由 credit 证据学到的收费模型（非额度耗尽导致）必须保持 paid。
+	genuinePaid := &modelRuntimeState{CostClass: modelCostPaid}
+	sanitizeRestoredModelState(genuinePaid)
+	if genuinePaid.CostClass != modelCostPaid {
+		t.Fatalf("genuine paid model must stay paid, got %q", genuinePaid.CostClass)
+	}
+
+	// 免费模型不受影响。
+	free := &modelRuntimeState{CostClass: modelCostFree, QuotaBlocked: true}
+	sanitizeRestoredModelState(free)
+	if free.CostClass != modelCostFree {
+		t.Fatalf("free model must stay free, got %q", free.CostClass)
+	}
+}
+
+// QuotaBlocked 必须短路调度，避免额度耗尽账号被反复选中探测。
+func TestQuotaBlockedShortCircuitsScheduling(t *testing.T) {
+	acc := &Account{Path: "exhausted.json", Auth: &StoredAuth{}, QuotaExhausted: true,
+		ModelStates: map[string]*modelRuntimeState{
+			"m": {CostClass: modelCostUnknown, QuotaBlocked: true},
+		}}
+	accountMu.Lock()
+	oldAccounts := accounts
+	accounts = []*Account{acc}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+	if _, _, err := nextAccountForModel("m", nil); err == nil {
+		t.Fatal("quota-blocked account must not be selected for the model")
 	}
 }
 
@@ -923,7 +1014,7 @@ func TestRenderAccountTableUsesFullYearAndNoEmoji(t *testing.T) {
 		FreeModels:     1,
 		ModelCooldowns: 2,
 	}})
-	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "付费耗尽", "2027-09-05 01:36:55", "总额度", "已用", "剩余", "付费用户", "免费模型", "模型冷却", "1100", "否"} {
+	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "付费耗尽", "2027-09-05 01:36:55", "总额度", "已用", "剩余", "套餐", "免费模型", "模型冷却", "1100", "免费"} {
 		if !strings.Contains(table, want) {
 			t.Fatalf("table missing %q:\n%s", want, table)
 		}
@@ -1097,12 +1188,63 @@ func TestUnknownModelQuotaProbeStopsAfterOneExhaustedAccount(t *testing.T) {
 
 func TestParseQuotaSummary(t *testing.T) {
 	data := []byte(`{"Packages":[{"CycleTotalCapacity":"1500","CycleUsedCapacity":"69.98999993","CycleRemainCapacity":"1430.01000007"},{"CycleTotalCapacity":"500","CycleUsedCapacity":"500","CycleRemainCapacity":"0"}],"IsPaidUser":true}`)
-	total, used, remaining, paid, err := parseQuotaSummary(data)
+	total, used, remaining, paid, plan, err := parseQuotaSummary(data)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if total != 2000 || used != 569.98999993 || remaining != 1430.01000007 || !paid {
 		t.Fatalf("unexpected quota summary: total=%v used=%v remaining=%v paid=%v", total, used, remaining, paid)
+	}
+	if plan != "pro" {
+		t.Fatalf("IsPaidUser=true should show pro, got %q", plan)
+	}
+}
+
+// 套餐展示规则：ProTrialStatus=1 → Pro试用；IsPaidUser=true → pro；
+// 其余（含字段缺失、类型异常、识别不出）→ 免费。
+func TestPlanLabelFromSummary(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want string
+	}{
+		{"Pro试用（数字1）", `{"ProTrialStatus":1,"IsPaidUser":false}`, "Pro试用"},
+		{"Pro试用（字符串1）", `{"ProTrialStatus":"1","IsPaidUser":false}`, "Pro试用"},
+		{"Pro试用优先于付费标记", `{"ProTrialStatus":1,"IsPaidUser":true}`, "Pro试用"},
+		{"正式付费pro", `{"ProTrialStatus":0,"IsPaidUser":true}`, "pro"},
+		{"试用已结束且非付费→免费", `{"ProTrialStatus":0,"IsPaidUser":false}`, "免费"},
+		{"字段缺失→免费", `{"Packages":[]}`, "免费"},
+		{"类型异常→免费", `{"ProTrialStatus":{"unexpected":true},"IsPaidUser":false}`, "免费"},
+		{"国内站无ProTrialStatus→免费", `{"IsPaidUser":false,"SubscriptionPackageCode":""}`, "免费"},
+		{"有订阅包但非试用非付费→免费", `{"IsPaidUser":false,"SubscriptionPackageCode":"pkg-code-000"}`, "免费"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var summary quotaSummaryData
+			if err := json.Unmarshal([]byte(tc.json), &summary); err != nil {
+				t.Fatal(err)
+			}
+			if got := planLabelFromSummary(summary); got != tc.want {
+				t.Fatalf("plan=%q want=%q", got, tc.want)
+			}
+		})
+	}
+}
+
+// 套餐列必须展示 Pro试用/pro/免费，且不再出现 1 和 0。
+func TestRenderAccountTableShowsPlanLabel(t *testing.T) {
+	table := renderAccountTable([]accountSnapshot{
+		{Path: "intl-trial.json", Edition: "intl", Nickname: "trial@example.com", State: "active", QuotaTotal: 500, QuotaRemaining: 500, QuotaKnown: true, PlanLabel: "Pro试用"},
+		{Path: "cn-paid.json", Edition: "cn", Nickname: "paid@example.com", State: "active", QuotaTotal: 2200, QuotaRemaining: 400, QuotaKnown: true, PlanLabel: "pro"},
+		{Path: "cn-free.json", Edition: "cn", Nickname: "free@example.com", State: "active", QuotaTotal: 2200, QuotaRemaining: 400, QuotaKnown: true, PlanLabel: "免费"},
+	})
+	for _, want := range []string{"套餐", "Pro试用", "pro", "免费"} {
+		if !strings.Contains(table, want) {
+			t.Fatalf("table missing %q:\n%s", want, table)
+		}
+	}
+	if strings.Contains(table, "付费用户") {
+		t.Fatalf("table should no longer contain 付费用户 column:\n%s", table)
 	}
 }
 
