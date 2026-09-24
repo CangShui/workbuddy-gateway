@@ -138,6 +138,34 @@ workbuddy-gateway [command] [options]
 
 `serve` 启动横幅会打印当前名单状态，例如 `模型黑白名单: 已启用 (黑名单 1 个 / 白名单 0 个...)`。
 
+### 按模型限制账号文件
+
+`models.accounts` 是**模型专属**的凭据 JSON 文件黑白名单，不是全局账号名单；未配置的模型仍可使用原有账号池。与上面的 `models.allowlist` / `models.blocklist`（控制模型是否可调用）互不替代：
+
+```json
+{
+  "models": {
+    "blocklist": [],
+    "allowlist": [],
+    "accounts": {
+      "deepseek-v4.1-flash": {
+        "allowlist": ["intl-a.json", "intl-b.json"],
+        "blocklist": ["intl-b.json"]
+      },
+      "hy3": {
+        "blocklist": ["old-account.json"]
+      }
+    }
+  }
+}
+```
+
+- 同一模型内黑名单优先；账号白名单为空表示不限制，黑名单为空表示不排除。上述示例中 `deepseek-v4.1-flash` 最终只允许 `intl-a.json`，`hy3` 仅排除 `old-account.json`。
+- 只接受凭据**文件名**（如 `intl-a.json`），不接受路径或通配符；同名凭据位于多个目录时会拒绝匹配，避免误用。模型名忽略大小写，文件名必须与实际凭据文件一致。
+- 请求调度与失败换号都不会绕过账号名单；后台价格探测与本机 `/admin/probe` 也会跳过不允许的账号。若没有匹配的账号，请求返回 `403 model_account_disabled` 中文提示，且不会调用上游。
+- 实时运行日志 `logs/gateway-YYYY-MM-DD.log` 在有账号被排除时记录汇总一行（模型、候选账号数、排除明细）；开启调试时 `logs/debug-YYYY-MM-DD.jsonl` 记录每个账号的 `model_account_policy_checked`。`monitor` 模型统计表的“可用账号”列已按名单过滤，只统计符合规则的账号。
+- `config.json` 在服务启动时读取，修改后需重启网关；示例中的文件名均为占位值。没有配置 `models.accounts` 时原行为不变。
+
 每条 JSON 调试日志都包含时间、级别、稳定事件名、`trace_id`、`request_id`、服务/实例/版本、路由、方法、模型、账号、流式标记和累计耗时，并记录客户端地址、代理头、协议、TLS、Content-Type、Content-Length、deadline 等请求元数据。客户端传入的 `X-Trace-ID` 会优先复用并透传到上游。
 
 请求体只记录以下安全摘要，不记录正文：
@@ -219,9 +247,30 @@ workbuddy-gateway serve -models-refresh 0
 {
   "upstream": {
     "headerTimeoutSeconds": 300,
-    "idleTimeoutSeconds": 120
+    "idleTimeoutSeconds": 120,
+    "transientRetries": 2
   }
 }
+```
+
+**瞬时网络错误重试**
+
+网关与上游 CDN 边缘节点之间的单条 TCP 连接可能被对端重置（`connection reset by peer`）、被关闭（`use of closed network connection`），或命中已被回收的 keep-alive 连接。这类错误属于瞬时故障，与请求体大小无关（实测 >5MB 请求 95% 成功，而 0.5MB 请求也会偶发失败）。
+
+只有**请求头尚未写出**时，才能确认上游不可能处理本次 POST，网关才对瞬时连接错误重试。`Do` 返回 EOF、RST 或超时但请求头已写出时，上游可能已经收到并处理请求；即使尚未收到响应头，也不会自动重放，以免重复生成。
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| 重试次数 | 2 | `upstream.transientRetries` 可覆盖；显式设为 `0` 可禁用 |
+| 重试间隔 | 300ms | 给上游边缘节点留出恢复时间 |
+| 重试范围 | 请求头未写出时的瞬时错误 | 包括建连阶段 EOF、RST、`broken pipe`、`connection refused` 等 |
+| 不重试 | — | 请求头已写出的 EOF/RST/超时（执行结果不确定）、客户端取消、上游 HTTP 错误响应 |
+| 连接处理 | 新连接 | 重试时设置 `Connection: close` 并 `CloseIdleConnections()`，避免复用坏连接 |
+
+重试会在日志中留下明确记录：
+
+```text
+[网络重试] traceId=... requestId=389 账号=example.json 第 1/2 次重试，上一尝试请求头未写出，已重建连接
 ```
 
 启动横幅会打印生效值，便于确认。流被中断时不会伪造 `[DONE]`（chat）或 `response.completed`（Responses），而是下发明确的 `upstream_stream_interrupted` / `response.failed` 错误事件，避免下游把残缺输出当成完整结果。

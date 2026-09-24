@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -89,6 +90,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	ensureLeadingSystemMessage(chatReq)
 	repairReport := repairToolMessageSequence(chatReq)
 	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
+	// 与 Chat 原生入口共用同一套 DeepSeek 多轮推理历史回填规则。
+	logReasoningHistoryRepair(r, reqID, modelName, repairReasoningHistory(chatReq))
 
 	upstreamBytes, err := json.Marshal(chatReq)
 	if err != nil {
@@ -124,14 +127,65 @@ func responsesToChatRequest(respReq map[string]any, modelName string) (map[strin
 			messages = append(messages, map[string]any{"role": "user", "content": input})
 		}
 	case []any:
+		// DSH 将一次模型回复拆成 reasoning、message、function_call 等独立项；
+		// Chat 上游却要求同一次回复是一条 assistant 消息。连续的助手项在
+		// user/tool 结果处结束，遇到新的 reasoning 项也代表下一次助手回复。
+		// 即使一次输出没有 reasoning，也必须将正文与工具调用合在一起。
+		var pendingReasoning string
+		var pendingAssistant map[string]any
+		flushAssistant := func() {
+			if pendingAssistant != nil {
+				messages = append(messages, pendingAssistant)
+				pendingAssistant = nil
+			}
+			pendingReasoning = ""
+		}
 		for _, itemAny := range input {
 			switch item := itemAny.(type) {
 			case string:
+				flushAssistant()
 				messages = append(messages, map[string]any{"role": "user", "content": item})
 			case map[string]any:
-				messages = append(messages, convertResponsesInputItem(item)...)
+				typ, _ := item["type"].(string)
+				if typ == "reasoning" {
+					if pendingAssistant != nil {
+						flushAssistant() // 新 reasoning 项代表下一次助手回复
+					}
+					if text := reasoningReplayText(item); text != "" {
+						if pendingReasoning != "" {
+							pendingReasoning += "\n\n"
+						}
+						pendingReasoning += text
+					}
+					continue
+				}
+				if typ == "web_search_call" {
+					continue // 不把历史搜索项误转成会打断工具调用的消息
+				}
+				for _, msgAny := range convertResponsesInputItem(item) {
+					msg, ok := msgAny.(map[string]any)
+					if !ok {
+						continue
+					}
+					if role, _ := msg["role"].(string); role == "assistant" {
+						if pendingAssistant == nil {
+							pendingAssistant = msg
+							if pendingReasoning != "" {
+								if _, explicit := pendingAssistant["reasoning_content"]; !explicit {
+									pendingAssistant["reasoning_content"] = pendingReasoning
+								}
+							}
+						} else {
+							mergeResponsesAssistantItem(pendingAssistant, msg)
+						}
+						continue
+					}
+					flushAssistant() // user/tool 边界，不把旧推理带到下一轮
+					messages = append(messages, msg)
+				}
 			}
 		}
+		flushAssistant()
 	}
 
 	if len(messages) == 0 {
@@ -162,6 +216,88 @@ func responsesToChatRequest(respReq map[string]any, modelName string) (map[strin
 	return chat, nil
 }
 
+// reasoningReplayText 取出 DSH 回放的 reasoning 项里的推理正文。
+// 网关自己发出去的项把全文放在 summary；官方 Responses 也可能把全文放在 content。
+// 有 content 时用 content，否则用 summary。encrypted_content 不是明文，不能当成 reasoning_content。
+func reasoningReplayText(item map[string]any) string {
+	if text := joinReasoningParts(item["content"]); text != "" {
+		return text
+	}
+	return joinReasoningParts(item["summary"])
+}
+
+func joinReasoningParts(raw any) string {
+	parts, ok := raw.([]any)
+	if !ok {
+		return ""
+	}
+	var b strings.Builder
+	for _, partAny := range parts {
+		part, ok := partAny.(map[string]any)
+		if !ok {
+			continue
+		}
+		text, _ := part["text"].(string)
+		if text == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(text)
+	}
+	return b.String()
+}
+
+// mergeResponsesAssistantItem 将一个 Responses 回复的正文与工具调用合成同一条 Chat assistant。
+// reasoning_content 已在第一项上，后续项只补充正文和工具列表，不复制推理。
+func mergeResponsesAssistantItem(dst, item map[string]any) {
+	if assistantMessageHasPayload(item) {
+		if !assistantMessageHasPayload(dst) {
+			dst["content"] = item["content"]
+		} else {
+			dst["content"] = append(responsesChatContentParts(dst["content"]), responsesChatContentParts(item["content"])...)
+		}
+	}
+	if calls, ok := item["tool_calls"].([]any); ok && len(calls) > 0 {
+		if existing, ok := dst["tool_calls"].([]any); ok {
+			dst["tool_calls"] = append(existing, calls...)
+		} else {
+			dst["tool_calls"] = calls
+		}
+	}
+}
+
+func responsesChatContentParts(content any) []any {
+	switch value := content.(type) {
+	case []any:
+		return value
+	case string:
+		if value != "" {
+			return []any{map[string]any{"type": "text", "text": value}}
+		}
+	}
+	return nil
+}
+
+func reasoningPassthroughStats(chat map[string]any) (attached int, chars int, missing int) {
+	list, _ := chat["messages"].([]any)
+	for _, msgAny := range list {
+		msg, ok := msgAny.(map[string]any)
+		if !ok || msg["role"] != "assistant" {
+			continue
+		}
+		text, _ := msg["reasoning_content"].(string)
+		if text == "" {
+			missing++
+			continue
+		}
+		attached++
+		chars += utf8.RuneCountInString(text)
+	}
+	return attached, chars, missing
+}
+
 // convertResponsesInputItem 将单个 Responses input item 转换为 0..1 条 chat 消息。
 func convertResponsesInputItem(item map[string]any) []any {
 	switch typ, _ := item["type"].(string); typ {
@@ -189,8 +325,8 @@ func convertResponsesInputItem(item map[string]any) []any {
 			"content":      stringifyToolOutput(item["output"]),
 		}}
 	case "reasoning", "web_search_call":
-		// 上游无法接收这些 Responses 历史项；尤其不能把 web_search_call 误转为空 user 消息，
-		// 否则会插入并行 function_call 与 output 之间并触发 11148。
+		// reasoning 的正文在 responsesToChatRequest 里挂到助手消息的 reasoning_content。
+		// web_search_call 不能转成消息：插在并行 function_call 与 output 之间会触发 11148。
 		return nil
 	}
 
@@ -198,7 +334,15 @@ func convertResponsesInputItem(item map[string]any) []any {
 	if role == "" {
 		role = "user"
 	}
-	return []any{map[string]any{"role": role, "content": convertResponsesContent(item["content"])}}
+	message := map[string]any{"role": role, "content": convertResponsesContent(item["content"])}
+	if role == "assistant" {
+		// 有些客户端直接在助手历史消息上携带 Chat 风格的推理字段；
+		// 不要在 Responses 转 Chat 的过程中再次丢弃它。
+		if reasoning, ok := item["reasoning_content"].(string); ok {
+			message["reasoning_content"] = reasoning
+		}
+	}
+	return []any{message}
 }
 
 // convertResponsesContent 将 Responses content（string 或 parts 数组）转换为 chat content。
@@ -333,7 +477,7 @@ func writeResponsesAggregate(w http.ResponseWriter, r *http.Request, resp *http.
 			"error_type": debugErrorType(err),
 			"error":      safeDebugError(err),
 		})
-		log.Printf("[#%d] 聚合响应失败: %v", reqID, err)
+		logAggregateFailure(r, reqID, err)
 		writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
 		return
 	}
@@ -595,13 +739,19 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	}
 
 	var usage map[string]any
+	finishReason := ""
+	sawDone := false
 
 	body := newTTFTReader(resp.Body, startTime)
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		data := stripDataPrefix(scanner.Text())
-		if data == "" || data == "[DONE]" {
+		if data == "" {
+			continue
+		}
+		if data == "[DONE]" {
+			sawDone = true
 			continue
 		}
 		var chunk map[string]any
@@ -611,9 +761,13 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 		if u, ok := chunk["usage"].(map[string]any); ok {
 			usage = u
 		}
+		finishReason = noteFinishReason(finishReason, chunk)
 		choices, _ := chunk["choices"].([]any)
 		for _, c := range choices {
 			choice, _ := c.(map[string]any)
+			if choice == nil {
+				continue
+			}
 			delta, _ := choice["delta"].(map[string]any)
 			if delta == nil {
 				continue
@@ -698,6 +852,32 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 		failed["error"] = map[string]any{"code": "stream_interrupted", "message": reason}
 		emit("response.failed", map[string]any{"response": failed})
 		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流式读取 账号=%s 异常=%v 业务影响=本次响应不完整，已下发 response.failed 而非伪造完成", debugTraceID(r), reqID, acc.Path, scanErr)
+		recordModelTTFT(modelName, body.duration())
+		recordModelLatency(modelName, time.Since(startTime))
+		return
+	}
+	if finishReason == "" {
+		// 干净 EOF：读错误是空的，但没有非空 finish_reason。
+		// 不能把已经收到的推理再塞进 output_item.done / response.completed，
+		// 那会让客户端把残缺输出当成完整结果；只发一个小的 response.failed。
+		debugEvent(r, "error", "stream_closed_without_finish", map[string]any{
+			"error_type":      "stream_closed_without_finish",
+			"finish_reason":   "",
+			"saw_done":        sawDone,
+			"reasoning_chars": reasoningSB.Len(),
+			"message_chars":   msgSB.Len(),
+			"tool_call_count": len(toolOrder),
+			"business_impact": "上游干净结束但没有 finish_reason，已拒绝 response.completed，改为小的 response.failed",
+		})
+		failed := buildResponsesEnvelope(respID, modelName, created)
+		failed["status"] = "failed"
+		failed["error"] = map[string]any{
+			"code":    "stream_closed_without_finish",
+			"message": errStreamClosedWithoutFinish.Error(),
+		}
+		emit("response.failed", map[string]any{"response": failed})
+		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=Responses收尾 账号=%s 结果=拒绝当成成功 原因=上游干净结束但没有 finish_reason 是否看到DONE=%t 已收到推理字符数=%d 已收到正文字符数=%d 工具调用数=%d 业务影响=不下发 output_item.done 和 response.completed，客户端收到 response.failed 是否已处理=是",
+			debugTraceID(r), reqID, acc.Path, sawDone, reasoningSB.Len(), msgSB.Len(), len(toolOrder))
 		recordModelTTFT(modelName, body.duration())
 		recordModelLatency(modelName, time.Since(startTime))
 		return

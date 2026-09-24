@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,9 @@ type runtimeFileConfig struct {
 		HeaderTimeoutSeconds int `json:"headerTimeoutSeconds"`
 		// IdleTimeoutSeconds：流式响应体的空闲读超时（持续有数据则不超时）。
 		IdleTimeoutSeconds int `json:"idleTimeoutSeconds"`
+		// TransientRetries：请求体发送阶段遇到瞬时网络错误的额外重试次数。
+		// 用指针区分「未配置」（用默认值）与「显式设为 0」（禁用重试）。
+		TransientRetries *int `json:"transientRetries"`
 	} `json:"upstream"`
 	// Models 段可选，用于按模型名做黑白名单控制（大小写不敏感）。
 	Models struct {
@@ -40,7 +44,14 @@ type runtimeFileConfig struct {
 		Blocklist []string `json:"blocklist"`
 		// Allowlist：白名单；非空时只允许列表内的模型，其余一律拒绝。
 		Allowlist []string `json:"allowlist"`
+		// Accounts：按模型限定可使用的凭据 JSON 文件名，不影响其他模型。
+		Accounts map[string]modelAccountFileConfig `json:"accounts"`
 	} `json:"models"`
+}
+
+type modelAccountFileConfig struct {
+	Allowlist []string `json:"allowlist"`
+	Blocklist []string `json:"blocklist"`
 }
 
 type debugRequestContextKey struct{}
@@ -75,10 +86,12 @@ func loadRuntimeConfig(path string) error {
 	cfg.DebugEnabled = false
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
+		setModelFilter(nil, nil)
+		_ = setModelAccountFilter(nil)
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("读取调试配置 %s: %w", path, err)
+		return fmt.Errorf("读取配置文件 %s: %w", path, err)
 	}
 	defer f.Close()
 
@@ -86,24 +99,31 @@ func loadRuntimeConfig(path string) error {
 	dec := json.NewDecoder(f)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&fileCfg); err != nil {
-		return fmt.Errorf("解析调试配置 %s: %w", path, err)
+		return fmt.Errorf("解析配置文件 %s: %w", path, err)
 	}
 	if err := ensureJSONEOF(dec); err != nil {
-		return fmt.Errorf("解析调试配置 %s: %w", path, err)
+		return fmt.Errorf("解析配置文件 %s: %w", path, err)
 	}
 	cfg.DebugEnabled = fileCfg.Debug.Enabled
 
 	// 模型黑白名单：先清空再按配置重建，避免热加载时残留旧规则。
 	setModelFilter(fileCfg.Models.Blocklist, fileCfg.Models.Allowlist)
+	if err := setModelAccountFilter(fileCfg.Models.Accounts); err != nil {
+		return fmt.Errorf("解析模型账号名单 %s: %w", path, err)
+	}
 
 	// 上游超时覆盖：仅当配置为正数时生效，否则保持内置默认值。
 	upstreamHeaderTimeout = upstreamHeaderTimeoutDefault
 	upstreamIdleTimeout = upstreamIdleTimeoutDefault
+	upstreamTransientRetries = upstreamTransientRetriesDefault
 	if secs := fileCfg.Upstream.HeaderTimeoutSeconds; secs > 0 {
 		upstreamHeaderTimeout = time.Duration(secs) * time.Second
 	}
 	if secs := fileCfg.Upstream.IdleTimeoutSeconds; secs > 0 {
 		upstreamIdleTimeout = time.Duration(secs) * time.Second
+	}
+	if n := fileCfg.Upstream.TransientRetries; n != nil && *n >= 0 {
+		upstreamTransientRetries = *n
 	}
 	return nil
 }
@@ -174,6 +194,100 @@ func modelFilterSummary() (blocked, allowed int) {
 	modelFilterMu.RLock()
 	defer modelFilterMu.RUnlock()
 	return len(currentFilter.blocklist), len(currentFilter.allowlist)
+}
+
+var (
+	modelAccountFilterMu sync.RWMutex
+	modelAccountFilters  = map[string]modelAccountFileRule{}
+)
+
+type modelAccountFileRule struct {
+	allow map[string]bool
+	block map[string]bool
+}
+
+// setModelAccountFilter 校验并原子替换按模型的凭据文件规则，不能用路径或通配符匹配凭据。
+func setModelAccountFilter(config map[string]modelAccountFileConfig) error {
+	rules := make(map[string]modelAccountFileRule, len(config))
+	for model, entry := range config {
+		id := normalizeModelName(model)
+		if id == "" {
+			return fmt.Errorf("模型名不能为空")
+		}
+		if _, exists := rules[id]; exists {
+			return fmt.Errorf("模型 %s 重复配置", id)
+		}
+		rule := modelAccountFileRule{allow: map[string]bool{}, block: map[string]bool{}}
+		for _, item := range []struct {
+			list []string
+			into map[string]bool
+		}{{entry.Allowlist, rule.allow}, {entry.Blocklist, rule.block}} {
+			for _, raw := range item.list {
+				name := strings.TrimSpace(raw)
+				if name == "" || name != filepath.Base(name) || strings.ContainsAny(name, `/\\*?[]`) || !strings.HasSuffix(strings.ToLower(name), ".json") {
+					return fmt.Errorf("模型 %s 的凭据文件名 %q 无效：仅支持以 .json 结尾的精确文件名，不支持路径或通配符", id, raw)
+				}
+				item.into[name] = true
+			}
+		}
+		if len(rule.allow) == 0 && len(rule.block) == 0 {
+			continue
+		}
+		rules[id] = rule
+	}
+	modelAccountFilterMu.Lock()
+	modelAccountFilters = rules
+	modelAccountFilterMu.Unlock()
+	return nil
+}
+
+// modelAccountAllowed 判断该账号能否用于指定模型；模型未配置时不限制账号。
+// 重名文件拒绝匹配，避免不同目录下同名凭据被一起误放行。
+func modelAccountAllowed(model string, acc *Account, pool []*Account) (bool, string) {
+	modelAccountFilterMu.RLock()
+	rule, configured := modelAccountFilters[normalizeModelName(model)]
+	modelAccountFilterMu.RUnlock()
+	if !configured || (len(rule.allow) == 0 && len(rule.block) == 0) || acc == nil {
+		return true, ""
+	}
+	name := filepath.Base(acc.Path)
+	for _, other := range pool {
+		if other != acc && filepath.Base(other.Path) == name {
+			return false, "凭据文件名重复"
+		}
+	}
+	if rule.block[name] {
+		return false, "命中账号黑名单"
+	}
+	if len(rule.allow) > 0 && !rule.allow[name] {
+		return false, "不在账号白名单"
+	}
+	return true, ""
+}
+
+// modelAccountRuleConfigured 判断该模型是否配置了有效的凭据文件规则。
+func modelAccountRuleConfigured(model string) bool {
+	modelAccountFilterMu.RLock()
+	rule, ok := modelAccountFilters[normalizeModelName(model)]
+	modelAccountFilterMu.RUnlock()
+	return ok && (len(rule.allow) > 0 || len(rule.block) > 0)
+}
+
+func modelAccountRuleCount() int {
+	modelAccountFilterMu.RLock()
+	defer modelAccountFilterMu.RUnlock()
+	return len(modelAccountFilters)
+}
+
+func modelAccountRuleIDs() []string {
+	modelAccountFilterMu.RLock()
+	ids := make([]string, 0, len(modelAccountFilters))
+	for id := range modelAccountFilters {
+		ids = append(ids, id)
+	}
+	modelAccountFilterMu.RUnlock()
+	sort.Strings(ids)
+	return ids
 }
 
 func ensureJSONEOF(dec *json.Decoder) error {

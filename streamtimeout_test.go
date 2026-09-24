@@ -126,7 +126,7 @@ func TestLargeSlowUpstreamHeaderIsNotKilled(t *testing.T) {
 		time.Sleep(1200 * time.Millisecond)
 		w.Header().Set("Content-Type", "text/event-stream")
 		f, _ := w.(http.Flusher)
-		_, _ = io.WriteString(w, `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":""}]}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\n")
 		f.Flush()
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 		f.Flush()
@@ -261,5 +261,140 @@ func TestInterruptedChatStreamDoesNotSendDone(t *testing.T) {
 	}
 	if !strings.Contains(out, "partial") {
 		t.Fatalf("already-received partial content should be forwarded:\n%s", out)
+	}
+}
+
+// useSingleUpstreamAccount 把国内站指到测试上游，并只留一个账号。
+func useSingleUpstreamAccount(t *testing.T, upstreamURL string) {
+	t.Helper()
+	oldBase, oldOrigin := profileCN.Base, profileCN.Origin
+	oldClient := cfg.HttpClient
+	profileCN.Base, profileCN.Origin = upstreamURL, upstreamURL
+	cfg.HttpClient = &http.Client{}
+	accountMu.Lock()
+	oldAccounts := accounts
+	accounts = []*Account{{
+		Path: "eof-rule.json",
+		Auth: &StoredAuth{
+			Edition: "cn",
+			Auth:    StoredTokens{AccessToken: "t", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+		},
+	}}
+	accountMu.Unlock()
+	t.Cleanup(func() {
+		profileCN.Base, profileCN.Origin = oldBase, oldOrigin
+		cfg.HttpClient = oldClient
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	})
+}
+
+// 干净 EOF，且只有空 finish_reason：不能补 [DONE]，必须明确告诉客户端这次不完整。
+func TestChatCleanEOFWithoutFinishReasonIsNotSuccess(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":""}]}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	useSingleUpstreamAccount(t, upstream.URL)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	requestAuditMiddleware(http.HandlerFunc(handleChatCompletions)).ServeHTTP(rec, req)
+
+	out := rec.Body.String()
+	if strings.Contains(out, "[DONE]") {
+		t.Fatalf("没有真实 finish_reason 时不得转发 [DONE]:\n%s", out)
+	}
+	if !strings.Contains(out, "stream_closed_without_finish") {
+		t.Fatalf("必须明确报告流未完整结束:\n%s", out)
+	}
+	if !strings.Contains(out, "partial") {
+		t.Fatalf("已经收到的内容仍应转发:\n%s", out)
+	}
+}
+
+// 有真实 finish_reason 时，即使上游没再发 [DONE]，也是正常结束，不能当成中断。
+func TestChatFinishReasonWithoutDoneIsSuccess(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"length"}]}`+"\n\n")
+	}))
+	defer upstream.Close()
+	useSingleUpstreamAccount(t, upstream.URL)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	requestAuditMiddleware(http.HandlerFunc(handleChatCompletions)).ServeHTTP(rec, req)
+
+	out := rec.Body.String()
+	if strings.Contains(out, "stream_closed_without_finish") || strings.Contains(out, "stream_interrupted") {
+		t.Fatalf("已有 finish_reason=length，不应判失败:\n%s", out)
+	}
+	if !strings.Contains(out, `"finish_reason":"length"`) || !strings.Contains(out, "done") {
+		t.Fatalf("终止分片应原样转发:\n%s", out)
+	}
+}
+
+// Responses：干净结束且没有 finish_reason 时，只发小的 response.failed，
+// 不得再把整段输出收成 output_item.done / response.completed。
+func TestResponsesCleanEOFWithoutFinishReasonEmitsFailed(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"loop"},"finish_reason":""}]}`+"\n\n")
+	}))
+	defer upstream.Close()
+	useSingleUpstreamAccount(t, upstream.URL)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","stream":true,"input":"hi"}`))
+	rec := httptest.NewRecorder()
+	requestAuditMiddleware(http.HandlerFunc(handleResponses)).ServeHTTP(rec, req)
+
+	out := rec.Body.String()
+	if !strings.Contains(out, "response.failed") || !strings.Contains(out, "stream_closed_without_finish") {
+		t.Fatalf("应下发 response.failed:\n%s", out)
+	}
+	if strings.Contains(out, "response.completed") || strings.Contains(out, "response.output_item.done") || strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("不完整流不得伪装完成:\n%s", out)
+	}
+	if !strings.Contains(out, "loop") {
+		t.Fatalf("已经发出的增量可以保留，但收尾不能再重放整段:\n%s", out)
+	}
+}
+
+// 终止分片可以没有 delta。只要 finish_reason 非空，Responses 仍应正常 completed。
+func TestResponsesFinishReasonEmitsCompleted(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":""}]}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"id":"c1","choices":[{"index":0,"finish_reason":"stop"}]}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	useSingleUpstreamAccount(t, upstream.URL)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","stream":true,"input":"hi"}`))
+	rec := httptest.NewRecorder()
+	requestAuditMiddleware(http.HandlerFunc(handleResponses)).ServeHTTP(rec, req)
+
+	out := rec.Body.String()
+	if !strings.Contains(out, "response.completed") || !strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("有 finish_reason 的流应正常完成:\n%s", out)
+	}
+	if strings.Contains(out, "stream_closed_without_finish") {
+		t.Fatalf("有 finish_reason 时不应判未完成:\n%s", out)
+	}
+}
+
+func TestAggregateCompletionWithoutFinishReasonIsNotSuccess(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"partial"},"finish_reason":""}]}`,
+		`data: [DONE]`,
+	}, "\n")
+	_, err := aggregateCompletion(strings.NewReader(sse), "m")
+	if !errors.Is(err, errStreamClosedWithoutFinish) {
+		t.Fatalf("没有 finish_reason 的聚合应失败，实际: %v", err)
 	}
 }

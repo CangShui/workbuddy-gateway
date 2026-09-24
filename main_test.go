@@ -1448,6 +1448,7 @@ func TestAggregateCompletionToolCalls(t *testing.T) {
 		`data: {"id":"cmpl-1","model":"hy3-preview","created":1700000000,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}`,
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}`,
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Beijing\"}"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
 		`data: [DONE]`,
 	}, "\n")
 
@@ -1543,6 +1544,134 @@ func TestResponsesToChatRequestStringInput(t *testing.T) {
 	}
 	if _, err := responsesToChatRequest(map[string]any{"model": "x"}, "x"); err == nil {
 		t.Fatal("empty input should error")
+	}
+}
+
+// 国际站 thinking 模式要求上一轮助手消息带回 reasoning_content，否则 11155。
+func TestResponsesReasoningContentPassedBack(t *testing.T) {
+	chat, err := responsesToChatRequest(map[string]any{
+		"model": "deepseek-v4.1-flash",
+		"input": []any{
+			map[string]any{"role": "user", "content": "先查天气"},
+			map[string]any{"type": "reasoning", "summary": []any{
+				map[string]any{"type": "summary_text", "text": "上一轮推理"},
+			}},
+			map[string]any{"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": `{"city":"BJ"}`},
+			map[string]any{"type": "function_call", "call_id": "call_2", "name": "get_time", "arguments": `{}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "sunny"},
+			map[string]any{"type": "reasoning", "content": []any{
+				map[string]any{"type": "reasoning_text", "text": "完整推理"},
+			}, "summary": []any{
+				map[string]any{"type": "summary_text", "text": "不该用这段摘要"},
+			}},
+			map[string]any{"type": "message", "role": "assistant", "content": []any{
+				map[string]any{"type": "output_text", "text": "今天晴"},
+			}},
+			map[string]any{"role": "user", "content": "再说一遍"},
+			map[string]any{"type": "reasoning", "summary": []any{
+				map[string]any{"type": "summary_text", "text": "这段不该漏到后面"},
+			}},
+			map[string]any{"role": "user", "content": "下一问"},
+			map[string]any{"type": "message", "role": "assistant", "content": "没有推理的回复"},
+		},
+	}, "deepseek-v4.1-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chat["messages"].([]any)
+	if len(messages) != 7 {
+		t.Fatalf("reasoning and parallel calls should form one assistant message: %#v", messages)
+	}
+	call := messages[1].(map[string]any)
+	if call["reasoning_content"] != "上一轮推理" {
+		t.Fatalf("tool call missing reasoning: %#v", call)
+	}
+	if calls, ok := call["tool_calls"].([]any); !ok || len(calls) != 2 {
+		t.Fatalf("parallel calls were not grouped: %#v", call)
+	}
+	tool := messages[2].(map[string]any)
+	if _, ok := tool["reasoning_content"]; ok {
+		t.Fatalf("tool result must not carry reasoning: %#v", tool)
+	}
+	answer := messages[3].(map[string]any)
+	if answer["reasoning_content"] != "完整推理" {
+		t.Fatalf("content text should win over summary, got %#v", answer)
+	}
+	plain := messages[len(messages)-1].(map[string]any)
+	if _, ok := plain["reasoning_content"]; ok {
+		t.Fatalf("reasoning before a user turn leaked forward: %#v", plain)
+	}
+}
+
+func TestResponsesExplicitAssistantReasoningContentIsPreserved(t *testing.T) {
+	chat, err := responsesToChatRequest(map[string]any{"input": []any{
+		map[string]any{"role": "user", "content": "hi"},
+		map[string]any{"type": "message", "role": "assistant", "content": "ok", "reasoning_content": "original thinking"},
+	}}, "deepseek-v4.1-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assistant := chat["messages"].([]any)[1].(map[string]any)
+	if assistant["reasoning_content"] != "original thinking" {
+		t.Fatalf("explicit assistant reasoning was dropped: %#v", assistant)
+	}
+}
+
+// 回归：reasoning+正文+并行工具调用来自同一次 Responses 回复，Chat 上游只能看到
+// 一条 assistant 消息；推理放在这条消息上，工具结果紧随其后而不重复推理。
+func TestResponsesReasoningTextAndCallsShareOneAssistant(t *testing.T) {
+	chat, err := responsesToChatRequest(map[string]any{
+		"model":     "deepseek-v4.1-flash",
+		"reasoning": map[string]any{"effort": "high"},
+		"input": []any{
+			map[string]any{"role": "user", "content": "检查一下"},
+			map[string]any{"type": "reasoning", "summary": []any{
+				map[string]any{"type": "summary_text", "text": "先看日志"},
+			}},
+			map[string]any{"type": "message", "role": "assistant", "content": []any{
+				map[string]any{"type": "output_text", "text": "我先查日志"},
+			}},
+			map[string]any{"type": "function_call", "call_id": "call_a", "name": "read", "arguments": `{}`},
+			map[string]any{"type": "web_search_call", "id": "ws_1"},
+			map[string]any{"type": "function_call", "call_id": "call_b", "name": "grep", "arguments": `{}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_a", "output": "file"},
+			map[string]any{"type": "function_call_output", "call_id": "call_b", "output": "match"},
+			map[string]any{"type": "reasoning", "summary": []any{
+				map[string]any{"type": "summary_text", "text": "确认了"},
+			}},
+			map[string]any{"type": "message", "role": "assistant", "content": "完成"},
+		},
+	}, "deepseek-v4.1-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := repairToolMessageSequence(chat)
+	messages := chat["messages"].([]any)
+	if len(messages) != 5 || report.MovedMessages != 0 || report.MergedCallMessages != 0 {
+		t.Fatalf("unexpected chat topology: report=%+v messages=%#v", report, messages)
+	}
+	assistant := messages[1].(map[string]any)
+	if assistant["reasoning_content"] != "先看日志" {
+		t.Fatalf("reasoning was not attached to the original reply: %#v", assistant)
+	}
+	parts, ok := assistant["content"].([]any)
+	if !ok || len(parts) != 1 || parts[0].(map[string]any)["text"] != "我先查日志" {
+		t.Fatalf("text was not attached to the same reply: %#v", assistant)
+	}
+	calls, ok := assistant["tool_calls"].([]any)
+	if !ok || len(calls) != 2 {
+		t.Fatalf("parallel tools were not attached to the same reply: %#v", assistant)
+	}
+	if messages[2].(map[string]any)["role"] != "tool" || messages[3].(map[string]any)["role"] != "tool" {
+		t.Fatalf("tool outputs not adjacent to their call: %#v", messages)
+	}
+	last := messages[4].(map[string]any)
+	if last["reasoning_content"] != "确认了" || last["content"] != "完成" {
+		t.Fatalf("next reply lost reasoning or text: %#v", last)
+	}
+	attached, chars, missing := reasoningPassthroughStats(chat)
+	if attached != 2 || chars != len([]rune("先看日志确认了")) || missing != 0 {
+		t.Fatalf("reasoning replay audit is incorrect: %d %d %d", attached, chars, missing)
 	}
 }
 

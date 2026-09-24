@@ -126,6 +126,16 @@ func handleAdminProbe(w http.ResponseWriter, r *http.Request) {
 			if r.Context().Err() != nil {
 				break
 			}
+			if allowed, reason := modelAccountAllowed(model, acc, candidates); !allowed {
+				result := probeResult{Account: acc.Path, Edition: acc.Profile().Key, Model: model, Status: "skipped", Detail: "账号名单排除：" + reason}
+				resp.Results = append(resp.Results, result)
+				resp.Summary[result.Status]++
+				log.Printf("[Probe] traceId=%s 模型=%s 凭据=%s 结果=跳过 原因=%s", w.Header().Get("X-Trace-ID"), model, filepath.Base(acc.Path), reason)
+				debugEvent(r, "debug", "model_account_policy_checked", map[string]any{
+					"account_file": filepath.Base(acc.Path), "model": model, "allowed": false, "reason": reason,
+				})
+				continue
+			}
 			result := probeAccountModel(r.Context(), acc, model)
 			resp.Results = append(resp.Results, result)
 			resp.Summary[result.Status]++

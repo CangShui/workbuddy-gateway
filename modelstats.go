@@ -268,7 +268,7 @@ type modelStatSnapshot struct {
 	IntlFree       string `json:"intlFree,omitempty"`       // 国际站：是 | 否 | 混合 | -
 	CNMultiplier   string `json:"cnMultiplier,omitempty"`   // 国内站倍率展示值，如 0.29x / 0.00x / -
 	IntlMultiplier string `json:"intlMultiplier,omitempty"` // 国际站倍率展示值
-	// AvailableAccounts 为两个站点合计的可服务账号数。
+	// AvailableAccounts 为两个站点合计的可服务账号数（已按模型账号黑白名单过滤）。
 	AvailableAccounts int    `json:"availableAccounts"`
 	Requests          int64  `json:"requests,omitempty"`
 	Success           int64  `json:"success,omitempty"`
@@ -358,7 +358,8 @@ func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot
 		// 若混在一起会显示成无意义的“混合”。
 		var cnFree, cnPaid, intlFree, intlPaid bool
 		for _, acc := range accs {
-			if modelServableLocked(acc, id, now) {
+			allowed, _ := modelAccountAllowed(id, acc, accs)
+			if allowed && modelServableLocked(acc, id, now) {
 				row.AvailableAccounts++
 			}
 			state := acc.ModelStates[id]
@@ -412,6 +413,9 @@ func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot
 	}
 
 	for _, id := range ids {
+		appendRow(id)
+	}
+	for _, id := range modelAccountRuleIDs() {
 		appendRow(id)
 	}
 	for id := range modelStats {

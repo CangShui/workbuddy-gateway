@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -897,6 +898,9 @@ func modelPendingProbeCount() int {
 			if !modelNeedsProbe(site, id, modelRequestCount(id)) {
 				continue
 			}
+			if pickProbeAccountForModel(site, id) == nil {
+				continue
+			}
 			modelsMu.RLock()
 			last := modelProbes[probeKey(site, id)].LastProbeAt
 			modelsMu.RUnlock()
@@ -933,15 +937,15 @@ func modelPriceProbeOnce() {
 		if done >= batch {
 			break
 		}
-		acc := pickProbeAccount(site)
-		if acc == nil {
-			continue
-		}
 		for _, id := range ids {
 			if done >= batch {
 				break
 			}
 			if !modelNeedsProbe(site, id, modelRequestCount(id)) {
+				continue
+			}
+			acc := pickProbeAccountForModel(site, id)
+			if acc == nil {
 				continue
 			}
 			modelsMu.RLock()
@@ -976,6 +980,10 @@ func modelPriceProbeOnce() {
 // 返回 20017 无权限的账号）——探测若命中 14018 只会被忽略，不会污染判定。
 // 仅跳过「已知耗尽」与失效账号。
 func pickProbeAccount(site string) *Account {
+	return pickProbeAccountForModel(site, "")
+}
+
+func pickProbeAccountForModel(site, model string) *Account {
 	accountMu.Lock()
 	defer accountMu.Unlock()
 	var unknownQuota *Account
@@ -984,6 +992,10 @@ func pickProbeAccount(site string) *Account {
 			continue
 		}
 		if profileForEdition(acc.Auth.Edition).Key != site {
+			continue
+		}
+		if allowed, reason := modelAccountAllowed(model, acc, accounts); !allowed {
+			log.Printf("[ModelPrice] 站点=%s 模型=%s 凭据=%s 结果=跳过 原因=账号名单%s", site, model, filepath.Base(acc.Path), reason)
 			continue
 		}
 		if acc.QuotaKnown {

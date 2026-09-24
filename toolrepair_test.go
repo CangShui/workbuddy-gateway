@@ -248,7 +248,7 @@ func TestResponsesParallelToolHistoryRepair(t *testing.T) {
 	ensureLeadingSystemMessage(chat)
 	report := repairToolMessageSequence(chat)
 	messages := chat["messages"].([]any)
-	if got := rolesOf(chat); !reflect.DeepEqual(got, []string{"system", "assistant", "tool", "tool", "assistant"}) {
+	if got := rolesOf(chat); !reflect.DeepEqual(got, []string{"system", "assistant", "tool", "tool"}) {
 		t.Fatalf("roles=%v messages=%#v", got, messages)
 	}
 	if got := callIDs(messages[1]); !reflect.DeepEqual(got, []string{"call_a", "call_b"}) {
@@ -257,11 +257,11 @@ func TestResponsesParallelToolHistoryRepair(t *testing.T) {
 	if got := outputIDs(messages); !reflect.DeepEqual(got, []string{"call_b", "call_a"}) {
 		t.Fatalf("outputs=%v", got)
 	}
-	if messageContent(messages[4]) != "插入消息" {
-		t.Fatalf("interposed message not moved after outputs: %#v", messages)
+	if messageContent(messages[1]) != "插入消息" {
+		t.Fatalf("assistant text must stay with its tool calls: %#v", messages)
 	}
-	if report.MovedMessages != 1 || report.MergedCallMessages != 1 {
-		t.Fatalf("unexpected report: %+v", report)
+	if report.MovedMessages != 0 || report.MergedCallMessages != 0 {
+		t.Fatalf("Responses items were not grouped before repair: %+v", report)
 	}
 }
 
@@ -383,5 +383,101 @@ func TestResponsesEndpointRepairsBrokenParallelToolHistory(t *testing.T) {
 	}
 	if messageContent(messages[4]) != "插入消息" {
 		t.Fatalf("interposed message not repaired: %#v", messages)
+	}
+}
+
+// 从 HTTP 入口一直验证到实际发往 Chat 上游的 JSON：同一次 Responses 回复的
+// 推理、正文和并行工具调用必须在同一条 assistant 消息，而不是被拆成两条。
+func TestResponsesEndpointReplaysReasoningWithTextAndTools(t *testing.T) {
+	body := `{
+		"model":"m","stream":true,"reasoning":{"effort":"high"},"input":[
+			{"role":"user","content":"查日志"},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"我先分析"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"开始检查"}]},
+			{"type":"function_call","call_id":"call_a","name":"read","arguments":"{}"},
+			{"type":"function_call","call_id":"call_b","name":"grep","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_a","output":"file"},
+			{"type":"function_call_output","call_id":"call_b","output":"match"},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"确认好了"}]},
+			{"type":"message","role":"assistant","content":"完成"}
+		]}`
+	messages := captureUpstreamMessages(t, "/v1/responses", body)
+	if got := rolesOf(map[string]any{"messages": messages}); !reflect.DeepEqual(got, []string{"system", "user", "assistant", "tool", "tool", "assistant"}) {
+		t.Fatalf("upstream roles=%v messages=%#v", got, messages)
+	}
+	first := messages[2].(map[string]any)
+	if first["reasoning_content"] != "我先分析" || !reflect.DeepEqual(callIDs(first), []string{"call_a", "call_b"}) {
+		t.Fatalf("first assistant lost reasoning or parallel calls: %#v", first)
+	}
+	parts := first["content"].([]any)
+	if len(parts) != 1 || parts[0].(map[string]any)["text"] != "开始检查" {
+		t.Fatalf("first assistant lost text: %#v", first)
+	}
+	last := messages[5].(map[string]any)
+	if last["reasoning_content"] != "确认好了" || last["content"] != "完成" {
+		t.Fatalf("next assistant lost reasoning or reply: %#v", last)
+	}
+}
+
+// 实际复现形态：thinking 模式下先有真实推理，下一步只有正文和并行工具调用。
+// 工具结果送回国际站时必须保留空 reasoning_content 字段，不能拆成两条 assistant。
+func TestResponsesThinkingNoReasoningStillEchoesEmptyField(t *testing.T) {
+	body := `{
+		"model":"deepseek-v4.1-flash","stream":true,"reasoning":{"effort":"high"},"input":[
+			{"role":"user","content":"检查文件"},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"先读取"}]},
+			{"type":"function_call","call_id":"call_a","name":"read","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_a","output":"文件存在"},
+			{"type":"message","role":"assistant","content":"继续检查"},
+			{"type":"function_call","call_id":"call_b","name":"grep","arguments":"{}"},
+			{"type":"function_call","call_id":"call_c","name":"read","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_b","output":"已匹配"},
+			{"type":"function_call_output","call_id":"call_c","output":"已读取"}
+		]}`
+	messages := captureUpstreamMessages(t, "/v1/responses", body)
+	if got := rolesOf(map[string]any{"messages": messages}); !reflect.DeepEqual(got, []string{"system", "user", "assistant", "tool", "assistant", "tool", "tool"}) {
+		t.Fatalf("unexpected message topology: %v", got)
+	}
+	if messages[2].(map[string]any)["reasoning_content"] != "先读取" {
+		t.Fatal("original reasoning was not preserved")
+	}
+	second := messages[4].(map[string]any)
+	if value, exists := second["reasoning_content"]; !exists || value != "" {
+		t.Fatalf("missing explicit empty reasoning field: %#v", second)
+	}
+	if second["reasoning"] != " " {
+		t.Fatalf("thinking assistant without reasoning must carry a whitespace marker: %#v", second)
+	}
+	if second["content"] != "继续检查" || !reflect.DeepEqual(callIDs(second), []string{"call_b", "call_c"}) {
+		t.Fatalf("text and calls were not grouped into the same reply: %#v", second)
+	}
+}
+
+func TestResponsesWithoutThinkingDoesNotAddReasoningField(t *testing.T) {
+	body := `{"model":"deepseek-v4.1-flash","stream":true,"reasoning":{"effort":"none"},"input":[
+		{"role":"user","content":"run"},
+		{"type":"message","role":"assistant","content":"running"},
+		{"type":"function_call","call_id":"call_a","name":"read","arguments":"{}"},
+		{"type":"function_call_output","call_id":"call_a","output":"ok"}
+	]}`
+	messages := captureUpstreamMessages(t, "/v1/responses", body)
+	assistant := messages[2].(map[string]any)
+	if _, exists := assistant["reasoning_content"]; exists {
+		t.Fatalf("non-thinking request should not gain reasoning field: %#v", assistant)
+	}
+}
+
+func TestChatRouteDoesNotInventReasoningField(t *testing.T) {
+	body := `{"model":"m","stream":true,"reasoning_effort":"high","messages":[
+		{"role":"system","content":"s"},
+		{"role":"user","content":"run"},
+		{"role":"assistant","content":"running","tool_calls":[
+			{"id":"call_a","type":"function","function":{"name":"read","arguments":"{}"}}
+		]},
+		{"role":"tool","tool_call_id":"call_a","content":"ok"}
+	]}`
+	messages := captureUpstreamMessages(t, "/v1/chat/completions", body)
+	if _, exists := messages[2].(map[string]any)["reasoning_content"]; exists {
+		t.Fatalf("native Chat input must remain untouched: %#v", messages[2])
 	}
 }
