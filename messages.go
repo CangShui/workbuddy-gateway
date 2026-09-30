@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,7 +26,8 @@ import (
 //   - 非流式响应：上游流式数据本地聚合为完整 Message 对象
 //
 // stop_reason 映射：stop->end_turn、tool_calls->tool_use、length->max_tokens。
-// 上游思维链（delta.reasoning_content）映射为 thinking 内容块。
+// 上游思维链（delta.reasoning_content）仅在请求启用 thinking 时回译为
+// thinking 内容块——没启用的客户端不处理这种块，多出来会被当成协议异常。
 // -----------------------------------------------------------------------------
 
 // anthropicErrFmtKey 标记本次请求的错误响应应使用 Anthropic 形状
@@ -107,6 +110,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		modelName = "hy4-preview"
 	}
 	isStream, _ := msgReq["stream"].(bool)
+	wantThinking := anthropicThinkingOn(msgReq)
 	debugSetModelAndStream(r, modelName, isStream)
 	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
 
@@ -135,7 +139,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	ensureLeadingSystemMessage(chatReq)
 	repairReport := repairToolMessageSequence(chatReq)
 	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
-	// 与 Chat 原生入口共用同一套 DeepSeek 多轮推理历史回填规则。
+	// 与 Chat / Responses 入口共用同一套 DeepSeek 多轮推理历史回填规则。
 	logReasoningHistoryRepair(r, reqID, modelName, repairReasoningHistory(chatReq))
 
 	upstreamBytes, err := json.Marshal(chatReq)
@@ -151,9 +155,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isStream {
-		streamMessagesResponse(w, r, resp, modelName, reqID, acc, prof, startTime)
+		streamMessagesResponse(w, r, resp, modelName, reqID, acc, prof, startTime, wantThinking)
 	} else {
-		writeMessagesAggregate(w, r, resp, modelName, reqID, acc, prof, startTime)
+		writeMessagesAggregate(w, r, resp, modelName, reqID, acc, prof, startTime, wantThinking)
 	}
 }
 
@@ -209,20 +213,14 @@ func anthropicToChatRequest(body map[string]any, modelName string) (map[string]a
 		chat["tool_choice"] = tc
 	}
 
-	// thinking -> reasoning_effort（Anthropic 用 budget_tokens 表达预算，上游只认
-	// 扁平的 reasoning_effort；enabled 无显式档位时取 high，disabled 显式关闭——
-	// applyThinkingRules 会对 "off" 做删除处理并跳过 reasoning_summary 注入）。
+	// thinking -> reasoning_effort（上游只认扁平档位；disabled 显式关闭，
+	// applyThinkingRules 会跳过 off 档的注入）。
 	if th, ok := body["thinking"].(map[string]any); ok {
-		ttype, _ := th["type"].(string)
-		switch strings.ToLower(strings.TrimSpace(ttype)) {
+		switch anthropicThinkingType(th) {
 		case "disabled":
 			chat["reasoning_effort"] = "off"
-		case "enabled":
-			effort := strings.TrimSpace(strOf(th["effort"]))
-			if effort == "" {
-				effort = "high"
-			}
-			chat["reasoning_effort"] = effort
+		case "enabled", "adaptive":
+			chat["reasoning_effort"] = anthropicEffort(th)
 		}
 	}
 	return chat, nil
@@ -231,6 +229,39 @@ func anthropicToChatRequest(body map[string]any, modelName string) (map[string]a
 func strOf(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// anthropicThinkingOn 判断请求是否启用扩展思考（响应侧据此决定是否回译 thinking 块）。
+// enabled 与 adaptive 都算启用：新版 Claude Code 对不在其能力表里的模型一律发 adaptive，
+// 只认 enabled 会让这类请求的思考过程被整段丢弃。
+func anthropicThinkingOn(body map[string]any) bool {
+	th, ok := body["thinking"].(map[string]any)
+	return ok && anthropicThinkingType(th) != "" && anthropicThinkingType(th) != "disabled"
+}
+
+func anthropicThinkingType(th map[string]any) string {
+	return strings.ToLower(strings.TrimSpace(strOf(th["type"])))
+}
+
+// anthropicEffort 取 thinking.effort 显式档位；没有时按预算量级分档
+// （<4k low / <16k medium / <64k high / 更高 max），均缺失取 high。
+func anthropicEffort(th map[string]any) string {
+	if e := strings.TrimSpace(strOf(th["effort"])); e != "" {
+		return e
+	}
+	if b, _ := th["budget_tokens"].(float64); b > 0 {
+		switch {
+		case b >= 65536:
+			return "max"
+		case b >= 16384:
+			return "high"
+		case b >= 4096:
+			return "medium"
+		default:
+			return "low"
+		}
+	}
+	return "high"
 }
 
 // extractAnthropicSystemText 提取 system 字段为纯文本。支持 string 与
@@ -243,11 +274,8 @@ func extractAnthropicSystemText(v any) string {
 		parts := make([]string, 0, len(s))
 		for _, b := range s {
 			blk, ok := b.(map[string]any)
-			if !ok {
-				continue
-			}
-			if blk["type"] == "text" {
-				if t, ok := blk["text"].(string); ok && t != "" {
+			if ok && blk["type"] == "text" {
+				if t := strOf(blk["text"]); t != "" {
 					parts = append(parts, t)
 				}
 			}
@@ -273,20 +301,14 @@ func convertAnthropicMessage(msg map[string]any) []any {
 
 // convertAnthropicBlocks 处理 content blocks 数组。
 // user：tool_result 块 -> 独立 tool 消息（必须紧跟 assistant 的 tool_calls），
-//
-//	其余文本合并为一条 user 消息放在 tool 消息之后。
-//
+// 其余文本/图片合并为一条 user 消息放在 tool 消息之后；tool_result 里嵌的
+// 图片提升到这条 user 消息（tool 消息的 content 只能是字符串，图片无处安放）。
 // assistant：text 块合并为 content，tool_use 块 -> tool_calls；thinking /
-//
-//	redacted_thinking 历史块不上传（上游自行管理思维链）。
+// redacted_thinking 历史块不上传（上游自行管理思维链）。
 func convertAnthropicBlocks(role string, blocks []any) []any {
 	switch role {
 	case "user":
-		// tool_result -> 独立 tool 消息（须紧跟 assistant 的 tool_calls）；
-		// text/image 合并为一条 user 消息（有图时 content 用 parts 数组）。
-		var toolMsgs []any
-		var parts []any
-		var texts []string
+		var toolMsgs, parts []any
 		for _, bAny := range blocks {
 			blk, ok := bAny.(map[string]any)
 			if !ok {
@@ -294,33 +316,47 @@ func convertAnthropicBlocks(role string, blocks []any) []any {
 			}
 			switch blk["type"] {
 			case "text":
-				if t, ok := blk["text"].(string); ok && t != "" {
-					texts = append(texts, t)
-					parts = append(parts, map[string]any{"type": "text", "text": t})
-				}
+				parts = append(parts, map[string]any{"type": "text", "text": strOf(blk["text"])})
 			case "image":
 				if url := anthropicImageURL(blk); url != "" {
-					parts = append(parts, map[string]any{
-						"type":      "image_url",
-						"image_url": map[string]any{"url": url},
-					})
+					parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
 				}
 			case "tool_result":
+				content := anthropicContentText(blk["content"])
+				// 提升工具结果里的图片，并保证 tool content 非空（上游要求）
+				hasImage := false
+				if list, ok := blk["content"].([]any); ok {
+					for _, subAny := range list {
+						sub, ok := subAny.(map[string]any)
+						if !ok || sub["type"] != "image" {
+							continue
+						}
+						if url := anthropicImageURL(sub); url != "" {
+							hasImage = true
+							parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
+						}
+					}
+				}
+				if content == "" && hasImage {
+					content = "[图片]"
+				}
 				toolMsgs = append(toolMsgs, map[string]any{
 					"role":         "tool",
 					"tool_call_id": strOf(blk["tool_use_id"]),
-					"content":      anthropicContentText(blk["content"]),
+					"content":      content,
 				})
 			}
 		}
 		var out []any
 		out = append(out, toolMsgs...)
-		if len(parts) > 0 {
-			content := any(strings.Join(texts, ""))
-			if len(parts) != len(texts) {
-				content = parts // 含图片块，保留 parts 数组
+		if len(parts) == 1 {
+			// 纯文本压平为字符串，多数上游对字符串更宽容
+			if p, ok := parts[0].(map[string]any); ok && p["type"] == "text" {
+				return append(out, map[string]any{"role": "user", "content": p["text"]})
 			}
-			out = append(out, map[string]any{"role": "user", "content": content})
+		}
+		if len(parts) > 0 {
+			out = append(out, map[string]any{"role": "user", "content": parts})
 		}
 		return out
 	case "assistant":
@@ -333,7 +369,7 @@ func convertAnthropicBlocks(role string, blocks []any) []any {
 			}
 			switch blk["type"] {
 			case "text":
-				if t, ok := blk["text"].(string); ok {
+				if t := strOf(blk["text"]); t != "" {
 					texts = append(texts, t)
 				}
 			case "tool_use":
@@ -361,7 +397,7 @@ func convertAnthropicBlocks(role string, blocks []any) []any {
 	var texts []string
 	for _, bAny := range blocks {
 		if blk, ok := bAny.(map[string]any); ok && blk["type"] == "text" {
-			if t, ok := blk["text"].(string); ok && t != "" {
+			if t := strOf(blk["text"]); t != "" {
 				texts = append(texts, t)
 			}
 		}
@@ -381,7 +417,7 @@ func anthropicContentText(v any) string {
 		parts := make([]string, 0, len(c))
 		for _, b := range c {
 			if blk, ok := b.(map[string]any); ok && blk["type"] == "text" {
-				if t, ok := blk["text"].(string); ok && t != "" {
+				if t := strOf(blk["text"]); t != "" {
 					parts = append(parts, t)
 				}
 			}
@@ -400,8 +436,7 @@ func anthropicImageURL(blk map[string]any) string {
 	}
 	switch strOf(src["type"]) {
 	case "base64":
-		media := strOf(src["media_type"])
-		data := strOf(src["data"])
+		media, data := strOf(src["media_type"]), strOf(src["data"])
 		if media == "" || data == "" {
 			return ""
 		}
@@ -437,25 +472,18 @@ func convertAnthropicTools(tools []any) []any {
 }
 
 // convertAnthropicToolChoice 将 Anthropic tool_choice 转为 chat 格式。
+// 带工具名时锁定该函数（any/tool/auto 都适用）；否则 auto/any -> auto/required。
 func convertAnthropicToolChoice(tc map[string]any) any {
-	typ := strings.ToLower(strOf(tc["type"]))
-	name := strOf(tc["name"])
-	switch typ {
+	if name := strOf(tc["name"]); name != "" {
+		return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+	}
+	switch strings.ToLower(strOf(tc["type"])) {
 	case "none":
 		return "none"
 	case "any", "required":
-		if name != "" {
-			return map[string]any{"type": "function", "function": map[string]any{"name": name}}
-		}
 		return "required"
-	case "tool":
-		if name != "" {
-			return map[string]any{"type": "function", "function": map[string]any{"name": name}}
-		}
-		return "auto"
-	default: // auto
-		return "auto"
 	}
+	return "auto"
 }
 
 // -----------------------------------------------------------------------------
@@ -478,23 +506,25 @@ type anthropicToolSlot struct {
 // anthropicStreamState 把逐个到来的 chat.completion.chunk 翻译为 Anthropic
 // SSE 事件字节流。同一实例也可走 aggregate() 输出非流式完整 Message。
 type anthropicStreamState struct {
-	msgID      string
-	model      string
-	started    bool
-	blockIndex int
-	thinking   *anthropicTextSlot
-	text       *anthropicTextSlot
-	tools      map[int]*anthropicToolSlot
-	toolOrder  []int
-	finish     string
-	usage      map[string]any
+	msgID        string
+	model        string
+	wantThinking bool
+	started      bool
+	blockIndex   int
+	thinking     *anthropicTextSlot
+	text         *anthropicTextSlot
+	tools        map[int]*anthropicToolSlot
+	toolOrder    []int
+	finish       string
+	usage        map[string]any
 }
 
-func newAnthropicStreamState(modelName string) *anthropicStreamState {
+func newAnthropicStreamState(modelName string, wantThinking bool) *anthropicStreamState {
 	return &anthropicStreamState{
-		msgID: "msg_" + compactUUID(),
-		model: modelName,
-		tools: map[int]*anthropicToolSlot{},
+		msgID:        "msg_" + compactUUID(),
+		model:        modelName,
+		wantThinking: wantThinking,
+		tools:        map[int]*anthropicToolSlot{},
 	}
 }
 
@@ -511,7 +541,8 @@ func (s *anthropicStreamState) emit(eventType string, data map[string]any) []byt
 // feed 消费一个上游 chunk，返回 0..n 个 Anthropic 事件。
 func (s *anthropicStreamState) feed(chunk map[string]any) []byte {
 	var out []byte
-	if m, ok := chunk["model"].(string); ok && m != "" {
+	// 上游可能改写 model（别名解析等），message_start 用回显值
+	if m := strOf(chunk["model"]); m != "" {
 		s.model = m
 	}
 	if !s.started {
@@ -538,7 +569,8 @@ func (s *anthropicStreamState) feed(chunk map[string]any) []byte {
 		}
 		delta, _ := choice["delta"].(map[string]any)
 		if delta != nil {
-			if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+			// 推理增量仅在请求启用 thinking 时回译
+			if rc, ok := delta["reasoning_content"].(string); ok && rc != "" && s.wantThinking {
 				out = append(out, s.appendThinking(rc)...)
 			}
 			if ct, ok := delta["content"].(string); ok && ct != "" {
@@ -547,21 +579,20 @@ func (s *anthropicStreamState) feed(chunk map[string]any) []byte {
 			if tcs, ok := delta["tool_calls"].([]any); ok {
 				for _, tcAny := range tcs {
 					tc, ok := tcAny.(map[string]any)
-					if !ok {
-						continue
+					if ok {
+						out = append(out, s.appendToolCall(tc)...)
 					}
-					out = append(out, s.appendToolCall(tc)...)
 				}
 			}
 		}
-		if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
+		if fr := strOf(choice["finish_reason"]); fr != "" {
 			s.finish = fr
 		}
 	}
 	return out
 }
 
-func (s *anthropicStreamState) stopTextLocked(out []byte) []byte {
+func (s *anthropicStreamState) stopText(out []byte) []byte {
 	if s.text != nil && s.text.open {
 		out = append(out, s.emit("content_block_stop", map[string]any{"index": s.text.index})...)
 		s.text.open = false
@@ -569,18 +600,25 @@ func (s *anthropicStreamState) stopTextLocked(out []byte) []byte {
 	return out
 }
 
-func (s *anthropicStreamState) stopThinkingLocked(out []byte) []byte {
-	if s.thinking != nil && s.thinking.open {
-		out = append(out, s.emit("content_block_stop", map[string]any{"index": s.thinking.index})...)
-		s.thinking.open = false
+// stopThinking 先发 signature_delta 再收口——顺序反了的话，content_block_stop
+// 之后到达的 delta 会被客户端丢弃，签名就白发了。
+func (s *anthropicStreamState) stopThinking(out []byte) []byte {
+	if s.thinking == nil || !s.thinking.open {
+		return out
 	}
+	s.thinking.open = false
+	out = append(out, s.emit("content_block_delta", map[string]any{
+		"index": s.thinking.index,
+		"delta": map[string]any{"type": "signature_delta", "signature": anthropicSignature(s.thinking.buf.String())},
+	})...)
+	out = append(out, s.emit("content_block_stop", map[string]any{"index": s.thinking.index})...)
 	return out
 }
 
 func (s *anthropicStreamState) appendThinking(rc string) []byte {
 	var out []byte
 	// 思维链只出现在正文前；若正文块开着，先收口再开新的 thinking 块。
-	out = s.stopTextLocked(out)
+	out = s.stopText(out)
 	if s.thinking == nil || !s.thinking.open {
 		s.thinking = &anthropicTextSlot{open: true, index: s.blockIndex}
 		s.blockIndex++
@@ -600,7 +638,7 @@ func (s *anthropicStreamState) appendThinking(rc string) []byte {
 func (s *anthropicStreamState) appendText(ct string) []byte {
 	var out []byte
 	// 正文开始：先收口 thinking 块，保证块顺序 thinking -> text。
-	out = s.stopThinkingLocked(out)
+	out = s.stopThinking(out)
 	if s.text == nil || !s.text.open {
 		s.text = &anthropicTextSlot{open: true, index: s.blockIndex}
 		s.blockIndex++
@@ -629,15 +667,15 @@ func (s *anthropicStreamState) appendToolCall(tc map[string]any) []byte {
 		s.tools[idx] = slot
 		s.toolOrder = append(s.toolOrder, idx)
 	}
-	var out []byte
 	// 工具块开始：先收口 thinking / text，保证块顺序 thinking -> text -> tool_use。
-	out = s.stopThinkingLocked(out)
-	out = s.stopTextLocked(out)
-	if id, ok := tc["id"].(string); ok && id != "" {
+	var out []byte
+	out = s.stopThinking(out)
+	out = s.stopText(out)
+	if id := strOf(tc["id"]); id != "" {
 		slot.id = id
 	}
 	if fn, ok := tc["function"].(map[string]any); ok {
-		if n, ok := fn["name"].(string); ok && n != "" {
+		if n := strOf(fn["name"]); n != "" {
 			slot.name = n
 		}
 	}
@@ -651,7 +689,8 @@ func (s *anthropicStreamState) appendToolCall(tc map[string]any) []byte {
 		})...)
 	}
 	if fn, ok := tc["function"].(map[string]any); ok {
-		if a, ok := fn["arguments"].(string); ok && a != "" {
+		// 参数分片原样透传，拼接交给客户端（无从判断 JSON 何时完整）
+		if a := strOf(fn["arguments"]); a != "" {
 			slot.args.WriteString(a)
 			out = append(out, s.emit("content_block_delta", map[string]any{
 				"index": slot.index,
@@ -663,52 +702,50 @@ func (s *anthropicStreamState) appendToolCall(tc map[string]any) []byte {
 }
 
 // mapStopReason 将 chat finish_reason 映射为 Anthropic stop_reason。
+// content_filter 等未列出的值一律按 end_turn 收尾。
 func mapStopReason(finish string) string {
 	switch finish {
-	case "tool_calls":
+	case "tool_calls", "function_call":
 		return "tool_use"
 	case "length":
 		return "max_tokens"
-	case "stop_sequence":
-		return "stop_sequence"
-	default:
-		return "end_turn"
 	}
+	return "end_turn"
 }
 
-func numToInt(v any) int {
-	switch n := v.(type) {
-	case float64:
-		return int(n)
-	case int:
-		return n
-	case int64:
-		return int(n)
-	case json.Number:
-		i, _ := n.Int64()
-		return int(i)
-	}
-	return 0
+func intFloat(v any) int {
+	f, _ := v.(float64)
+	return int(f)
 }
 
+// anthropicUsage 将上游 usage 转为 Anthropic 口径。上游的 prompt_tokens
+// 已包含命中的缓存 token；Anthropic 的 input_tokens 不含缓存——不减的话
+// 客户端把 input 与 cache_read 相加时缓存会被算两遍。
 func (s *anthropicStreamState) anthropicUsage() map[string]any {
-	in, out := 0, 0
+	in, out, cached := 0, 0, 0
 	if s.usage != nil {
-		in = numToInt(s.usage["prompt_tokens"])
-		out = numToInt(s.usage["completion_tokens"])
-		if in == 0 && out == 0 {
-			in = numToInt(s.usage["input_tokens"])
-			out = numToInt(s.usage["output_tokens"])
+		in = intFloat(s.usage["prompt_tokens"])
+		out = intFloat(s.usage["completion_tokens"])
+		if d, ok := s.usage["prompt_tokens_details"].(map[string]any); ok {
+			cached = intFloat(d["cached_tokens"])
 		}
 	}
-	return map[string]any{"input_tokens": in, "output_tokens": out}
+	if cached > in {
+		cached = in // 上游给了畸形命中数时钳到非负
+	}
+	return map[string]any{
+		"input_tokens":                in - cached,
+		"cache_read_input_tokens":     cached,
+		"cache_creation_input_tokens": 0,
+		"output_tokens":               out,
+	}
 }
 
 // finishEvents 关闭所有未收口块并输出 message_delta + message_stop。
 func (s *anthropicStreamState) finishEvents() []byte {
 	var out []byte
-	out = s.stopThinkingLocked(out)
-	out = s.stopTextLocked(out)
+	out = s.stopThinking(out)
+	out = s.stopText(out)
 	for _, idx := range s.toolOrder {
 		slot := s.tools[idx]
 		if slot.open {
@@ -729,7 +766,8 @@ func (s *anthropicStreamState) aggregate() map[string]any {
 	content := []any{}
 	if s.thinking != nil && s.thinking.buf.Len() > 0 {
 		content = append(content, map[string]any{
-			"type": "thinking", "thinking": s.thinking.buf.String(), "signature": "",
+			"type": "thinking", "thinking": s.thinking.buf.String(),
+			"signature": anthropicSignature(s.thinking.buf.String()),
 		})
 	}
 	if s.text != nil && s.text.buf.Len() > 0 {
@@ -760,6 +798,14 @@ func (s *anthropicStreamState) aggregate() map[string]any {
 	}
 }
 
+// anthropicSignature 生成 thinking 块的回传签名。请求侧不上传 thinking
+// 历史（上游自行管理思维链），签名只为满足严格客户端的协议校验，
+// 取推理正文的哈希即可，可确定复现。
+func anthropicSignature(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
 // -----------------------------------------------------------------------------
 // 响应出口：流式 / 聚合 / count_tokens
 // -----------------------------------------------------------------------------
@@ -778,19 +824,15 @@ func scanUpstreamSSE(body io.Reader, state *anthropicStreamState, sink func([]by
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			continue
 		}
-		if sink != nil {
-			if out := state.feed(chunk); len(out) > 0 {
-				sink(out)
-			}
-		} else {
-			state.feed(chunk)
+		if out := state.feed(chunk); sink != nil && len(out) > 0 {
+			sink(out)
 		}
 	}
 	return scanner.Err()
 }
 
 // streamMessagesResponse 将上游流式响应实时回译为 Anthropic SSE。
-func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
+func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time, wantThinking bool) {
 	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -810,7 +852,7 @@ func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.R
 		flusher.Flush()
 	}
 
-	state := newAnthropicStreamState(modelName)
+	state := newAnthropicStreamState(modelName, wantThinking)
 	body := newTTFTReader(resp.Body, startTime)
 	scanErr := scanUpstreamSSE(body, state, writeEvent)
 	if scanErr != nil {
@@ -858,9 +900,9 @@ func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.R
 }
 
 // writeMessagesAggregate 本地聚合上游流式数据，输出完整 Anthropic Message。
-func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
+func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time, wantThinking bool) {
 	defer resp.Body.Close()
-	state := newAnthropicStreamState(modelName)
+	state := newAnthropicStreamState(modelName, wantThinking)
 	body := newTTFTReader(resp.Body, startTime)
 	if err := scanUpstreamSSE(body, state, nil); err != nil {
 		debugEvent(r, "error", "aggregate_response_failed", map[string]any{
@@ -900,9 +942,7 @@ func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.R
 }
 
 // handleCountTokens 处理 POST /v1/messages/count_tokens。
-// V1 为本地估算（不打上游）：CJK 字符约 1 token/字，ASCII 约 4 字符/token，
-// tools schema 按序列化字节估算。Claude Code 对该端点缺失时会本地兜底，
-// 精确计数可后续用 max_tokens=1 真实流式调用实现。
+// 本地估算不打上游：CJK 约 1 token/字、ASCII 约 4 字符/token。
 func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeAnthropicError(w, http.StatusMethodNotAllowed, "api_error", "仅支持 POST 请求")
@@ -933,12 +973,10 @@ func estimateAnthropicInputTokens(body map[string]any) int {
 	}
 	if msgs, ok := body["messages"].([]any); ok {
 		for _, m := range msgs {
-			msg, ok := m.(map[string]any)
-			if !ok {
-				continue
+			if msg, ok := m.(map[string]any); ok {
+				appendAnthropicContentText(&sb, msg["content"])
+				sb.WriteByte('\n')
 			}
-			appendAnthropicContentText(&sb, msg["content"])
-			sb.WriteByte('\n')
 		}
 	}
 	n := approxTokens(sb.String())
