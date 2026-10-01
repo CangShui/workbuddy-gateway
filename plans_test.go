@@ -121,6 +121,12 @@ func TestParsePlanPageRejectsSchemaDrift(t *testing.T) {
 	if rows, total, err := parsePlanPage([]byte(`{"Response":{"Data":{"TotalCount":"0","Accounts":[]}}}`)); err != nil || total != 0 || len(rows) != 0 {
 		t.Fatalf("valid empty page: rows=%v total=%d err=%v", rows, total, err)
 	}
+	for _, id := range []string{`123456789`, `"123456789"`} {
+		data := []byte(`{"Response":{"Data":{"TotalCount":1,"Accounts":[{"AccountId":` + id + `,"ResourceId":"res1","PackageCode":"new-code","Status":0}]}}}`)
+		if rows, total, err := parsePlanPage(data); err != nil || total != 1 || len(rows) != 1 {
+			t.Fatalf("numeric/string AccountId must both work: total=%d err=%v", total, err)
+		}
+	}
 }
 
 func TestFetchPlansUsesAllCodesAndPagination(t *testing.T) {

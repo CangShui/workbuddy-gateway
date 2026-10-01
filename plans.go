@@ -37,7 +37,7 @@ var nonPlanCodes = map[string]bool{
 }
 
 type planResource struct {
-	AccountID          string          `json:"AccountId"`
+	AccountID          json.RawMessage `json:"AccountId"` // 官网可返回数字或字符串。
 	ResourceID         string          `json:"ResourceId"`
 	PackageCode        string          `json:"PackageCode"`
 	PackageName        string          `json:"PackageName"`
@@ -288,9 +288,14 @@ func fetchPlanResources(ctx context.Context, prof *upstreamProfile, headers func
 		lastTotal = total
 		for _, row := range rows {
 			// 一个订阅资源可有多个计量账户，优先按 AccountId 去重。
-			key := row.AccountID
-			if key == "" {
-				key = row.ResourceID
+			key := strings.Trim(strings.TrimSpace(string(row.AccountID)), `"`)
+			if key == "" || key == "null" {
+				key = ""
+				if row.ResourceID != "" {
+					key = "resource:" + row.ResourceID
+				}
+			} else {
+				key = "account:" + key
 			}
 			if key != "" {
 				if seen[key] {
