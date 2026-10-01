@@ -77,11 +77,46 @@ func TestIdentifyPlanFromEffectiveResources(t *testing.T) {
 		{"invalid_expiry", quotaSummaryData{}, []planResource{free, badTime}, "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := identifyPlan(tc.summary, tc.rows, now)
+			got, err := identifyPlan("intl", tc.summary, tc.rows, now)
 			if (err != nil) != tc.wantErr || got != tc.want {
 				t.Fatalf("got=%q err=%v want=%q error=%v", got, err, tc.want, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestRegionalPlanNamesAndFutureTiers(t *testing.T) {
+	for _, tc := range []struct {
+		site, code, name, want string
+	}{
+		{"cn", "TCACA_code_008_cfWoLwvjU4", "CodeBuddy个人体验版", "体验版"},
+		{"cn", "TCACA_code_002_AkiJS3ZHF5", "Pro Plan Monthly Subscription", "标准版"},
+		{"cn", "TCACA_code_026_BaESVICNoi", "", "高级版"},
+		{"cn", "TCACA_code_027_0FCGVA6vSa", "CodeBuddy个人旗舰版", "旗舰版"},
+		{"intl", "TCACA_code_002_AkiJS3ZHF5", "Pro Plan Monthly Subscription", "pro"},
+		{"intl", "TCACA_code_035_ArVxJcGDsm", "Free Plan Subscription", "免费"},
+		{"intl", "TCACA_code_039_KRcQj7wUat", "Pro Plan Trial Subscription", "Pro试用"},
+		{"cn", "future-cn-tier", "CodeBuddy商务版", "CodeBuddy商务版"},
+		{"cn", "new-standard-code", "个人标准版", "标准版"},
+		{"cn", "future-unnamed-tier", "", "未识别订阅"},
+		{"cn", "TCACA_code_023_4xbGhMrE6q", "CodeBuddy个人青春版", "CodeBuddy个人青春版"},
+	} {
+		t.Run(tc.site+"/"+tc.code, func(t *testing.T) {
+			got := resourcePlanName(tc.site, testPlanResource(tc.code, tc.name))
+			if got != tc.want {
+				t.Fatalf("site=%s got=%q want=%q", tc.site, got, tc.want)
+			}
+		})
+	}
+	free := testPlanResource("TCACA_code_008_cfWoLwvjU4", "CodeBuddy个人体验版")
+	for code, label := range cnPlanNames {
+		got, err := identifyPlan("cn", quotaSummaryData{}, []planResource{free, testPlanResource(code, "")}, time.Now())
+		if err != nil || got != label {
+			t.Fatalf("cn tier=%s got=%q err=%v want=%q", code, got, err, label)
+		}
+	}
+	if got, err := identifyPlan("cn", quotaSummaryData{}, nil, time.Now()); err != nil || got != "体验版" {
+		t.Fatalf("cn empty entitlements must not use intl Free label: %q %v", got, err)
 	}
 }
 

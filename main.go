@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	version = "1.13.9"
+	version = "1.13.10"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -1905,7 +1905,7 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	now := time.Now()
 	resources, planErr := fetchPlanResources(ctx, prof, headers, traceID, path, now)
 	if planErr == nil {
-		plan, planErr = identifyPlan(summary, resources, now)
+		plan, planErr = identifyPlan(prof.Key, summary, resources, now)
 	}
 	accountMu.Lock()
 	wasExhausted := acc.QuotaExhausted

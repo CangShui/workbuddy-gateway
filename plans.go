@@ -28,6 +28,29 @@ var legacyPlanNames = map[string]string{
 	"TCACA_code_040_mi9rCYg46x": "Pro试用",
 }
 
+// 国内站同一 Pro 编码在官网展示为“标准版”，不能套用国际站名称。
+// 此表仅规范已知四档的显示，不用于过滤查询结果；新编码仍显示官方名称。
+var cnPlanNames = map[string]string{
+	"TCACA_code_008_cfWoLwvjU4": "体验版",
+	"TCACA_code_002_AkiJS3ZHF5": "标准版",
+	"TCACA_code_026_BaESVICNoi": "高级版",
+	"TCACA_code_027_0FCGVA6vSa": "旗舰版",
+}
+
+func knownPlanName(site, code string) string {
+	if site == "cn" {
+		return cnPlanNames[code]
+	}
+	return legacyPlanNames[code]
+}
+
+func freePlanName(site string) string {
+	if site == "cn" {
+		return "体验版"
+	}
+	return "免费"
+}
+
 var nonPlanCodes = map[string]bool{
 	"TCACA_code_006_DbXS0lrypC": true,
 	"TCACA_code_007_nzdH5h4Nl0": true,
@@ -128,7 +151,23 @@ func safePlanName(name string) string {
 	return string(runes)
 }
 
-func resourcePlanName(r planResource) string {
+func resourcePlanName(site string, r planResource) string {
+	if site == "cn" {
+		if label := cnPlanNames[r.PackageCode]; label != "" {
+			return label
+		}
+		label := safePlanName(r.PackageName)
+		for _, tier := range []string{"体验版", "标准版", "高级版", "旗舰版"} {
+			switch label {
+			case tier, "个人" + tier, "CodeBuddy个人" + tier:
+				return tier
+			}
+		}
+		if label != "" {
+			return label // 新套餐及历史青春版等不强行归入当前四档。
+		}
+		return "未识别订阅"
+	}
 	if label := safePlanName(r.PackageName); label != "" {
 		switch strings.ToLower(label) {
 		case "free plan subscription", "free plan":
@@ -147,7 +186,7 @@ func resourcePlanName(r planResource) string {
 	return "未识别订阅"
 }
 
-func identifyPlan(summary quotaSummaryData, resources []planResource, now time.Time) (string, error) {
+func identifyPlan(site string, summary quotaSummaryData, resources []planResource, now time.Time) (string, error) {
 	var plans []planResource
 	ambiguous := false
 	for _, r := range resources {
@@ -166,7 +205,7 @@ func identifyPlan(summary quotaSummaryData, resources []planResource, now time.T
 			return "", fmt.Errorf("有效权益缺少套餐编码")
 		}
 		// 新套餐沿用 IDE 子产品，或 summary 明确指定的当前订阅，都可识别。
-		if r.SubProductCode == "sp_tcaca_codebuddy_ide" || legacyPlanNames[r.PackageCode] != "" ||
+		if r.SubProductCode == "sp_tcaca_codebuddy_ide" || knownPlanName(site, r.PackageCode) != "" ||
 			r.PackageCode == summary.SubscriptionPackageCode {
 			plans = append(plans, r)
 		} else {
@@ -175,7 +214,7 @@ func identifyPlan(summary quotaSummaryData, resources []planResource, now time.T
 	}
 	// 官网试用已转付费(2)且试用仍有效时，仍展示试用，付费套餐待生效。
 	trialStatus, _ := planInteger(json.RawMessage(fmt.Sprint(summary.ProTrialStatus)))
-	if trialStatus == 2 {
+	if site == "intl" && trialStatus == 2 {
 		for _, r := range plans {
 			if legacyPlanNames[r.PackageCode] == "Pro试用" {
 				return "Pro试用", nil
@@ -185,7 +224,7 @@ func identifyPlan(summary quotaSummaryData, resources []planResource, now time.T
 	if summary.SubscriptionPackageCode != "" {
 		for _, r := range plans {
 			if r.PackageCode == summary.SubscriptionPackageCode {
-				return resourcePlanName(r), nil
+				return resourcePlanName(site, r), nil
 			}
 		}
 		return "", fmt.Errorf("订阅摘要与有效权益不一致")
@@ -194,8 +233,8 @@ func identifyPlan(summary quotaSummaryData, resources []planResource, now time.T
 	labels := map[string]bool{}
 	hasFree := false
 	for _, r := range plans {
-		label := resourcePlanName(r)
-		if label == "免费" {
+		label := resourcePlanName(site, r)
+		if label == freePlanName(site) {
 			hasFree = true
 		} else {
 			labels[label] = true
@@ -205,7 +244,7 @@ func identifyPlan(summary quotaSummaryData, resources []planResource, now time.T
 		return "", fmt.Errorf("发现未知子产品，无法完整确认套餐")
 	}
 	if len(labels) > 0 {
-		if len(labels) > 1 {
+		if site == "intl" && len(labels) > 1 {
 			delete(labels, "Pro试用") // 已有有效正式订阅时普通试用不覆盖订阅。
 		}
 		names := make([]string, 0, len(labels))
@@ -220,7 +259,7 @@ func identifyPlan(summary quotaSummaryData, resources []planResource, now time.T
 	}
 	if hasFree || len(plans) == 0 {
 		// 已成功完整查询，只有过期包/赠送包/空列表，且没有付费订阅声明。
-		return "免费", nil
+		return freePlanName(site), nil
 	}
 	return "", fmt.Errorf("套餐无法确认")
 }
