@@ -2816,6 +2816,8 @@ func runServe() {
 	mux.HandleFunc("/chat/completions", handleChatCompletions)
 	mux.HandleFunc("/v1/responses", handleResponses)
 	mux.HandleFunc("/responses", handleResponses)
+	mux.HandleFunc("/v1/messages", handleMessages)
+	mux.HandleFunc("/v1/messages/count_tokens", handleCountTokens)
 	mux.HandleFunc("/v1/models", handleModels)
 	mux.HandleFunc("/models", handleModels)
 	mux.HandleFunc("/health", handleHealth)
@@ -2838,6 +2840,7 @@ func runServe() {
 	fmt.Printf("WorkBuddy 本地网关已启动\n")
 	fmt.Printf("   服务监听地址:  http://%s\n", listenAddr)
 	fmt.Printf("   Chat 接口地址: http://%s/v1/chat/completions\n", listenAddr)
+	fmt.Printf("   Claude Code:   http://%s/v1/messages (ANTHROPIC_BASE_URL 指向本网关)\n", listenAddr)
 	fmt.Printf("   Models 接口:   http://%s/v1/models\n", listenAddr)
 	fmt.Printf("   模型转发策略:  【完全透传】客户端请求的任意 model 原样中继至上游\n")
 	_, modelSource := mergedModelIDs()
@@ -3024,6 +3027,10 @@ func authMiddleware(next http.Handler) http.Handler {
 		if cfg.APIKey != "" && r.URL.Path != "/health" && r.URL.Path != "/ping" && r.URL.Path != "/" {
 			authHeader := r.Header.Get("Authorization")
 			token := strings.TrimPrefix(authHeader, "Bearer ")
+			// Anthropic 客户端（Claude Code 等）用 x-api-key 头携带密钥。
+			if token == "" {
+				token = r.Header.Get("x-api-key")
+			}
 			if token != cfg.APIKey {
 				debugEvent(r, "warn", "authentication_rejected", map[string]any{
 					"status_code":     http.StatusUnauthorized,
@@ -3031,7 +3038,7 @@ func authMiddleware(next http.Handler) http.Handler {
 					"business_impact": "请求未进入业务逻辑",
 				})
 				log.Printf("[请求被拦截] traceId=%s 拦截层=API鉴权 结果=拒绝 原因=未提供有效API密钥 返回状态码=401 业务影响=请求未进入业务方法", w.Header().Get("X-Trace-ID"))
-				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "未提供有效 API 密钥")
+				writeUpstreamError(w, r, http.StatusUnauthorized, "invalid_api_key", "未提供有效 API 密钥")
 				return
 			}
 		}
@@ -3062,7 +3069,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			"business_impact": "没有可用登录凭据，未调用上游模型",
 		})
 		recordModelFailure(modelName, "no_auth")
-		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
+		writeUpstreamError(w, r, http.StatusUnauthorized, "no_auth", "未找到有效登录凭据，请先执行 login 命令扫码登录")
 		return nil, nil, nil, false
 	}
 
@@ -3078,7 +3085,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 					"status_code": http.StatusForbidden, "reason": "没有符合模型账号名单的凭据", "business_impact": "未进入上游调用",
 				})
 				recordModelFailure(modelName, "账号名单拒绝")
-				writeOpenAIError(w, http.StatusForbidden, "model_account_disabled", fmt.Sprintf("模型 %s 没有可用的凭据文件：已被账号黑白名单禁用", modelName))
+				writeUpstreamError(w, r, http.StatusForbidden, "model_account_disabled", fmt.Sprintf("模型 %s 没有可用的凭据文件：已被账号黑白名单禁用", modelName))
 				return nil, nil, nil, false
 			}
 			// 所有账号均不可用（冷却或失效）
@@ -3096,7 +3103,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 				"business_impact": "未调用上游模型",
 			})
 			recordModelFailure(modelName, "无可用账号")
-			writeOpenAIError(w, http.StatusServiceUnavailable, "no_available_account", msg)
+			writeUpstreamError(w, r, http.StatusServiceUnavailable, "no_available_account", msg)
 			return nil, nil, nil, false
 		}
 		attempted[acc] = true
@@ -3153,7 +3160,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游网络调用 账号=%s 异常=%v 业务影响=本次模型请求失败 是否已处理=是", traceID, reqID, acc.Path, err)
 			log.Printf("[#%d] 账号 %s [%s] 上游请求失败: %v", reqID, acc.Path, prof.Label, err)
 			recordModelFailure(modelName, "网络错误")
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
+			writeUpstreamError(w, r, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
 			return nil, nil, nil, false
 		}
 
@@ -3177,7 +3184,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 					msg := fmt.Sprintf("当前模型 %s 已在余额耗尽账号 %s 上完成受控探测并确认需要付费额度，本次不再探测其他耗尽账号", modelName, acc.Path)
 					log.Printf("[#%d] %s", reqID, msg)
 					recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
-					writeOpenAIError(w, http.StatusServiceUnavailable, "model_requires_quota", msg)
+					writeUpstreamError(w, r, http.StatusServiceUnavailable, "model_requires_quota", msg)
 					return nil, nil, nil, false
 				}
 				lastRateErr = errStr
@@ -3193,7 +3200,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 				if selection == selectionProbeExhausted {
 					msg := fmt.Sprintf("当前模型 %s 在余额耗尽账号 %s 的受控探测中触发模型级限流，本次不再探测其他耗尽账号", modelName, acc.Path)
 					recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
-					writeOpenAIError(w, http.StatusServiceUnavailable, "model_rate_limited", msg)
+					writeUpstreamError(w, r, http.StatusServiceUnavailable, "model_rate_limited", msg)
 					return nil, nil, nil, false
 				}
 				lastRateErr = errStr
@@ -3220,7 +3227,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			}
 
 			recordModelFailure(modelName, modelStatusFromError(resp.StatusCode, errStr))
-			writeOpenAIError(w, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
+			writeUpstreamError(w, r, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream %d: %s", resp.StatusCode, errStr))
 			return nil, nil, nil, false
 		}
 
@@ -3243,7 +3250,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		"reason":          "all_accounts_cooldown",
 		"business_impact": "未调用上游模型",
 	})
-	writeOpenAIError(w, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
+	writeUpstreamError(w, r, http.StatusTooManyRequests, "all_accounts_cooldown", "所有账号均处于冷却状态")
 	return nil, nil, nil, false
 }
 
@@ -3515,7 +3522,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = fmt.Fprintf(w, "WorkBuddy Local Gateway v%s is running.\n\nEndpoints:\n- POST /v1/chat/completions\n- POST /v1/responses\n- GET  /v1/models\n- GET  /health\n", version)
+	_, _ = fmt.Fprintf(w, "WorkBuddy Local Gateway v%s is running.\n\nEndpoints:\n- POST /v1/chat/completions\n- POST /v1/responses\n- POST /v1/messages (Anthropic)\n- POST /v1/messages/count_tokens\n- GET  /v1/models\n- GET  /health\n", version)
 }
 
 // -----------------------------------------------------------------------------

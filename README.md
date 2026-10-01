@@ -52,6 +52,7 @@
 - **流式分片规范化**：把上游每个分片携带的 `finish_reason:""` 归一化为 `null`，避免 Anthropic 翻译层误判 `stop_reason` 导致工具不执行。
 - **工具调用序列自愈**：出站前按 `tool_call_id` 修复并行调用中夹入 message 的历史结构，合并 Responses API 拆散的并行调用，并删除无配对调用、孤儿或重复结果，避免国际站返回 `11148 tool_call_sequence_broken`。
 - **OpenAI 兼容协议**：`/v1/chat/completions`（SSE 流式 + 非流式聚合）、`/v1/responses`（Responses API）、`/v1/models`、`/health`。
+- **Anthropic 协议原生入口**：`/v1/messages`（SSE 流式 + 非流式聚合）与 `/v1/messages/count_tokens`，Claude Code 等 Anthropic 客户端免外部翻译层直连，鉴权兼容 `x-api-key` 头。
 
 ---
 
@@ -213,6 +214,8 @@ workbuddy-gateway serve -models-refresh 0
 |---|---|---|
 | POST | `/v1/chat/completions`、`/chat/completions` | Chat Completions，支持 SSE 流式与非流式 |
 | POST | `/v1/responses`、`/responses` | OpenAI Responses API |
+| POST | `/v1/messages` | Anthropic Messages API（Claude Code 直连，内部转 Chat 走同一条上游管线） |
+| POST | `/v1/messages/count_tokens` | Anthropic 令牌计数（本地估算，CJK 1 token/字、ASCII 4 字符/token） |
 | GET | `/v1/models`、`/models` | 模型列表，响应头 `X-Model-Source` 标注来源 |
 | GET | `/health`、`/ping` | 健康检查，返回 `version`、`model_count`、`model_source` |
 | POST | `/admin/probe` | 供 `probe` 命令调用，**仅接受回环来源** |
@@ -599,6 +602,19 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)
 ```
+
+Claude Code（Anthropic 协议直连，免外部翻译层）：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
+export ANTHROPIC_API_KEY=你的网关-api-key   # 网关未启用 -api-key 时随意填
+claude
+```
+
+> 网关在 `/v1/messages` 入口完成 Anthropic → Chat 双向转译：思维链回译为 `thinking` 内容块、
+> `tool_calls` 回译为 `tool_use`、`finish_reason` 映射 `stop_reason`（`tool_calls→tool_use`、
+> `length→max_tokens`），并复用账号池轮询、工具序列自愈与 WAF 脱敏管线。
+> 模型名直接填网关 `/v1/models` 列表中的 ID。
 
 DSH（`~/.dsh/settings.yaml`）：
 
