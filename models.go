@@ -677,19 +677,35 @@ func siteKnownFree(site, modelID string) bool {
 	if modelProbeVerdict(site, modelID) == "free" {
 		return true
 	}
-	accountMu.Lock()
-	for _, acc := range accounts {
-		if profileForEdition(acc.Auth.Edition).Key != site && acc.Edition != site {
-			continue
-		}
-		if acc.ModelStates != nil {
+	accountFree := func() (knownFree bool) {
+		accountMu.Lock()
+		skipped := 0
+		defer func() {
+			accountMu.Unlock()
+			if skipped > 0 {
+				log.Printf("[站点免费判断] 站点=%s 模型=%s 跳过不可调度账号=%d 有效账号免费记录=%t 说明=空账号、失效标记及缺少凭据的账号不参与判断",
+					site, modelID, skipped, knownFree)
+			}
+		}()
+		for _, acc := range accounts {
+			// 启动时会载入 .disabled 标记形成无 Auth 的占位账号；
+			// 它们不能参与调度，也不能因历史免费状态影响站点选择。
+			if acc == nil || acc.Disabled || acc.Auth == nil || acc.Auth.Auth.AccessToken == "" {
+				skipped++
+				continue
+			}
+			if acc.Profile().Key != site && acc.Edition != site {
+				continue
+			}
 			if st := acc.ModelStates[normalizeModelName(modelID)]; st != nil && st.CostClass == modelCostFree {
-				accountMu.Unlock()
 				return true
 			}
 		}
+		return false
+	}()
+	if accountFree {
+		return true
 	}
-	accountMu.Unlock()
 	entry, ok := modelEntry(site, modelID)
 	return ok && entry.HasMultiplier && entry.Multiplier == 0 && !entry.PromoExpired
 }
