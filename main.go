@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	version = "1.13.8"
+	version = "1.13.9"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -339,7 +339,7 @@ type quotaSummaryData struct {
 	Packages []quotaPackage `json:"Packages"`
 	// IsPaidUser 为上游「正式付费订阅」标记；Pro 试用用户该字段同样为 false。
 	IsPaidUser bool `json:"IsPaidUser"`
-	// ProTrialStatus 为上游 Pro 试用状态：1=试用中，0=无/已结束；国内站可能不返回。
+	// ProTrialStatus 不能单独证明试用仍有效；必须结合当前权益资源。
 	ProTrialStatus any `json:"ProTrialStatus"`
 	// SubscriptionPackageCode 为当前订阅包编码，非空表示存在订阅包。
 	SubscriptionPackageCode string `json:"SubscriptionPackageCode"`
@@ -387,7 +387,9 @@ type Account struct {
 	QuotaUsed      float64                       // 最近一次额度查询返回的已用额度
 	QuotaRemaining float64                       // 最近一次额度查询返回的剩余额度
 	IsPaidUser     bool                          // 是否为付费用户（上游 IsPaidUser 原值）
-	PlanLabel      string                        // 套餐展示：Pro试用 | pro | 免费
+	PlanLabel      string                        // 官方套餐名称或已知套餐短名称
+	PlanCheckedAt  int64                         // 最近成功校验权益的时间；旧快照为0
+	PlanStale      bool                          // 最近查询失败，展示时标记旧结果
 	QuotaKnown     bool                          // 是否已成功获取过额度
 	QuotaExhausted bool                          // 已确认额度为 0；额度扫描发现恢复后自动解除
 	ModelStates    map[string]*modelRuntimeState // 按模型隔离的成本、限流和额度阻断状态
@@ -945,6 +947,12 @@ func restoreAccountRuntimeStateLocked() {
 		acc.QuotaRemaining = state.QuotaRemaining
 		acc.IsPaidUser = state.IsPaidUser
 		acc.PlanLabel = state.PlanLabel
+		acc.PlanCheckedAt = state.PlanCheckedAt
+		acc.PlanStale = state.PlanStale || state.PlanCheckedAt == 0 ||
+			time.Now().Unix()-state.PlanCheckedAt >= 300
+		if acc.PlanCheckedAt == 0 {
+			acc.PlanLabel = planUnknown // 不沿用旧版本仅凭试用标记猜出的标签。
+		}
 		acc.QuotaKnown = state.QuotaKnown
 		acc.QuotaExhausted = state.QuotaExhausted
 		if len(state.ModelStates) == 0 {
@@ -1686,36 +1694,10 @@ func parseQuotaCapacity(value string) (float64, error) {
 	return strconv.ParseFloat(value, 64)
 }
 
-// planLabelFromSummary 把上游套餐字段归一化为展示值：Pro试用 | pro | 免费。
-// 规则：ProTrialStatus=1 → Pro试用；IsPaidUser=true → pro；其余（含字段缺失、
-// 类型异常等识别不出的情况）→ 免费。
+// summary 只有额度与历史标记，不能独立判定有效套餐。
+// 由完整权益查询成功后替换“待确认”，禁止据试用标记猜成Pro试用。
 func planLabelFromSummary(summary quotaSummaryData) string {
-	if isProTrialActive(summary.ProTrialStatus) {
-		return "Pro试用"
-	}
-	if summary.IsPaidUser {
-		return "pro"
-	}
-	return "免费"
-}
-
-// isProTrialActive 判断 ProTrialStatus 是否为「试用中」，兼容数字与字符串两种编码。
-func isProTrialActive(value any) bool {
-	switch v := value.(type) {
-	case float64:
-		return v == 1
-	case int:
-		return v == 1
-	case int64:
-		return v == 1
-	case json.Number:
-		n, err := v.Int64()
-		return err == nil && n == 1
-	case string:
-		return strings.TrimSpace(v) == "1"
-	default:
-		return false
-	}
+	return planUnknown
 }
 
 func parseQuotaSummary(data []byte) (total, used, remaining float64, paid bool, plan string, err error) {
@@ -1895,24 +1877,35 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	prof := acc.Profile()
 	accountMu.Unlock()
 
-	log.Printf("[Quota] 账号 %s 开始查询额度，站点=%s，接口=%s", path, prof.Label, prof.quotaSummaryURL())
+	traceID := uuid.NewString()
+	log.Printf("[Quota] traceId=%s 账号 %s 开始查询额度，站点=%s，接口=%s", traceID, path, prof.Label, prof.quotaSummaryURL())
 	headers := func(r *http.Request) {
 		commonHeaders(r, prof)
 		r.Header.Set("Authorization", "Bearer "+auth.Auth.AccessToken)
 		r.Header.Set("X-Client-Platform", "web")
+		r.Header.Set("X-Trace-ID", traceID)
 		if auth.Account.EnterpriseID != "" {
 			r.Header.Set("X-Enterprise-Id", auth.Account.EnterpriseID)
 		}
 	}
 	data, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.quotaSummaryURL(), headers, strings.NewReader("{}"))
 	if err != nil {
-		log.Printf("[Quota] 账号 %s 查询额度失败，HTTP=%d，原因=%v，保留上一次额度数据", path, status, err)
+		markAccountPlanStale(acc)
+		log.Printf("[Quota] traceId=%s 账号 %s 查询额度失败，HTTP=%d，保留上一次额度数据，套餐标记待刷新", traceID, path, status)
 		return err
 	}
 	total, used, remaining, paid, plan, err := parseQuotaSummary(data)
 	if err != nil {
-		log.Printf("[Quota] 账号 %s 查询额度响应无法解析，原因=%v，保留上一次额度数据", path, err)
+		markAccountPlanStale(acc)
+		log.Printf("[Quota] traceId=%s 账号 %s 查询额度响应无法解析，保留上一次额度数据，套餐标记待刷新", traceID, path)
 		return err
+	}
+	var summary quotaSummaryData
+	_ = json.Unmarshal(data, &summary) // parseQuotaSummary 已校验。
+	now := time.Now()
+	resources, planErr := fetchPlanResources(ctx, prof, headers, traceID, path, now)
+	if planErr == nil {
+		plan, planErr = identifyPlan(summary, resources, now)
 	}
 	accountMu.Lock()
 	wasExhausted := acc.QuotaExhausted
@@ -1920,7 +1913,17 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	acc.QuotaUsed = used
 	acc.QuotaRemaining = remaining
 	acc.IsPaidUser = paid
-	acc.PlanLabel = plan
+	if planErr == nil {
+		acc.PlanLabel = plan
+		acc.PlanCheckedAt = now.Unix()
+		acc.PlanStale = false
+	} else {
+		if acc.PlanCheckedAt == 0 {
+			acc.PlanLabel = planUnknown
+		}
+		acc.PlanStale = true
+	}
+	plan = planDisplayLabel(acc.PlanLabel, acc.PlanStale)
 	acc.QuotaKnown = true
 	acc.QuotaExhausted = remaining <= 0
 	if remaining > 0 {
@@ -1930,13 +1933,18 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 		}
 	}
 	accountMu.Unlock()
+	if planErr != nil {
+		log.Printf("[套餐判断] traceId=%s 账号=%s 结果=待确认 原因=%v 显示=%s 业务影响=额度仍更新，不把接口失败误报为免费或试用", traceID, path, planErr, plan)
+	} else {
+		log.Printf("[套餐判断] traceId=%s 账号=%s 有效期校验时间=%s 资源数=%d 显示=%s 结果=完整权益校验成功", traceID, path, now.Format(time.RFC3339), len(resources), plan)
+	}
 	switch {
 	case !wasExhausted && remaining <= 0:
-		log.Printf("[Quota] 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s；账号已冻结调度，等待额度恢复", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
+		log.Printf("[Quota] traceId=%s 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s；账号已冻结调度，等待额度恢复", traceID, path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
 	case wasExhausted && remaining > 0:
-		log.Printf("[Quota] 账号 %s 额度已恢复，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s；账号已自动解除冻结并恢复调度", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
+		log.Printf("[Quota] traceId=%s 账号 %s 额度已恢复，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s；账号已自动解除冻结并恢复调度", traceID, path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
 	default:
-		log.Printf("[Quota] 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s", path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
+		log.Printf("[Quota] traceId=%s 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s", traceID, path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
 	}
 	return nil
 }
@@ -2196,7 +2204,10 @@ func formatAccountStatus(acc *Account, idx int, now time.Time) string {
 	sb.WriteString(fmt.Sprintf("用户 UID:     %s\n", acc.Auth.Account.UID))
 	sb.WriteString(fmt.Sprintf("企业 ID:      %s\n", ifEmpty(acc.Auth.Account.EnterpriseID, "(个人账号)")))
 	sb.WriteString(fmt.Sprintf("认证域名:     %s\n", ifEmpty(acc.Auth.Auth.Domain, "www.codebuddy.cn")))
-	sb.WriteString(fmt.Sprintf("套餐:         %s\n", ifEmpty(acc.PlanLabel, "免费")))
+	sb.WriteString(fmt.Sprintf("套餐:         %s\n", planDisplayLabel(acc.PlanLabel, acc.PlanStale)))
+	if acc.PlanStale {
+		sb.WriteString("              * 权益查询失败，待刷新；名称可能是上次成功结果。\n")
+	}
 	if acc.QuotaKnown {
 		sb.WriteString(fmt.Sprintf("额度:         总额度 %s / 已用 %s / 剩余 %s\n", formatQuota(acc.QuotaTotal), formatQuota(acc.QuotaUsed), formatQuota(acc.QuotaRemaining)))
 	}
@@ -2286,7 +2297,9 @@ type accountSnapshot struct {
 	QuotaUsed      float64                       `json:"quotaUsed,omitempty"`
 	QuotaRemaining float64                       `json:"quotaRemaining"`
 	IsPaidUser     bool                          `json:"isPaidUser"`
-	PlanLabel      string                        `json:"planLabel,omitempty"` // 套餐展示：Pro试用 | pro | 免费
+	PlanLabel      string                        `json:"planLabel,omitempty"` // 官方套餐名称或已知短名称
+	PlanCheckedAt  int64                         `json:"planCheckedAt,omitempty"`
+	PlanStale      bool                          `json:"planStale,omitempty"`
 	QuotaKnown     bool                          `json:"quotaKnown,omitempty"`
 	QuotaExhausted bool                          `json:"quotaExhausted,omitempty"`
 	ModelStates    map[string]modelStateSnapshot `json:"modelStates,omitempty"`
@@ -2323,6 +2336,8 @@ func writeStatusSnapshot() {
 		as.QuotaRemaining = acc.QuotaRemaining
 		as.IsPaidUser = acc.IsPaidUser
 		as.PlanLabel = acc.PlanLabel
+		as.PlanCheckedAt = acc.PlanCheckedAt
+		as.PlanStale = acc.PlanStale
 		as.QuotaKnown = acc.QuotaKnown
 		as.QuotaExhausted = acc.QuotaExhausted
 		if len(acc.ModelStates) > 0 {
@@ -2436,6 +2451,9 @@ func fitCell(s string, width int) string {
 
 func renderAccountTable(accs []accountSnapshot) string {
 	widths := []int{4, 20, 24, 8, 10, 19, 10, 10, 10, 10, 10, 10}
+	for _, a := range accs {
+		widths[9] = min(36, max(widths[9], displayWidth(planDisplayLabel(a.PlanLabel, a.PlanStale))))
+	}
 	headers := []string{"序号", "凭据文件", "账号", "站点", "状态", "Token 有效期", "总额度", "已用", "剩余", "套餐", "免费模型", "模型冷却"}
 	border := func() string {
 		var b strings.Builder
@@ -2469,7 +2487,7 @@ func renderAccountTable(accs []accountSnapshot) string {
 			total = formatQuota(a.QuotaTotal)
 			used = formatQuota(a.QuotaUsed)
 			remaining = formatQuota(a.QuotaRemaining)
-			plan = ifEmpty(a.PlanLabel, "免费")
+			plan = planDisplayLabel(a.PlanLabel, a.PlanStale)
 		}
 		if a.TokenExpiresAt > 0 {
 			expires = time.Unix(a.TokenExpiresAt, 0).Format("2006-01-02 15:04:05")
@@ -2491,6 +2509,12 @@ func renderAccountTable(accs []accountSnapshot) string {
 		}) + "\n")
 	}
 	b.WriteString(border())
+	for _, a := range accs {
+		if a.PlanStale {
+			b.WriteString("\n* 套餐权益查询失败，待刷新；名称可能是上次成功结果。")
+			break
+		}
+	}
 	return b.String()
 }
 

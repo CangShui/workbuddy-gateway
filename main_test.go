@@ -1195,28 +1195,27 @@ func TestParseQuotaSummary(t *testing.T) {
 	if total != 2000 || used != 569.98999993 || remaining != 1430.01000007 || !paid {
 		t.Fatalf("unexpected quota summary: total=%v used=%v remaining=%v paid=%v", total, used, remaining, paid)
 	}
-	if plan != "pro" {
-		t.Fatalf("IsPaidUser=true should show pro, got %q", plan)
+	if plan != planUnknown {
+		t.Fatalf("summary alone cannot establish the current plan, got %q", plan)
 	}
 }
 
-// 套餐展示规则：ProTrialStatus=1 → Pro试用；IsPaidUser=true → pro；
-// 其余（含字段缺失、类型异常、识别不出）→ 免费。
+// 摘要标记不再直接当成当前有效权益。
 func TestPlanLabelFromSummary(t *testing.T) {
 	cases := []struct {
 		name string
 		json string
 		want string
 	}{
-		{"Pro试用（数字1）", `{"ProTrialStatus":1,"IsPaidUser":false}`, "Pro试用"},
-		{"Pro试用（字符串1）", `{"ProTrialStatus":"1","IsPaidUser":false}`, "Pro试用"},
-		{"Pro试用优先于付费标记", `{"ProTrialStatus":1,"IsPaidUser":true}`, "Pro试用"},
-		{"正式付费pro", `{"ProTrialStatus":0,"IsPaidUser":true}`, "pro"},
-		{"试用已结束且非付费→免费", `{"ProTrialStatus":0,"IsPaidUser":false}`, "免费"},
-		{"字段缺失→免费", `{"Packages":[]}`, "免费"},
-		{"类型异常→免费", `{"ProTrialStatus":{"unexpected":true},"IsPaidUser":false}`, "免费"},
-		{"国内站无ProTrialStatus→免费", `{"IsPaidUser":false,"SubscriptionPackageCode":""}`, "免费"},
-		{"有订阅包但非试用非付费→免费", `{"IsPaidUser":false,"SubscriptionPackageCode":"pkg-code-000"}`, "免费"},
+		{"历史试用标记", `{"ProTrialStatus":1,"IsPaidUser":false}`, planUnknown},
+		{"字符串试用标记", `{"ProTrialStatus":"1","IsPaidUser":false}`, planUnknown},
+		{"试用与付费标记同时存在", `{"ProTrialStatus":1,"IsPaidUser":true}`, planUnknown},
+		{"付费标记不能决定等级", `{"ProTrialStatus":0,"IsPaidUser":true}`, planUnknown},
+		{"空标记也要查有效权益", `{"ProTrialStatus":0,"IsPaidUser":false}`, planUnknown},
+		{"字段缺失", `{"Packages":[]}`, planUnknown},
+		{"类型异常", `{"ProTrialStatus":{"unexpected":true},"IsPaidUser":false}`, planUnknown},
+		{"国内站无试用标记", `{"IsPaidUser":false,"SubscriptionPackageCode":""}`, planUnknown},
+		{"未知订阅包", `{"IsPaidUser":false,"SubscriptionPackageCode":"pkg-code-000"}`, planUnknown},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
