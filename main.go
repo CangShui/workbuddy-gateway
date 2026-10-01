@@ -350,25 +350,26 @@ type quotaSummaryData struct {
 // -----------------------------------------------------------------------------
 
 type Config struct {
-	Addr            string
-	Port            int
-	AuthFile        string
-	AuthDir         string
-	AuthExplicit    bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
-	LoginIntl       bool // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
-	APIKey          string
-	ProxyURL        string
-	Verbose         bool
-	DebugEnabled    bool   // 仅由工作目录 config.json 的 debug.enabled 控制
-	ReloadInterval  int    // 账号池热加载扫描间隔（秒），0 关闭
-	MonitorInterval int    // monitor 状态刷新间隔（秒）
-	LogFile         string // monitor 附加展示的日志文件路径
-	JournalService  string // monitor 附加展示的 systemd 服务名（journalctl -u）
-	LogLines        int    // monitor 展示的最近日志行数
-	ModelsRefresh   int    // 官方模型目录刷新间隔（分钟），0 关闭
-	ProbeModels     string // probe 专用：逗号分隔的模型列表
-	ProbeLimit      int    // probe 专用：未显式指定模型时的取用数量
-	HttpClient      *http.Client
+	Addr               string
+	Port               int
+	AuthFile           string
+	AuthDir            string
+	AuthExplicit       bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
+	LoginIntl          bool // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
+	APIKey             string
+	ProxyURL           string
+	Verbose            bool
+	DebugEnabled       bool   // 仅由工作目录 config.json 的 debug.enabled 控制
+	ReloadInterval     int    // 账号池热加载扫描间隔（秒），0 关闭
+	MonitorInterval    int    // monitor 状态刷新间隔（秒）
+	LogFile            string // monitor 附加展示的日志文件路径
+	JournalService     string // monitor 附加展示的 systemd 服务名（journalctl -u）
+	LogLines           int    // monitor 展示的最近日志行数
+	ModelsRefresh      int    // 官方模型目录刷新间隔（分钟），0 关闭
+	DisablePriceProbes bool   // 禁止后台价格探测，不影响客户端请求及显式 probe 命令
+	ProbeModels        string // probe 专用：逗号分隔的模型列表
+	ProbeLimit         int    // probe 专用：未显式指定模型时的取用数量
+	HttpClient         *http.Client
 }
 
 // Account 表示一个 CodeBuddy 账号凭据及其运行时状态。
@@ -499,6 +500,7 @@ func main() {
 	fs.StringVar(&cfg.JournalService, "journal", "", "monitor 附加跟随的 systemd 服务名（Linux 下用 journalctl -u <服务> -f 跟随）")
 	fs.IntVar(&cfg.LogLines, "lines", 15, "monitor 每次刷新展示的最近日志行数")
 	fs.IntVar(&cfg.ModelsRefresh, "models-refresh", 60, "模型目录刷新间隔（分钟），0 关闭（实时接口 + npm 合并）")
+	fs.BoolVar(&cfg.DisablePriceProbes, "disable-price-probes", false, "禁止后台自动价格探测，不影响正常模型请求")
 	fs.StringVar(&cfg.ProbeModels, "models", "", "probe 专用：逗号分隔的待探测模型（默认取目录前几个）")
 	fs.IntVar(&cfg.ProbeLimit, "limit", 5, "probe 专用：未指定 -models 时探测的模型数量上限")
 	_ = fs.Parse(args)
@@ -607,6 +609,9 @@ func printHelp() {
   -models-refresh <min>
                     模型目录刷新间隔（默认 60 分钟，0 关闭）
                     （目录来源：实时接口 + npm 静态包，合并去重）
+  -disable-price-probes
+                    关闭后台自动价格探测，避免主动生成模型请求；
+                    不影响客户端请求、目录刷新及显式 probe 命令
 
 probe 选项:
   -auth <path>      只探测指定凭据文件（文件名或路径均可）；默认探测全部账号

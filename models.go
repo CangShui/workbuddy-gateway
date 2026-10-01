@@ -872,6 +872,10 @@ func modelsRefreshLoop(interval time.Duration) {
 // modelPriceProbeLoop 周期性执行价格探测。
 // 首轮在启动后很快执行；只要仍有待探测模型就用较短间隔追赶，收敛后回到长间隔。
 func modelPriceProbeLoop() {
+	if cfg.DisablePriceProbes {
+		log.Printf("[ModelPrice] 阶段=自动探测调度 结果=已关闭 原因=指定-disable-price-probes 业务影响=不会自动请求模型，客户端请求和显式probe不受影响")
+		return
+	}
 	timer := time.NewTimer(modelPriceProbeStartDelay)
 	defer timer.Stop()
 	for {

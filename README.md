@@ -87,6 +87,7 @@ workbuddy-gateway [command] [options]
 | `-intl` | `false` | 仅 `login` 生效：登录国际站 |
 | `-reload-interval <sec>` | `5` | 凭据热加载扫描间隔，`0` 关闭 |
 | `-models-refresh <min>` | `60` | 模型目录刷新间隔，`0` 关闭 |
+| `-disable-price-probes` | `false` | 禁止后台自动价格探测，避免自动发起模型生成请求；不影响客户端请求及显式 `probe` 命令 |
 
 ### JSON 调试日志
 
