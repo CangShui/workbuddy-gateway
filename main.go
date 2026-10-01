@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	version = "1.13.7"
+	version = "1.13.8"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -2978,8 +2978,9 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 			traceID = uuid.NewString()
 		}
 		w.Header().Set("X-Trace-ID", traceID)
+		// 普通落盘审计也需要稳定的 TraceID / requestID；不能依赖可选 JSON 日志。
+		ensureDebugRequestContext(r, traceID, start)
 		if debugLoggingEnabled() {
-			ensureDebugRequestContext(r, traceID, start)
 			debugEvent(r, "info", "request_received", map[string]any{
 				"message": "请求已进入网关，准备执行中间件与路由处理",
 			})
@@ -3319,7 +3320,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 会话结构归一化：保证首条消息为 system，修复部分非 harness 客户端
 	//（以 assistant / tool 续写或回传工具结果）触发的上游 11128 错误
-	ensureLeadingSystemMessage(reqObj)
+	prepareSystemPromptForUpstream(reqObj, r, reqID, w.Header().Get("X-Trace-ID"))
 	repairReport := repairToolMessageSequence(reqObj)
 	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
 	// 11155 防护：与 Responses 入口共用出站推理历史回填，不伪造思维链正文。
@@ -3585,21 +3586,23 @@ func sanitizeMessages(obj map[string]any) {
 //  2. 首条是 developer（OpenAI 新版 system 别名）：重命名为 system；
 //  3. 后续存在 system/developer：提升到首位（developer 归一化为 system），其余保持原序；
 //  4. 其余情况（user / assistant / tool 开头且无 system）：在最前注入一条保底 system。
-func ensureLeadingSystemMessage(obj map[string]any) {
+//
+// 返回值只表示本次是否注入了保底 system，用于不记录提示词正文的审计日志。
+func ensureLeadingSystemMessage(obj map[string]any) bool {
 	messages, ok := obj["messages"].([]any)
 	if !ok || len(messages) == 0 {
-		obj["messages"] = []any{map[string]any{"role": "system", "content": defaultSystemPrompt}}
-		return
+		obj["messages"] = []any{map[string]any{"role": "system", "content": configuredFallbackSystemPrompt()}}
+		return true
 	}
 
 	switch roleOfMessage(messages[0]) {
 	case "system":
-		return
+		return false
 	case "developer":
 		if msg, ok := messages[0].(map[string]any); ok {
 			msg["role"] = "system"
 		}
-		return
+		return false
 	}
 
 	// 后续存在 system/developer：提升到首位，其余保持原序
@@ -3614,15 +3617,16 @@ func ensureLeadingSystemMessage(obj map[string]any) {
 			reordered = append(reordered, messages[:i]...)
 			reordered = append(reordered, messages[i+1:]...)
 			obj["messages"] = reordered
-			return
+			return false
 		}
 	}
 
 	// 无任何 system：在最前注入保底 system（兼容国内站/国际站）
 	injected := make([]any, 0, len(messages)+1)
-	injected = append(injected, map[string]any{"role": "system", "content": defaultSystemPrompt})
+	injected = append(injected, map[string]any{"role": "system", "content": configuredFallbackSystemPrompt()})
 	injected = append(injected, messages...)
 	obj["messages"] = injected
+	return true
 }
 
 // roleOfMessage 读取消息的 role 字段并归一化为小写去空格；非法结构返回空串。

@@ -41,7 +41,10 @@ func withAnthropicErrFormat(ctx context.Context) context.Context {
 // writeUpstreamError 是 upstreamChat / 鉴权中间件的统一错误出口：
 // 请求来自 /v1/messages 时回 Anthropic 形状，否则回 OpenAI 形状。
 func writeUpstreamError(w http.ResponseWriter, r *http.Request, statusCode int, errType, message string) {
-	if r.Context().Value(anthropicErrFmtKey{}) == true {
+	// 鉴权发生在 handler 之前，此时还没有协议标记；精确匹配两个
+	// Anthropic 路由，避免错误响应退回 OpenAI 形状或误伤其他接口。
+	if r.Context().Value(anthropicErrFmtKey{}) == true ||
+		r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/messages/count_tokens" {
 		writeAnthropicError(w, statusCode, anthropicErrType(errType), message)
 		return
 	}
@@ -49,6 +52,8 @@ func writeUpstreamError(w http.ResponseWriter, r *http.Request, statusCode int, 
 }
 
 func writeAnthropicError(w http.ResponseWriter, statusCode int, errType, message string) {
+	log.Printf("[请求失败] traceId=%s 协议=Anthropic 状态码=%d 错误类型=%s 结果=已返回错误，未作为成功响应 说明=错误详情仅返回调用方，日志不记录请求正文",
+		w.Header().Get("X-Trace-ID"), statusCode, errType)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -136,7 +141,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	applyThinkingRules(chatReq, modelName)
 	sanitizeMessages(chatReq)
-	ensureLeadingSystemMessage(chatReq)
+	prepareSystemPromptForUpstream(chatReq, r, reqID, w.Header().Get("X-Trace-ID"))
 	repairReport := repairToolMessageSequence(chatReq)
 	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
 	// 与 Chat / Responses 入口共用同一套 DeepSeek 多轮推理历史回填规则。
@@ -148,7 +153,12 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[#%d] POST /v1/messages -> Upstream [Model: %s, Stream: %v]", reqID, modelName, isStream)
+	debugEvent(r, "info", "messages_request_converted", map[string]any{
+		"upstream_bytes":  len(upstreamBytes),
+		"business_impact": "Anthropic请求已转换并执行提示词、工具序列及推理历史规则，准备调用上游",
+	})
+	log.Printf("[协议转换] traceId=%s requestId=%d 入口=/v1/messages 模型=%s 流式=%t 上游请求字节=%d 结果=已转换并应用统一规则，未记录提示词正文",
+		w.Header().Get("X-Trace-ID"), reqID, modelName, isStream, len(upstreamBytes))
 
 	resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime)
 	if !ok {
@@ -896,7 +906,7 @@ func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.R
 	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	debugEvent(r, "info", "stream_response_completed", map[string]any{"status_code": http.StatusOK})
-	log.Printf("[#%d] Messages 流式输出完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
+	log.Printf("[响应完成] traceId=%s requestId=%d Messages流式输出完成 账号=%s 站点=%s 耗时=%v 首字=%v", debugTraceID(r), reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
 }
 
 // writeMessagesAggregate 本地聚合上游流式数据，输出完整 Anthropic Message。
@@ -938,7 +948,7 @@ func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.R
 		"status_code":    http.StatusOK,
 		"response_bytes": len(out),
 	})
-	log.Printf("[#%d] Messages 非流式响应完成 (账号 %s [%s], 耗时 %v)", reqID, acc.Path, prof.Label, time.Since(startTime))
+	log.Printf("[响应完成] traceId=%s requestId=%d Messages非流式响应完成 账号=%s 站点=%s 耗时=%v", debugTraceID(r), reqID, acc.Path, prof.Label, time.Since(startTime))
 }
 
 // handleCountTokens 处理 POST /v1/messages/count_tokens。
@@ -948,20 +958,32 @@ func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusMethodNotAllowed, "api_error", "仅支持 POST 请求")
 		return
 	}
+	readStarted := debugBodyReadStarted(r)
 	bodyBytes, err := io.ReadAll(r.Body)
+	readDuration := debugElapsedSince(readStarted)
 	if err != nil {
+		debugBodyReadFailed(r, bodyBytes, readStarted, err)
 		writeAnthropicError(w, http.StatusBadRequest, "api_error", "读取请求体失败")
 		return
 	}
 	defer r.Body.Close()
 	var msgReq map[string]any
-	if err := json.Unmarshal(bodyBytes, &msgReq); err != nil {
+	decodeStarted := time.Now()
+	err = json.Unmarshal(bodyBytes, &msgReq)
+	debugBodyReadCompleted(r, bodyBytes, readDuration, time.Since(decodeStarted), err == nil, err)
+	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "无效的 JSON 请求体")
 		return
 	}
+	tokens := estimateAnthropicInputTokens(msgReq)
+	debugEvent(r, "info", "tokens_estimated_locally", map[string]any{
+		"input_tokens": tokens, "business_impact": "仅估算客户端输入，不调用上游、不消耗账号额度，不含网关注入的提示词",
+	})
+	log.Printf("[Token估算] traceId=%s requestId=%d 输入字节=%d 估算token=%d 结果=仅本地估算客户端输入，不含网关注入提示词，未调用上游",
+		w.Header().Get("X-Trace-ID"), requestIDFor(r), len(bodyBytes), tokens)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"input_tokens": estimateAnthropicInputTokens(msgReq),
+		"input_tokens": tokens,
 	})
 }
 

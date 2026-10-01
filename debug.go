@@ -25,6 +25,11 @@ import (
 const runtimeConfigFile = "config.json"
 
 type runtimeFileConfig struct {
+	// SystemPrompt 控制保底文本及实验性全局强制前缀。空值均保持旧行为。
+	SystemPrompt struct {
+		Fallback string `json:"fallback"`
+		Force    string `json:"force"`
+	} `json:"systemPrompt"`
 	Debug struct {
 		Enabled bool `json:"enabled"`
 	} `json:"debug"`
@@ -88,6 +93,7 @@ func loadRuntimeConfig(path string) error {
 	if errors.Is(err, os.ErrNotExist) {
 		setModelFilter(nil, nil)
 		_ = setModelAccountFilter(nil)
+		setSystemPromptConfig("", "")
 		return nil
 	}
 	if err != nil {
@@ -111,6 +117,7 @@ func loadRuntimeConfig(path string) error {
 	if err := setModelAccountFilter(fileCfg.Models.Accounts); err != nil {
 		return fmt.Errorf("解析模型账号名单 %s: %w", path, err)
 	}
+	setSystemPromptConfig(fileCfg.SystemPrompt.Fallback, fileCfg.SystemPrompt.Force)
 
 	// 上游超时覆盖：仅当配置为正数时生效，否则保持内置默认值。
 	upstreamHeaderTimeout = upstreamHeaderTimeoutDefault

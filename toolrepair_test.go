@@ -319,6 +319,8 @@ func captureUpstreamMessages(t *testing.T, route, requestBody string) []any {
 	rec := httptest.NewRecorder()
 	if route == "/v1/responses" {
 		requestAuditMiddleware(http.HandlerFunc(handleResponses)).ServeHTTP(rec, req)
+	} else if route == "/v1/messages" {
+		requestAuditMiddleware(http.HandlerFunc(handleMessages)).ServeHTTP(rec, req)
 	} else {
 		requestAuditMiddleware(http.HandlerFunc(handleChatCompletions)).ServeHTTP(rec, req)
 	}

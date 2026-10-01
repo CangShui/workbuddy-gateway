@@ -87,7 +87,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	applyThinkingRules(chatReq, modelName)
 	sanitizeMessages(chatReq)
-	ensureLeadingSystemMessage(chatReq)
+	prepareSystemPromptForUpstream(chatReq, r, reqID, w.Header().Get("X-Trace-ID"))
 	repairReport := repairToolMessageSequence(chatReq)
 	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
 	// 与 Chat 原生入口共用同一套 DeepSeek 多轮推理历史回填规则。

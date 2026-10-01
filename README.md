@@ -102,6 +102,30 @@ workbuddy-gateway [command] [options]
 
 开启后，网关把单行 JSON 写入 `logs/debug-YYYY-MM-DD.jsonl`；普通运行日志仍写入原来的 `logs/gateway-YYYY-MM-DD.log`，两者互不替代。可复制 `config.example.json` 作为起点。
 
+### 配置系统提示词
+
+工作目录 `config.json` 的 `systemPrompt` 段有两个独立选项（修改后需重启 `serve`）：
+
+```json
+{
+  "systemPrompt": {
+    "fallback": "",
+    "force": ""
+  }
+}
+```
+
+| 配置 | 空值的默认行为 | 非空时的行为 |
+|---|---|---|
+| `fallback` | 继续使用 `You are a helpful assistant.` | **仅在客户端没有任何 system 时**，替换网关注入的保底提示词；已有 system 不变 |
+| `force` | 不启用；请求提示词完全按原规则处理 | **实验功能**：在 Chat、Responses、Anthropic Messages 三个入口的首条 system 内容之前加上配置文本；原 system 内容仍保留 |
+
+例如 `{"systemPrompt":{"fallback":"你是一个助手。","force":"请用中文回答。"}}`：客户端没有 system 时，发往上游的是 `请用中文回答。\n\n你是一个助手。`；客户端自带 system 时，发往上游的是 `请用中文回答。\n\n<客户端原 system>`。配置值仅支持 JSON 字符串；空串或全空白视为未配置。不会写出或替换客户端的 user、assistant、tool 消息，也不改变账号选择。普通日志和 JSON 调试日志只记录规则分支与字符数，**不记录提示词正文**。
+
+> **实验功能风险自负：** `force` 可能与客户端的 system 指令冲突、改变模型行为、增加 token 消耗，或触发上游内容/参数校验。需要回退时将 `force` 改回 `""` 并重启；建议先在测试会话验证，切勿在配置中写入密码、密钥或个人隐私。`config.json` 已被 Git 忽略，不要将真实配置提交到仓库。
+
+`/v1/messages/count_tokens` 仅对客户端提供的内容做本地近似估算，不调用上游，也不计入网关随后注入的 `fallback` / `force` 文本；最终消耗以模型返回的 usage 为准。
+
 ### 模型黑白名单
 
 `config.json` 的 `models` 段可按模型名启用黑白名单（大小写与首尾空白不敏感）：
