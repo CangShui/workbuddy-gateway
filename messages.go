@@ -219,6 +219,23 @@ func anthropicToChatRequest(body map[string]any, modelName string) (map[string]a
 	}
 	if tc, ok := body["tool_choice"].(map[string]any); ok {
 		chat["tool_choice"] = convertAnthropicToolChoice(tc)
+		if name := strOf(tc["name"]); name != "" {
+			// 实际上游的 tool_choice 只接受字符串，不能发送 OpenAI 的
+			// function 对象。仅暴露指定工具并设 required，保留强制选定语义。
+			var selected []any
+			tools, _ := chat["tools"].([]any)
+			for _, item := range tools {
+				tool, _ := item.(map[string]any)
+				fn, _ := tool["function"].(map[string]any)
+				if strOf(fn["name"]) == name {
+					selected = append(selected, item)
+				}
+			}
+			if len(selected) == 0 {
+				return nil, fmt.Errorf("tool_choice 指定的工具未在 tools 中定义")
+			}
+			chat["tools"] = selected
+		}
 	} else if tc, ok := body["tool_choice"].(string); ok {
 		chat["tool_choice"] = tc
 	}
@@ -481,11 +498,11 @@ func convertAnthropicTools(tools []any) []any {
 	return out
 }
 
-// convertAnthropicToolChoice 将 Anthropic tool_choice 转为 chat 格式。
-// 带工具名时锁定该函数（any/tool/auto 都适用）；否则 auto/any -> auto/required。
+// convertAnthropicToolChoice 转为上游实际接受的字符串枚举。
+// 带工具名时由调用方筛选工具列表，再使用 required 强制调用。
 func convertAnthropicToolChoice(tc map[string]any) any {
 	if name := strOf(tc["name"]); name != "" {
-		return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+		return "required"
 	}
 	switch strings.ToLower(strOf(tc["type"])) {
 	case "none":

@@ -135,6 +135,32 @@ func TestAnthropicRequestOptions(t *testing.T) {
 	}
 }
 
+func TestAnthropicNamedToolChoiceUsesUpstreamString(t *testing.T) {
+	var body map[string]any
+	if err := json.Unmarshal([]byte(`{
+		"messages":[{"role":"user","content":"call lookup"}],
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}},{"name":"other","input_schema":{"type":"object"}}],
+		"tool_choice":{"type":"tool","name":"lookup"}
+	}`), &body); err != nil {
+		t.Fatal(err)
+	}
+	chat, err := anthropicToChatRequest(body, "deepseek-v4.1-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chat["tool_choice"] != "required" {
+		t.Fatalf("upstream requires a string tool_choice: %#v", chat["tool_choice"])
+	}
+	tools := chat["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["function"].(map[string]any)["name"] != "lookup" {
+		t.Fatalf("named choice must only expose the selected tool: %#v", tools)
+	}
+	body["tool_choice"] = map[string]any{"type": "tool", "name": "missing"}
+	if _, err := anthropicToChatRequest(body, "deepseek-v4.1-flash"); err == nil {
+		t.Fatal("undefined named tool must be rejected before contacting upstream")
+	}
+}
+
 const messagesTestSSE = `data: {"model":"m","choices":[{"delta":{"reasoning_content":"分析"},"finish_reason":""}]}
 
 data: {"choices":[{"delta":{"content":"结果"},"finish_reason":null}]}
