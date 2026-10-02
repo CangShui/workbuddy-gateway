@@ -38,10 +38,21 @@ func chdirTemp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chdir(t.TempDir()); err != nil {
+	// 不使用 t.TempDir()：它的清理时机与「切回原工作目录」的相对顺序无法保证，
+	// 而 Windows 不允许删除仍是当前工作目录的目录，顺序错了会留下无效 cwd，
+	// 进而让后续测试的 os.Getwd/os.Chdir 全部失效。
+	dir, err := os.MkdirTemp("", "workbuddy-test-cwd-")
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chdir(old) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// 必须在同一个清理里先恢复工作目录、再删除，顺序不能颠倒。
+		_ = os.Chdir(old)
+		_ = os.RemoveAll(dir)
+	})
 }
 
 // 验证 429 消息中的重置时间解析
@@ -628,7 +639,8 @@ func TestNextAccountAllDisabled(t *testing.T) {
 	t.Logf("all-disabled error: %v", err)
 }
 
-// 验证 disableAccount：标记失效、删除凭据文件、写入失效标记文件
+// 验证 disableAccount：停止调度并写入失效标记。
+// 删除凭据需要「只读校验明确确认不可用」，测试环境没有 HTTP 客户端时应保守保留文件。
 func TestDisableAccount(t *testing.T) {
 	dir := t.TempDir()
 	authPath := dir + "/workbuddy-test.json"
@@ -654,9 +666,9 @@ func TestDisableAccount(t *testing.T) {
 	if reason == "" {
 		t.Fatal("disabled reason should be recorded")
 	}
-	// 凭据文件应被删除
-	if _, err := os.Stat(authPath); !os.IsNotExist(err) {
-		t.Fatalf("credential file should be deleted, stat err=%v", err)
+	// 无法确认凭据失效时必须保留文件：删除不可逆，误删只能重新登录。
+	if _, err := os.Stat(authPath); err != nil {
+		t.Fatalf("无法确认凭据失效时应保留凭据文件, stat err=%v", err)
 	}
 	// 失效标记文件应存在
 	if _, err := os.Stat(markerPath(authPath)); err != nil {

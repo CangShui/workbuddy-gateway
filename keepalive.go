@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -132,27 +131,24 @@ func formatKeepaliveHours(hours []int) string {
 // jwtExpiry 从 JWT 载荷读取 exp，仅用于展示与到期预警，不做签名校验。
 // 手工导入的凭据也能借此看到刷新令牌的到期时间。
 func jwtExpiry(token string) (time.Time, bool) {
-	parts := strings.Split(strings.TrimSpace(token), ".")
-	if len(parts) != 3 {
+	claims := jwtClaims(token)
+	if claims == nil {
 		return time.Time{}, false
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
-	if err != nil {
-		return time.Time{}, false
+	switch v := claims["exp"].(type) {
+	case float64:
+		if v <= 0 {
+			return time.Time{}, false
+		}
+		return time.Unix(int64(v), 0), true
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil || n <= 0 {
+			return time.Time{}, false
+		}
+		return time.Unix(n, 0), true
 	}
-	var claims struct {
-		Exp json.Number `json:"exp"`
-	}
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.UseNumber()
-	if err := dec.Decode(&claims); err != nil {
-		return time.Time{}, false
-	}
-	n, err := claims.Exp.Int64()
-	if err != nil || n <= 0 {
-		return time.Time{}, false
-	}
-	return time.Unix(n, 0), true
+	return time.Time{}, false
 }
 
 // refreshTokenExpiry 返回刷新令牌到期时间：优先用续期时记录的字段，
@@ -338,6 +334,8 @@ func formatRenewalStatus(acc *Account) string {
 	}
 	if acc.RefreshFailCount > 0 {
 		sb.WriteString(fmt.Sprintf("续期失败:     连续 %d 次，最近原因=%s\n", acc.RefreshFailCount, acc.LastRefreshError))
+	} else if acc.LastRefreshError != "" {
+		sb.WriteString(fmt.Sprintf("续期告警:     %s\n", acc.LastRefreshError))
 	}
 	return sb.String()
 }

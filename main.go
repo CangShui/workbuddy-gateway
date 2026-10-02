@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	version = "1.13.11"
+	version = "1.13.12"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -1350,6 +1350,7 @@ func disableAccount(acc *Account, reason string) {
 	nickname := ""
 	uid := ""
 	edition := ""
+	var authSnapshot *StoredAuth
 	if acc.Auth != nil {
 		nickname = acc.Auth.Account.Nickname
 		uid = acc.Auth.Account.UID
@@ -1357,6 +1358,8 @@ func disableAccount(acc *Account, reason string) {
 		acc.Nickname = nickname
 		acc.UID = uid
 		acc.Edition = edition
+		copied := *acc.Auth
+		authSnapshot = &copied
 	}
 	accountMu.Unlock()
 
@@ -1375,11 +1378,17 @@ func disableAccount(acc *Account, reason string) {
 		}
 	}
 
-	// 删除失效的凭据文件，方便用户下次重新登录
+	// 删除凭据前先做一次只读校验：删除不可逆，只有确认凭据真的不可用才销毁。
+	if keep, note := credentialStillUsableForDelete(authSnapshot); keep {
+		log.Printf("[Auth] 账号 %s 已停止调度；%s；凭据文件保留在 %s（如需彻底移除请手动删除），重新登录会自动覆盖",
+			path, note, path)
+		writeStatusSnapshot()
+		return
+	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		log.Printf("[Auth] 账号 %s 凭据文件删除失败: %v", path, err)
 	}
-	log.Printf("[Auth] 账号 %s 授权失效，已禁止调度并删除凭据文件: %s", path, reason)
+	log.Printf("[Auth] 账号 %s 授权失效，已禁止调度并删除凭据文件（删除前只读校验确认不可用）: %s", path, reason)
 	writeStatusSnapshot()
 }
 
@@ -1437,15 +1446,32 @@ func loadDisabledMarkers() {
 		if err := json.Unmarshal(data, &m); err != nil {
 			continue
 		}
-		// 避免与已加载的有效账号重复
-		dup := false
-		for _, a := range accounts {
-			if a.Path == m.Path {
-				dup = true
-				break
+		// 凭据文件比标记更新，说明用户已重新登录或手动续期，旧标记已过期。
+		if fi, statErr := os.Stat(m.Path); statErr == nil {
+			if mi, mErr := os.Stat(mp); mErr == nil && fi.ModTime().After(mi.ModTime()) {
+				log.Printf("[Auth] 账号 %s 凭据文件比失效标记更新，视为已重新登录，清除失效标记", m.Path)
+				_ = os.Remove(mp)
+				continue
 			}
 		}
-		if dup {
+		// 凭据文件仍在时，标记负责把该账号重新置为失效（保留文件是为了可恢复）。
+		applied := false
+		for _, a := range accounts {
+			if a.Path != m.Path {
+				continue
+			}
+			a.Disabled = true
+			a.DisabledReason = m.Reason
+			if a.Nickname == "" {
+				a.Nickname = m.Nickname
+			}
+			if a.UID == "" {
+				a.UID = m.UID
+			}
+			applied = true
+			break
+		}
+		if applied {
 			continue
 		}
 		accounts = append(accounts, &Account{
@@ -1639,6 +1665,7 @@ func refreshAccountToken(acc *Account, reason string) error {
 		return fmt.Errorf("无法刷新：账号缺少 RefreshToken 或已失效")
 	}
 	refreshed := *acc.Auth
+	oldTokens := refreshed.Auth // 覆盖前校验要比对旧凭据，先留存副本。
 	path := acc.Path
 	oldExpiresAt := refreshed.Auth.ExpiresAt
 	accountMu.Unlock()
@@ -1661,6 +1688,15 @@ func refreshAccountToken(acc *Account, reason string) error {
 			log.Printf("[Auth] 账号 %s Token 刷新失败，旧凭据未覆盖；连续失败=%d/%d 判定=%s 业务影响=本次未续期，账号仍可用到访问令牌过期，稍后自动重试",
 				path, count, refreshDisableThreshold, summary)
 		}
+		return err
+	}
+	// 覆盖前校验：新凭据必须仍属于同一账号且确实可用，否则保留旧凭据不覆盖。
+	if err := validateRefreshedCredential(&refreshed, oldTokens); err != nil {
+		accountMu.Lock()
+		acc.LastRefreshError = "新凭据未通过覆盖前校验: " + err.Error()
+		accountMu.Unlock()
+		log.Printf("[Auth] 账号 %s 新凭据未通过覆盖前校验，已放弃本次覆盖并保留原凭据；原因=%v 业务影响=账号继续使用原凭据，不销毁、不降级",
+			path, err)
 		return err
 	}
 	if err := saveAuthTo(path, &refreshed); err != nil {

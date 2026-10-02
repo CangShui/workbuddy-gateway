@@ -137,6 +137,11 @@ func refreshTestServer(t *testing.T, handler func(call int) (int, string)) *http
 	t.Helper()
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 覆盖前的只读校验会打到同一个站点，返回「可用」让测试聚焦刷新逻辑本身。
+		if r.URL.Path == "/billing/meter/get-user-resource-summary" {
+			_, _ = w.Write([]byte(`{"code":0,"data":{"Packages":[]}}`))
+			return
+		}
 		calls++
 		if r.URL.Path != "/v2/plugin/auth/token/refresh" {
 			t.Errorf("非预期路径: %s", r.URL.Path)
