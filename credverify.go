@@ -101,9 +101,13 @@ func verifyAccountUsable(ctx context.Context, auth StoredAuth) (bool, error) {
 //  2. 新访问令牌必须能取到账号数据，防止用「接口 200 但实际不可用」的凭据覆盖掉还能用的旧凭据。
 //
 // 校验接口本身不可用时按通过处理，避免因为校验抖动而拒绝掉有效的新凭据。
-func validateRefreshedCredential(refreshed *StoredAuth, oldTokens StoredTokens) error {
+func validateRefreshedCredential(path string, refreshed *StoredAuth, oldTokens StoredTokens) error {
 	oldID, oldRealm := credentialIdentity(oldTokens)
 	newID, newRealm := credentialIdentity(refreshed.Auth)
+	identityNote := "凭据未携带可解析的账号声明，跳过一致性比对"
+	if newID != "" {
+		identityNote = fmt.Sprintf("账号标识=%s 站点=%s 与旧凭据一致", shortID(newID), newRealm)
+	}
 	if oldID != "" && newID != "" && oldID != newID {
 		return fmt.Errorf("新凭据账号标识与旧凭据不一致（%s -> %s），拒绝覆盖",
 			shortID(oldID), shortID(newID))
@@ -116,12 +120,17 @@ func validateRefreshedCredential(refreshed *StoredAuth, oldTokens StoredTokens) 
 	defer cancel()
 	usable, err := verifyAccountUsable(ctx, *refreshed)
 	if err != nil {
-		log.Printf("[凭据校验] 阶段=覆盖前校验 结果=无法判定，按通过处理 原因=%v 说明=刷新接口已成功，不因校验抖动丢弃新凭据", err)
+		log.Printf("[凭据校验] 账号=%s 阶段=覆盖前校验 结果=无法判定，按通过处理 一致性=%s 原因=%v 说明=刷新接口已成功，不因校验抖动丢弃新凭据",
+			path, identityNote, err)
 		return nil
 	}
 	if !usable {
+		log.Printf("[凭据校验] 账号=%s 阶段=覆盖前校验 结果=不通过 一致性=%s 原因=新访问令牌取不到账号数据 业务影响=放弃本次覆盖，保留旧凭据继续使用",
+			path, identityNote)
 		return fmt.Errorf("新凭据取不到账号数据，拒绝覆盖旧凭据")
 	}
+	log.Printf("[凭据校验] 账号=%s 阶段=覆盖前校验 结果=通过 一致性=%s 只读校验=新访问令牌可取到账号数据 说明=允许覆盖旧凭据",
+		path, identityNote)
 	return nil
 }
 

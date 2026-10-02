@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -140,6 +142,40 @@ func TestRefreshCommitsOnlyVerifiedCredential(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// 覆盖前校验必须在日志里可见，否则生产上无法确认它真的执行过。
+func TestOverwriteVerificationIsObservable(t *testing.T) {
+	chdirTemp(t)
+	credTestServer(t, "new-refresh", "user-A", 200, `{"code":0,"data":{"Packages":[]}}`)
+	acc := newVerifiedTestAccount(t, "user-A")
+	var buf bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(oldWriter)
+
+	if err := refreshAccountToken(acc, "单元测试"); err != nil {
+		t.Fatal(err)
+	}
+	log.SetOutput(oldWriter)
+	out := buf.String()
+	for _, want := range []string{"阶段=覆盖前校验", "结果=通过", "与旧凭据一致", "允许覆盖旧凭据"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("覆盖前校验缺少可观测日志 %q:\n%s", want, out)
+		}
+	}
+	// 拒绝覆盖时也必须留下原因。
+	credTestServer(t, "new-refresh", "user-B", 200, `{"code":0,"data":{"Packages":[]}}`)
+	acc2 := newVerifiedTestAccount(t, "user-A")
+	buf.Reset()
+	log.SetOutput(&buf)
+	if err := refreshAccountToken(acc2, "单元测试"); err == nil {
+		t.Fatal("账号不一致时应拒绝覆盖")
+	}
+	log.SetOutput(oldWriter)
+	if !strings.Contains(buf.String(), "账号标识与旧凭据不一致") {
+		t.Fatalf("拒绝覆盖应说明原因:\n%s", buf.String())
 	}
 }
 

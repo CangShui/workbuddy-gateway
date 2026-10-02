@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	version = "1.13.12"
+	version = "1.13.13"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -1691,7 +1691,7 @@ func refreshAccountToken(acc *Account, reason string) error {
 		return err
 	}
 	// 覆盖前校验：新凭据必须仍属于同一账号且确实可用，否则保留旧凭据不覆盖。
-	if err := validateRefreshedCredential(&refreshed, oldTokens); err != nil {
+	if err := validateRefreshedCredential(path, &refreshed, oldTokens); err != nil {
 		accountMu.Lock()
 		acc.LastRefreshError = "新凭据未通过覆盖前校验: " + err.Error()
 		accountMu.Unlock()
