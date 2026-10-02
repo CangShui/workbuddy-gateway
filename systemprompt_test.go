@@ -115,3 +115,31 @@ func TestSystemPromptConfigurationReachesMessages(t *testing.T) {
 		})
 	}
 }
+
+// TestForcedPromptIsPrependedBeforeClientSystem 固定「强制提示词在前、客户端原文在后」这一契约。
+//
+// 这条顺序直接决定冲突时的实际效果：网关只发送一条 system 消息，内容形如
+// 「<强制文本>\n\n<客户端自己的系统提示词>」。客户端自己的身份类指令排在后面，
+// 且通常长得多、具体得多，因此当两者冲突时，客户端的指令往往更有影响力。
+// 这不是优先级字段，而是同一段文本里的先后与详略差异。
+func TestForcedPromptIsPrependedBeforeClientSystem(t *testing.T) {
+	withSystemPrompts(t, "", "【强制前缀】")
+	body := `{"model":"m","stream":true,"messages":[{"role":"system","content":"【客户端自己的系统提示词】"},{"role":"user","content":"hi"}]}`
+	messages := captureUpstreamMessages(t, "/v1/chat/completions", body)
+	content, ok := messages[0].(map[string]any)["content"].(string)
+	if !ok {
+		t.Fatalf("system 内容应为字符串: %#v", messages[0])
+	}
+	forcedAt := strings.Index(content, "【强制前缀】")
+	clientAt := strings.Index(content, "【客户端自己的系统提示词】")
+	if forcedAt != 0 {
+		t.Fatalf("强制文本应位于 system 内容最前: %q", content)
+	}
+	if clientAt <= forcedAt {
+		t.Fatalf("客户端原文应排在强制文本之后: %q", content)
+	}
+	// 两者之间用空行分隔，保证仍是一条合法 system 消息。
+	if !strings.Contains(content, "【强制前缀】\n\n【客户端自己的系统提示词】") {
+		t.Fatalf("拼接格式变化: %q", content)
+	}
+}
