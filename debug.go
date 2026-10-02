@@ -25,7 +25,7 @@ import (
 const runtimeConfigFile = "config.json"
 
 type runtimeFileConfig struct {
-	// SystemPrompt 控制保底文本及实验性全局强制前缀。空值均保持旧行为。
+	// SystemPrompt 控制保底文本及实验性全局强制文本（后置于 system 末尾）。空值均保持旧行为。
 	SystemPrompt struct {
 		Fallback string `json:"fallback"`
 		Force    string `json:"force"`
