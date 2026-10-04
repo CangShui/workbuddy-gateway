@@ -81,13 +81,54 @@ workbuddy-gateway [command] [options]
 | `-port <port>` | `8317` | 网关监听端口 |
 | `-auth <path>` | 自动发现 | 凭据文件路径，支持逗号分隔多个 |
 | `-auth-dir <dir>` | 空 | 凭据目录，自动加载目录内所有 `workbuddy*.json` |
-| `-api-key <key>` | 空 | 设置后调用网关必须携带 `Authorization: Bearer <key>` |
+| `-api-key <key>` | 空 | 网关密钥；`serve` 必须与 `-api-key-file` 二选一，客户端使用 Bearer 或 `x-api-key` |
+| `-api-key-file <path>` | 空 | 从本地 UTF-8 文件读取网关密钥，避免将密钥放入进程命令行；`probe` 可读取同一文件 |
 | `-proxy <url>` | 空 | 上游请求代理，如 `http://127.0.0.1:7890`、`socks5://...` |
 | `-verbose` | `false` | 输出详细调试日志 |
 | `-intl` | `false` | 仅 `login` 生效：登录国际站 |
 | `-reload-interval <sec>` | `5` | 凭据热加载扫描间隔，`0` 关闭 |
 | `-models-refresh <min>` | `60` | 模型目录刷新间隔，`0` 关闭 |
 | `-disable-price-probes` | `false` | 禁止后台自动价格探测，避免自动发起模型生成请求；不影响客户端请求及显式 `probe` 命令 |
+
+### 网关密钥与启动迁移
+
+`serve`（含默认命令、`run`、`start`）现在必须通过 `-api-key-file` 或 `-api-key` 提供非空密钥；未配置时在初始化网络和账号池之前退出。两项不能同时使用。`login`、`status`、`refresh` 等非服务命令不强制要求网关密钥。
+
+推荐生成随机密钥并保存到工作目录的 `api-key.txt`。不要把下面示例替换成登录账号的访问令牌或刷新令牌。
+
+Windows PowerShell：
+
+```powershell
+$gatewayKeyBytes = New-Object byte[] 32
+$gatewayRandom = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+try { $gatewayRandom.GetBytes($gatewayKeyBytes) } finally { $gatewayRandom.Dispose() }
+$gatewayKeyText = ([System.BitConverter]::ToString($gatewayKeyBytes)).Replace('-', '').ToLowerInvariant()
+[System.IO.File]::WriteAllText((Join-Path (Get-Location) 'api-key.txt'), $gatewayKeyText)
+```
+
+Linux / macOS：
+
+```bash
+umask 077
+openssl rand -hex 32 > api-key.txt
+```
+
+首次生成后，请妥善保存此文件；再次生成会更换密钥，需要同步更新客户端。Windows 还应将密钥、凭据及其所在目录的 NTFS 权限限制为当前用户和 SYSTEM；Go 的 `0600` 文件模式不能代替 Windows ACL，凭据仍是明文 JSON。
+
+启动与主动探测示例：
+
+```bash
+workbuddy-gateway serve -api-key-file ./api-key.txt -disable-price-probes
+workbuddy-gateway probe -api-key-file ./api-key.txt -models hy3
+```
+
+密钥文件最多 4096 字节，读取后去除首尾空白；空文件、读取失败或同时指定两种密钥来源都会报错。客户端填写文件中的密钥值。启动横幅及正常日志不打印密钥正文。
+
+浏览器来源也采用限制策略：仅接受本网关回环地址和端口的 HTTP Origin；其他来源（含 `null` / `file:` 页面）返回 403。原生客户端、SDK 和本机服务不携带 Origin 时可正常使用。回环监听同时校验 Host，拒绝其他主机名或端口。公网网页客户端及保留公网 Host 的反向代理需要据此调整接入方式。
+
+Chat、Responses、Messages 和 count_tokens 的请求体统一限制为 32 MiB，超限返回 413。控制接口响应上限 8 MiB，模型失败响应上限 1 MiB；请求头读取超时 10 秒、空闲连接超时 60 秒、请求头上限 64 KiB。正常模型流仍没有总写入时长限制。
+
+携带凭据的请求禁止跨来源重定向，HTTPS 请求禁止降级到 HTTP；不携带凭据的公共目录可正常进行 HTTPS 重定向。
 
 ### JSON 调试日志
 
@@ -154,13 +195,13 @@ workbuddy-gateway [command] [options]
 
 ```bash
 # 默认每天 22:00 主动续期
-workbuddy-gateway serve
+workbuddy-gateway serve -api-key-file ./api-key.txt
 
 # 每天 10:00 和 22:00 各一次
-workbuddy-gateway serve -keepalive-hours 10,22
+workbuddy-gateway serve -api-key-file ./api-key.txt -keepalive-hours 10,22
 
 # 关闭主动续期，只保留临近过期时的按需刷新
-workbuddy-gateway serve -keepalive-hours ""
+workbuddy-gateway serve -api-key-file ./api-key.txt -keepalive-hours ""
 ```
 
 实现要点：
@@ -186,6 +227,8 @@ workbuddy-gateway serve -keepalive-hours ""
 | 新旧凭据站点一致（`iss` realm） | 防止国内站/国际站凭据互相覆盖 | 同上 |
 | 新访问令牌能取到账号数据 | 防止「接口返回 200 但实际不可用」的凭据覆盖掉还能用的旧凭据 | 同上 |
 
+凭据先完整写入同目录的临时文件，执行 Sync/Close 后再替换正式文件；失败时保留旧文件并清理临时文件。普通 403 作为无法判定处理，只有明确 401 或明确令牌无效信息才用于确认凭据失效。
+
 校验接口自身不可用时按通过处理，不会因为校验抖动而拒绝有效的新凭据。校验失败**不计入**「判定失效」的计数，因此不会把还能用的账号停掉。
 
 **判定失效、准备删除凭据之前：**
@@ -193,7 +236,7 @@ workbuddy-gateway serve -keepalive-hours ""
 1. 先停止调度并写入失效标记；
 2. 再用只读接口确认该凭据确实取不到账号数据，**才**删除文件；
 3. 凭据仍能取到数据 → 保留文件；
-4. 无法判定（网络故障、上游 5xx）→ 保守保留文件。
+4. 无法判定（网络故障、普通 403、上游 5xx）→ 保守保留文件。
 
 凭据文件被保留时，失效标记在重启后依然生效，账号不会被重新调度。如果你重新 `login` 或手动续期了该凭据，凭据文件会比标记更新，网关会自动清除过期标记并恢复该账号。
 
@@ -269,7 +312,7 @@ workbuddy-gateway serve -keepalive-hours ""
 - `declared_body_bytes`、`actual_body_bytes`、`body_read_ms`
 - `body_sha256_prefix`（SHA-256 前 12 位）
 - `json_valid`、`json_decode_ms`
-- `body_limit_bytes`、`body_limit_exceeded`（当前未设置请求体限制，因此分别为 `0`、`false`）
+- `body_limit_bytes`、`body_limit_exceeded`（请求体上限为 32 MiB，是否超限按实际读取结果记录）
 - `read_error_type`、脱敏截断后的 `read_error`
 
 调试日志不会记录 `Authorization`、Cookie、API Key、Access Token、Refresh Token 或完整请求体。只记录是否提供 Authorization，以及凭据的不可逆短哈希 `api_key_fingerprint`。
@@ -282,25 +325,25 @@ workbuddy-gateway serve -keepalive-hours ""
 
 ```bash
 # 默认监听 127.0.0.1:8317，自动加载当前目录下所有 workbuddy*.json
-workbuddy-gateway serve
+workbuddy-gateway serve -api-key-file ./api-key.txt
 
 # 自定义端口与监听地址
-workbuddy-gateway serve -port 9000 -addr 0.0.0.0
+workbuddy-gateway serve -api-key-file ./api-key.txt -port 9000 -addr 0.0.0.0
 
 # 显式指定多个凭据文件（逗号分隔，轮询）
-workbuddy-gateway serve -auth workbuddy.json,workbuddy2.json
+workbuddy-gateway serve -api-key-file ./api-key.txt -auth workbuddy.json,workbuddy2.json
 
 # 目录模式：加载目录内所有 workbuddy*.json
-workbuddy-gateway serve -auth-dir ./auths
+workbuddy-gateway serve -api-key-file ./api-key.txt -auth-dir ./auths
 
 # 上游走代理 + 开启客户端鉴权 + 详细日志
-workbuddy-gateway serve -proxy http://127.0.0.1:7890 -api-key sk-xxx -verbose
+workbuddy-gateway serve -proxy http://127.0.0.1:7890 -api-key-file ./api-key.txt -verbose
 
 # 关闭凭据热加载
-workbuddy-gateway serve -reload-interval 0
+workbuddy-gateway serve -api-key-file ./api-key.txt -reload-interval 0
 
 # 关闭模型目录自动刷新
-workbuddy-gateway serve -models-refresh 0
+workbuddy-gateway serve -api-key-file ./api-key.txt -models-refresh 0
 ```
 
 启动后提供的端点：
@@ -516,16 +559,16 @@ workbuddy-gateway monitor -interval 2 -lines 20
 
 ```bash
 # 探测全部账号，每个账号取模型目录前 5 个模型
-workbuddy-gateway probe
+workbuddy-gateway probe -api-key-file ./api-key.txt
 
 # 只探测指定账号
-workbuddy-gateway probe -auth workbuddy4.json
+workbuddy-gateway probe -api-key-file ./api-key.txt -auth workbuddy4.json
 
 # 指定模型
-workbuddy-gateway probe -auth workbuddy4.json -models hy3,deepseek-v4.1-flash
+workbuddy-gateway probe -api-key-file ./api-key.txt -auth workbuddy4.json -models hy3,deepseek-v4.1-flash
 
 # 指定数量上限（默认 5，上限 50）
-workbuddy-gateway probe -auth workbuddy4.json -limit 8
+workbuddy-gateway probe -api-key-file ./api-key.txt -auth workbuddy4.json -limit 8
 ```
 
 | 选项 | 默认 | 说明 |
@@ -558,7 +601,7 @@ workbuddy4.json        intl   hy3      paid     0.42    820     usage.credit=0.4
 | `skipped` | 账号失效或无凭据 |
 | `error` | 网络 / 协议错误 |
 
-> 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源；服务启用 `-api-key` 时同样需要鉴权。
+> 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源；服务必须启用鉴权；`probe` 使用与服务相同的 `-api-key-file` 或 `-api-key`。
 
 ---
 
@@ -604,14 +647,14 @@ workbuddy-gateway -h         # 同 help
 
 ```bash
 # 方式一（推荐）：自动发现
-# 把多个凭据文件放进工作目录，无需任何参数
-workbuddy-gateway serve
+# 把多个凭据文件放进工作目录，无需逐个指定凭据文件
+workbuddy-gateway serve -api-key-file ./api-key.txt
 
 # 方式二：-auth 逗号分隔
-workbuddy-gateway serve -auth workbuddy.json,workbuddy2.json
+workbuddy-gateway serve -api-key-file ./api-key.txt -auth workbuddy.json,workbuddy2.json
 
 # 方式三：-auth-dir 目录
-workbuddy-gateway serve -auth-dir ./auths
+workbuddy-gateway serve -api-key-file ./api-key.txt -auth-dir ./auths
 ```
 
 行为说明：
@@ -682,15 +725,17 @@ curl：
 ```bash
 curl -N -s http://127.0.0.1:8317/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $(cat ./api-key.txt)" \
   -d '{"model":"hy4-preview","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
 Python OpenAI SDK：
 
 ```python
+from pathlib import Path
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8317/v1", api_key="none")
+client = OpenAI(base_url="http://127.0.0.1:8317/v1", api_key=Path("api-key.txt").read_text().strip())
 resp = client.chat.completions.create(
     model="hy4-preview",
     messages=[{"role": "user", "content": "写一个快速排序"}],
@@ -702,7 +747,7 @@ Claude Code（Anthropic 协议直连，免外部翻译层）：
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
-export ANTHROPIC_API_KEY=你的网关-api-key   # 网关未启用 -api-key 时随意填
+export ANTHROPIC_API_KEY="$(cat ./api-key.txt)"
 claude
 ```
 
@@ -718,7 +763,7 @@ llm-pi-ai:
   providers:
     workbuddy-local:
       baseURL: http://127.0.0.1:8317/v1
-      apiKeyEnv: LOCAL_API_KEY   # 任意字符串即可
+      apiKeyEnv: LOCAL_API_KEY   # 环境变量中填写 api-key.txt 的密钥值
       api: openai-completions
       models:
         - id: hy4-preview
@@ -737,10 +782,10 @@ llm-pi-ai:
 
    ```powershell
    .\workbuddy-gateway-windows-amd64.exe login
-   .\workbuddy-gateway-windows-amd64.exe serve -port 8317
+   .\workbuddy-gateway-windows-amd64.exe serve -api-key-file ./api-key.txt -port 8317
    ```
 
-3. 开机自启：`Win+R` → `shell:startup`，把 exe 快捷方式放入启动文件夹，并在快捷方式“目标”后追加 `serve`。
+3. 开机自启：`Win+R` → `shell:startup`，把 exe 快捷方式放入启动文件夹，并在快捷方式“目标”后追加 `serve -api-key-file <密钥文件绝对路径>`。
 
 ### Linux
 
@@ -754,7 +799,7 @@ wget https://github.com/CangShui/workbuddy-gateway/releases/latest/download/work
 sudo install -m 755 workbuddy-gateway-linux-arm64 /usr/local/bin/workbuddy-gateway
 
 workbuddy-gateway login
-workbuddy-gateway serve -addr 127.0.0.1 -port 8317
+workbuddy-gateway serve -api-key-file ./api-key.txt -addr 127.0.0.1 -port 8317
 ```
 
 #### systemd 服务（推荐）
@@ -770,7 +815,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/workbuddy-gateway
-ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 8317
+ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -api-key-file /opt/workbuddy-gateway/api-key.txt -addr 127.0.0.1 -port 8317
 Restart=on-failure
 RestartSec=5
 User=root
@@ -807,7 +852,7 @@ sudo systemctl disable workbuddy-gateway
 对外开放时（例如局域网其他设备）把 `-addr` 改为 `0.0.0.0`，并**务必**设置 `-api-key`：
 
 ```ini
-ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 8317 -api-key sk-changeme
+ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 8317 -api-key-file /opt/workbuddy-gateway/api-key.txt
 ```
 
 ### macOS
@@ -824,7 +869,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 
    ```bash
    ./workbuddy-gateway-darwin-arm64 login
-   ./workbuddy-gateway-darwin-arm64 serve
+   ./workbuddy-gateway-darwin-arm64 serve -api-key-file ./api-key.txt
    ```
 
 4. 开机自启（launchd）：创建 `~/Library/LaunchAgents/com.workbuddy.gateway.plist`：
@@ -839,6 +884,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
      <array>
        <string>/path/to/workbuddy-gateway-darwin-arm64</string>
        <string>serve</string>
+       <string>-api-key-file</string><string>/path/to/workbuddy-gateway-dir/api-key.txt</string>
        <string>-port</string><string>8317</string>
      </array>
      <key>RunAtLoad</key><true/>
@@ -856,6 +902,8 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 
 ## 安全提示
 
+- 网关 API 密钥与上游登录凭据分别保存；`api-key.txt`、`secrets/` 已被 Git 忽略，其他自定义密钥文件也应排除。
+
 - `workbuddy*.json` 包含真实访问凭据（Access Token / Refresh Token），**严禁提交到 Git 或公开分享**；本仓库 `.gitignore` 已排除。
 - 网关默认只监听 `127.0.0.1`。需要局域网 / 公网访问时改用 `-addr 0.0.0.0` 并配合 `-api-key`，或置于反向代理之后。
 - `/admin/probe` 仅接受回环来源调用。
@@ -865,7 +913,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 
 ## 从源码构建
 
-需要 Go 1.20+：
+需要 Go 1.27.1+：
 
 ```bash
 git clone https://github.com/CangShui/workbuddy-gateway.git

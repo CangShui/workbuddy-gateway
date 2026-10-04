@@ -1,4 +1,6 @@
 # 凭据与敏感数据（切勿提交！）
+api-key.txt
+secrets/
 workbuddy*.json
 workbuddy-console.json
 last-*.json

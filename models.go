@@ -336,13 +336,14 @@ func fetchNPMCatalogVersion() (string, error) {
 			continue
 		}
 		resp, err := cfg.HttpClient.Do(req)
-		cancel()
 		if err != nil {
+			cancel()
 			lastErr = err
 			continue
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		cancel()
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 			continue
@@ -494,7 +495,7 @@ func fetchNPMCatalogTarball(url, file string) ([]catalogModel, error) {
 	}
 	defer gz.Close()
 	want := "package/" + file
-	tr := tar.NewReader(gz)
+	tr := tar.NewReader(io.LimitReader(gz, npmTarballMaxBytes))
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {

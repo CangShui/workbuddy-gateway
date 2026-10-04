@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -38,11 +37,11 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	startTime := requestStartFor(r)
 
 	readStarted := debugBodyReadStarted(r)
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readClientBody(w, r)
 	readDuration := debugElapsedSince(readStarted)
 	if err != nil {
 		debugBodyReadFailed(r, bodyBytes, readStarted, err)
-		writeOpenAIError(w, http.StatusBadRequest, "read_error", "读取请求体失败")
+		writeOpenAIError(w, clientBodyErrorStatus(err), "read_error", "读取请求体失败或超过 32 MiB 上限")
 		return
 	}
 	defer r.Body.Close()

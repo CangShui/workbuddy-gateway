@@ -360,6 +360,7 @@ type Config struct {
 	AuthExplicit       bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
 	LoginIntl          bool // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
 	APIKey             string
+	APIKeyFile         string
 	ProxyURL           string
 	Verbose            bool
 	DebugEnabled       bool   // 仅由工作目录 config.json 的 debug.enabled 控制
@@ -499,7 +500,8 @@ func main() {
 	fs.IntVar(&cfg.Port, "port", 8317, "网关监听端口")
 	fs.StringVar(&cfg.AuthFile, "auth", "workbuddy.json", "凭据存储文件路径（支持逗号分隔多个文件实现多账号）")
 	fs.StringVar(&cfg.AuthDir, "auth-dir", "", "凭据目录：自动加载目录下所有 workbuddy*.json 作为多账号池")
-	fs.StringVar(&cfg.APIKey, "api-key", "", "可选：访问网关所需的 API Key (客户端 Bearer 校验)")
+	fs.StringVar(&cfg.APIKey, "api-key", "", "访问网关所需的 API Key（serve 必需；与 -api-key-file 二选一）")
+	fs.StringVar(&cfg.APIKeyFile, "api-key-file", "", "从受保护的本地文件读取网关 API 密钥")
 	fs.StringVar(&cfg.ProxyURL, "proxy", "", "可选：上游请求代理 (如 http://127.0.0.1:7890)")
 	fs.BoolVar(&cfg.Verbose, "verbose", false, "输出详细调试日志")
 	fs.BoolVar(&cfg.LoginIntl, "intl", false, "login 专用：登录国际站 (www.workbuddy.ai，浏览器内完成登录)；默认登录国内站")
@@ -516,6 +518,10 @@ func main() {
 	fs.IntVar(&cfg.ProbeLimit, "limit", 5, "probe 专用：未指定 -models 时探测的模型数量上限")
 	_ = fs.Parse(args)
 	cfg.KeepaliveHours = []int(keepaliveHours)
+	if err := loadGatewayAPIKey(); err != nil {
+		fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
+		os.Exit(1)
+	}
 
 	// 检测 -auth 是否被显式指定：
 	// 若未指定 -auth 且未指定 -auth-dir，则自动扫描当前目录下所有 workbuddy*.json 组成账号池，
@@ -526,6 +532,10 @@ func main() {
 		}
 	})
 	serveCommand := command == "serve" || command == "run" || command == "start"
+	if serveCommand && cfg.APIKey == "" {
+		fmt.Fprintln(os.Stderr, "启动失败: serve 要求使用 -api-key-file 或 -api-key 启用鉴权")
+		os.Exit(1)
+	}
 	if serveCommand {
 		if err := loadRuntimeConfig(runtimeConfigFile); err != nil {
 			fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
@@ -573,6 +583,8 @@ func main() {
 
 // initFileLogging 将运行日志同时写入控制台和按日期命名的项目日志文件。
 func initFileLogging(command string) func() {
+	// Keep console logs redacted even when the log directory cannot be written.
+	log.SetOutput(&redactingLogWriter{writer: os.Stderr})
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		log.Printf("[Log] 无法创建日志目录 %s，将仅输出到控制台: %v", logDir, err)
 		return func() {}
@@ -583,7 +595,7 @@ func initFileLogging(command string) func() {
 		log.Printf("[Log] 无法打开日志文件 %s，将仅输出到控制台: %v", path, err)
 		return func() {}
 	}
-	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	log.SetOutput(&redactingLogWriter{writer: io.MultiWriter(os.Stderr, f)})
 	log.Printf("[Log] 审计日志已启用，文件=%s，命令=%s，版本=%s", path, command, version)
 	return func() { _ = f.Close() }
 }
@@ -614,6 +626,9 @@ func printHelp() {
   -auth <path>      凭据文件路径；支持逗号分隔多个文件实现多账号
                     (默认: 自动发现当前目录下所有 workbuddy*.json)
   -auth-dir <dir>   凭据目录：自动加载目录下所有 workbuddy*.json 作为账号池
+  -api-key <key>    网关 API Key（serve 必需；与 -api-key-file 二选一）
+  -api-key-file <path>
+                    从本地文件读取 API Key，避免把密钥放入进程命令行
   -intl             login 专用：登录国际站 www.workbuddy.ai（浏览器内完成登录）
   -reload-interval <sec>
                     账号池热加载扫描间隔（默认 5 秒，0 关闭）：运行期自动发现
@@ -634,7 +649,8 @@ probe 选项:
   -models <m1,m2>   指定要探测的模型；默认取模型目录前几个
   -limit <n>        未指定 -models 时探测的模型数量（默认 5，上限 50）
   -addr/-port       需与运行中的 serve 一致；-api-key 启用时 probe 会自动携带
-  -api-key <key>    设置后，调用网关必须携带 Bearer <key> 鉴权
+  -api-key/-api-key-file
+                    需使用与 serve 相同的密钥；推荐从同一密钥文件读取
   -proxy <url>      设置上游转发代理 (例如 http://127.0.0.1:7890 或 socks5://...)
   -verbose          输出详细调试日志 (请求/响应体)
 
@@ -651,14 +667,14 @@ monitor 选项:
   # 登录国际站账号（www.workbuddy.ai，浏览器内完成登录）
   workbuddy-gateway login -intl -auth workbuddy-intl.json
 
-  # 自动发现：把多个凭据文件放进工作目录即可自动多账号（无需任何参数）
-  workbuddy-gateway serve        # 自动加载 ./workbuddy*.json
+  # 自动发现：把多个凭据文件放进工作目录即可自动多账号（无需逐个指定凭据文件）
+  workbuddy-gateway serve -api-key-file ./api-key.txt        # 自动加载 ./workbuddy*.json
 
   # 启动时指定多个凭据文件（轮询 + 429 自动冷却代偿；国内/国际可混挂）
-  workbuddy-gateway serve -auth workbuddy.json,workbuddy2.json
+  workbuddy-gateway serve -api-key-file ./api-key.txt -auth workbuddy.json,workbuddy2.json
 
   # 或使用目录模式：目录内所有 workbuddy*.json 自动组成账号池
-  workbuddy-gateway serve -auth-dir ./auths
+  workbuddy-gateway serve -api-key-file ./api-key.txt -auth-dir ./auths
 
   # 运行期新增/更新/删除凭据文件会自动热加载（默认每 5 秒），无需重启 serve
 
@@ -670,10 +686,10 @@ monitor 选项:
   workbuddy-gateway login -intl
 
   # 启动本地网关 (监听 127.0.0.1:8317)
-  workbuddy-gateway serve
+  workbuddy-gateway serve -api-key-file ./api-key.txt
 
   # 启动网关并指定端口和代理
-  workbuddy-gateway serve -port 9000 -proxy http://127.0.0.1:7890`)
+  workbuddy-gateway serve -api-key-file ./api-key.txt -port 9000 -proxy http://127.0.0.1:7890`)
 }
 
 func initHTTPClient() {
@@ -697,8 +713,9 @@ func initHTTPClient() {
 	// 总超时会给整条流设一个硬上限（原为 180s），大请求长时间但持续有输出的流会被中途掐断，
 	// 导致上游 usage 丢失、客户端收到不完整响应，并被 CPA 判为 provider 故障而触发 503。
 	cfg.HttpClient = &http.Client{
-		Transport: transport,
-		Jar:       jar,
+		Transport:     transport,
+		Jar:           jar,
+		CheckRedirect: safeUpstreamRedirect,
 	}
 }
 
@@ -784,6 +801,7 @@ func loadAuth() (*StoredAuth, error) {
 	if sa.Auth.AccessToken == "" {
 		return nil, fmt.Errorf("凭据文件中缺少 AccessToken")
 	}
+	registerCredentialSecrets(&sa)
 
 	authLock.Lock()
 	currAuth = &sa
@@ -792,37 +810,30 @@ func loadAuth() (*StoredAuth, error) {
 }
 
 func saveAuth(sa *StoredAuth) error {
-	authLock.Lock()
-	currAuth = sa
-	authLock.Unlock()
-
-	dir := filepath.Dir(cfg.AuthFile)
-	if dir != "" && dir != "." {
-		_ = os.MkdirAll(dir, 0755)
-	}
+	registerCredentialSecrets(sa)
 	data, err := json.MarshalIndent(sa, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(cfg.AuthFile, data, 0600); err != nil {
+	if err := writeCredentialFile(cfg.AuthFile, data); err != nil {
 		return err
 	}
 	clearDisabledMarker(cfg.AuthFile)
+	authLock.Lock()
+	currAuth = sa
+	authLock.Unlock()
 	return nil
 }
 
 // saveAuthTo 将凭据写入指定路径（多账号模式使用）。
 // 写入成功后清除该路径的失效标记（表示账号已重新登录）。
 func saveAuthTo(path string, sa *StoredAuth) error {
-	dir := filepath.Dir(path)
-	if dir != "" && dir != "." {
-		_ = os.MkdirAll(dir, 0755)
-	}
+	registerCredentialSecrets(sa)
 	data, err := json.MarshalIndent(sa, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := writeCredentialFile(path, data); err != nil {
 		return err
 	}
 	clearDisabledMarker(path)
@@ -842,6 +853,7 @@ func loadAccountFile(path string) (*StoredAuth, error) {
 	if sa.Auth.AccessToken == "" {
 		return nil, fmt.Errorf("凭据文件缺少 AccessToken (%s)", path)
 	}
+	registerCredentialSecrets(&sa)
 	return &sa, nil
 }
 
@@ -1342,6 +1354,7 @@ func markModelQuotaBlocked(acc *Account, model, msg string) {
 // disableAccount 将账号标记为失效（授权过期/撤销），禁止调度并删除凭据文件，
 // 同时写入持久化失效标记，便于控制台提示用户重新登录。
 func disableAccount(acc *Account, reason string) {
+	reason = redactSensitiveText(reason)
 	accountMu.Lock()
 	acc.Disabled = true
 	acc.DisabledReason = reason
@@ -1759,6 +1772,7 @@ func refreshTokenPayload(sa *StoredAuth) (int, error) {
 	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
 		return status, fmt.Errorf("解析新 Token 失败: %w", err)
 	}
+	registerSecrets(tok.AccessToken, tok.RefreshToken)
 
 	now := time.Now()
 	sa.Auth.AccessToken = tok.AccessToken
@@ -2835,8 +2849,9 @@ func runLogin() {
 	fmt.Println("正在生成登录凭据与二维码...")
 
 	loginClient := &http.Client{
-		Timeout: 30 * time.Second,
-		Jar:     cfg.HttpClient.Jar,
+		Timeout:       30 * time.Second,
+		Jar:           cfg.HttpClient.Jar,
+		CheckRedirect: safeUpstreamRedirect,
 	}
 
 	// 轮询 auth/token 时与官方客户端一致，显式声明无 Authorization
@@ -2854,6 +2869,11 @@ func runLogin() {
 	_ = json.Unmarshal(data, &st)
 	if st.State == "" || st.AuthURL == "" {
 		fmt.Println("上游返回的登录状态信息异常，请重试。")
+		return
+	}
+	loginURL, err := url.Parse(st.AuthURL)
+	if err != nil || loginURL.Scheme != "https" || loginURL.Host == "" || loginURL.User != nil {
+		fmt.Println("上游返回了无效或非 HTTPS 登录链接，已拒绝。")
 		return
 	}
 
@@ -2928,7 +2948,7 @@ func runLogin() {
 			fmt.Printf("凭据已成功保存至: %s\n", cfg.AuthFile)
 			fmt.Printf("令牌有效期至: %s\n", time.Unix(sa.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
 			fmt.Println("\n现在您可以运行以下命令启动网关服务：")
-			fmt.Println("  workbuddy-gateway serve")
+			fmt.Println("  workbuddy-gateway serve -api-key-file ./api-key.txt")
 			return
 		}
 	}
@@ -2990,9 +3010,12 @@ func runServe() {
 
 	listenAddr := fmt.Sprintf("%s:%d", cfg.Addr, cfg.Port)
 	server := &http.Server{
-		Addr:        listenAddr,
-		Handler:     requestAuditMiddleware(corsMiddleware(authMiddleware(mux))),
-		ReadTimeout: 120 * time.Second,
+		Addr:              listenAddr,
+		Handler:           localSecurityMiddleware(requestAuditMiddleware(corsMiddleware(authMiddleware(mux)))),
+		ReadTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 		// WriteTimeout 覆盖「读完请求头 → 响应写完」的总时长。流式对话可能持续数分钟，
 		// 原来的 300s 会给长流设硬上限并中途掐断，因此这里不限总时长，
 		// 改由上游 idleReadCloser 的空闲超时和客户端自身取消来控制。
@@ -3014,7 +3037,7 @@ func runServe() {
 		fmt.Printf("   凭据热加载:    已关闭 (-reload-interval 0)\n")
 	}
 	if cfg.APIKey != "" {
-		fmt.Printf("   API 鉴权:      已启用 (Bearer %s)\n", cfg.APIKey)
+		fmt.Println("   API 鉴权:      已启用 (密钥已隐藏)")
 	} else {
 		fmt.Printf("   API 鉴权:      未启用 (任何客户端均可直连)\n")
 	}
@@ -3168,9 +3191,17 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "*")
+		origin := r.Header.Get("Origin")
+		if origin != "" && !allowedBrowserOrigin(origin) {
+			writeUpstreamError(w, r, http.StatusForbidden, "invalid_origin", "网关拒绝来自其他网页的请求")
+			return
+		}
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Api-Key, X-Trace-ID, X-Request-ID, X-Parent-Request-ID, Anthropic-Version, Anthropic-Beta")
 		if r.Method == http.MethodOptions {
 			debugEvent(r, "info", "cors_preflight_completed", map[string]any{
 				"result":  "allowed",
@@ -3190,12 +3221,16 @@ func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if cfg.APIKey != "" && r.URL.Path != "/health" && r.URL.Path != "/ping" && r.URL.Path != "/" {
 			authHeader := r.Header.Get("Authorization")
-			token := strings.TrimPrefix(authHeader, "Bearer ")
+			token := ""
+			parts := strings.Fields(authHeader)
+			if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+				token = parts[1]
+			}
 			// Anthropic 客户端（Claude Code 等）用 x-api-key 头携带密钥。
-			if token == "" {
+			if authHeader == "" {
 				token = r.Header.Get("x-api-key")
 			}
-			if token != cfg.APIKey {
+			if !validGatewayKey(token) {
 				debugEvent(r, "warn", "authentication_rejected", map[string]any{
 					"status_code":     http.StatusUnauthorized,
 					"reason":          "invalid_api_key",
@@ -3260,7 +3295,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			if lastRateErr != "" {
 				msg += " | 最近一次频率限制: " + truncate(lastRateErr, 200)
 			}
-			log.Printf("[#%d] %s", reqID, msg)
+			log.Printf("[#%d] 无可用账号，错误详情仅返回调用方", reqID)
 			debugEvent(r, "warn", "request_rejected_no_available_account", map[string]any{
 				"status_code":     http.StatusServiceUnavailable,
 				"reason":          "no_available_account",
@@ -3330,16 +3365,16 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 
 		// 上游非 200 响应处理
 		if resp.StatusCode >= 400 {
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody, _ := readLimited(resp.Body, 1<<20)
 			resp.Body.Close()
 			upstreamCancel()
-			errStr := string(errBody)
+			errStr := redactSensitiveText(string(errBody))
 			debugEvent(r, "warn", "upstream_response_rejected", map[string]any{
 				"upstream_host": prof.Base,
 				"status_code":   resp.StatusCode,
 				"error_code":    modelStatusFromError(resp.StatusCode, errStr),
 			})
-			log.Printf("[#%d] 账号 %s [%s] 上游返回 HTTP %d: %s (耗时 %v)", reqID, acc.Path, prof.Label, resp.StatusCode, errStr, time.Since(startTime))
+			log.Printf("[#%d] 账号 %s [%s] 上游返回 HTTP %d (耗时 %v)，错误正文仅返回调用方", reqID, acc.Path, prof.Label, resp.StatusCode, time.Since(startTime))
 			log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=失败 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
 
 			if isQuotaExhausted(resp.StatusCode, errStr) {
@@ -3385,7 +3420,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			if isAuthFailure(resp.StatusCode, errStr) {
 				// 授权失效（401/403 / token 无效 / 登录过期）：禁用该账号并删除凭据文件，
 				// 自动改用下一个可用账号，控制台提示用户重新登录
-				disableAccount(acc, fmt.Sprintf("上游鉴权失败 (HTTP %d): %s", resp.StatusCode, truncate(errStr, 200)))
+				disableAccount(acc, fmt.Sprintf("上游鉴权失败 (HTTP %d)", resp.StatusCode))
 				lastAuthErr = errStr
 				continue // 尝试下一个账号
 			}
@@ -3428,11 +3463,11 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	startTime := requestStartFor(r)
 
 	readStarted := debugBodyReadStarted(r)
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readClientBody(w, r)
 	readDuration := debugElapsedSince(readStarted)
 	if err != nil {
 		debugBodyReadFailed(r, bodyBytes, readStarted, err)
-		writeOpenAIError(w, http.StatusBadRequest, "read_error", "读取请求体失败")
+		writeOpenAIError(w, clientBodyErrorStatus(err), "read_error", "读取请求体失败或超过 32 MiB 上限")
 		return
 	}
 	defer r.Body.Close()
@@ -3880,16 +3915,19 @@ func doJSONContext(ctx context.Context, client *http.Client, method, fullURL str
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, readErr := readLimited(resp.Body, 8<<20)
+	if readErr != nil {
+		return nil, resp.StatusCode, fmt.Errorf("读取上游响应失败: %w", readErr)
+	}
 	if resp.StatusCode >= 400 {
-		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d: %s", resp.StatusCode, string(raw))
+		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d: %s", resp.StatusCode, redactSensitiveText(string(raw)))
 	}
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("解析上游 JSON 失败: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s", env.Code, env.Msg)
+		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s", env.Code, redactSensitiveText(env.Msg))
 	}
 	return env.Data, resp.StatusCode, nil
 }

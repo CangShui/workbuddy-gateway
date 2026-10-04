@@ -88,7 +88,8 @@ func verifyAccountUsable(ctx context.Context, auth StoredAuth) (bool, error) {
 	}
 	_, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.quotaSummaryURL(), headers, strings.NewReader("{}"))
 	if err != nil {
-		if isAuthFailure(status, err.Error()) {
+		// A generic 403 can be a permission or WAF denial, not an expired token.
+		if status == http.StatusUnauthorized || isAuthFailure(0, err.Error()) {
 			return false, nil // 上游明确拒绝：凭据确实不可用
 		}
 		return false, fmt.Errorf("只读校验未完成 HTTP=%d", status)

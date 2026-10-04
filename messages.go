@@ -91,11 +91,11 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	startTime := requestStartFor(r)
 
 	readStarted := debugBodyReadStarted(r)
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readClientBody(w, r)
 	readDuration := debugElapsedSince(readStarted)
 	if err != nil {
 		debugBodyReadFailed(r, bodyBytes, readStarted, err)
-		writeAnthropicError(w, http.StatusBadRequest, "api_error", "读取请求体失败")
+		writeAnthropicError(w, clientBodyErrorStatus(err), "api_error", "读取请求体失败或超过 32 MiB 上限")
 		return
 	}
 	defer r.Body.Close()
@@ -976,11 +976,11 @@ func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	readStarted := debugBodyReadStarted(r)
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := readClientBody(w, r)
 	readDuration := debugElapsedSince(readStarted)
 	if err != nil {
 		debugBodyReadFailed(r, bodyBytes, readStarted, err)
-		writeAnthropicError(w, http.StatusBadRequest, "api_error", "读取请求体失败")
+		writeAnthropicError(w, clientBodyErrorStatus(err), "api_error", "读取请求体失败或超过 32 MiB 上限")
 		return
 	}
 	defer r.Body.Close()

@@ -45,7 +45,7 @@ Set-Location -LiteralPath $PSScriptRoot
 # ---------------------------------------------------------------------------
 $go = Get-Command go -ErrorAction SilentlyContinue
 if (-not $go) {
-    Write-Host '[错误] 未检测到 Go 工具链，请先安装 Go 1.20+：https://go.dev/dl/' -ForegroundColor Red
+    Write-Host '[错误] 未检测到 Go 工具链，请先安装 Go 1.27.1+：https://go.dev/dl/' -ForegroundColor Red
     exit 1
 }
 

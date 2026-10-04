@@ -557,8 +557,8 @@ func debugBodyFields(r *http.Request, body []byte, readDuration, decodeDuration 
 		"body_sha256_prefix":  bodyHashPrefix(body),
 		"json_valid":          jsonValid,
 		"json_decode_ms":      durationMilliseconds(decodeDuration),
-		"body_limit_bytes":    int64(0),
-		"body_limit_exceeded": false,
+		"body_limit_bytes":    maxClientRequestBytes,
+		"body_limit_exceeded": clientBodyErrorStatus(readErr) == http.StatusRequestEntityTooLarge,
 		"read_error_type":     "",
 		"read_error":          "",
 	}
@@ -604,7 +604,7 @@ func safeDebugError(err error) string {
 	if err == nil {
 		return ""
 	}
-	message := strings.ReplaceAll(strings.ReplaceAll(err.Error(), "\r", " "), "\n", " ")
+	message := strings.ReplaceAll(strings.ReplaceAll(redactSensitiveText(err.Error()), "\r", " "), "\n", " ")
 	if len(message) > 300 {
 		message = message[:300]
 	}

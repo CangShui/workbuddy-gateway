@@ -223,7 +223,7 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 
 	if resp.StatusCode >= 400 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		errStr := string(errBody)
+		errStr := redactSensitiveText(string(errBody))
 		switch {
 		case isQuotaExhausted(resp.StatusCode, errStr):
 			markModelQuotaBlocked(acc, model, errStr)
