@@ -2419,7 +2419,7 @@ type accountSnapshot struct {
 	QuotaKnown       bool                          `json:"quotaKnown,omitempty"`
 	QuotaExhausted   bool                          `json:"quotaExhausted,omitempty"`
 	ModelStates      map[string]modelStateSnapshot `json:"modelStates,omitempty"`
-	FreeModels       int                           `json:"freeModels,omitempty"`
+	FreeModels       int                           `json:"freeModels,omitempty"` // 展示值：所属站点模型统计中 0.00x 的模型数，不参与调度
 	ModelCooldowns   int                           `json:"modelCooldowns,omitempty"`
 }
 
@@ -2470,9 +2470,6 @@ func writeStatusSnapshot() {
 		if len(acc.ModelStates) > 0 {
 			as.ModelStates = make(map[string]modelStateSnapshot, len(acc.ModelStates))
 			for model, state := range acc.ModelStates {
-				if state.CostClass == modelCostFree {
-					as.FreeModels++
-				}
 				if state.CooldownUntil.After(now) {
 					as.ModelCooldowns++
 				}
@@ -2526,6 +2523,20 @@ func writeStatusSnapshot() {
 		snap.Accounts = append(snap.Accounts, as)
 	}
 	snap.Models = buildModelStatSnapshots(now, accounts)
+	cnFree, intlFree := freeModelDisplayCounts(snap.Models)
+	for i := range snap.Accounts {
+		if profileForEdition(snap.Accounts[i].Edition).Key == "intl" {
+			snap.Accounts[i].FreeModels = intlFree
+		} else {
+			snap.Accounts[i].FreeModels = cnFree
+		}
+	}
+	if !lastFreeModelDisplay.initialized || lastFreeModelDisplay.cn != cnFree || lastFreeModelDisplay.intl != intlFree {
+		lastFreeModelDisplay.initialized = true
+		lastFreeModelDisplay.cn, lastFreeModelDisplay.intl = cnFree, intlFree
+		log.Printf("[免费模型展示] traceId=%s 来源=模型统计站点倍率 国内=%d 国际=%d 模型行数=%d 规则=只计0.00x 业务影响=仅更新账号表展示，不改实测账本、调度或计费判断",
+			newTraceID(), cnFree, intlFree, len(snap.Models))
+	}
 	accountMu.Unlock()
 
 	data, err := json.MarshalIndent(snap, "", "  ")

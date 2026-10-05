@@ -334,6 +334,26 @@ func freeLabel(freeSeen, paidSeen bool) string {
 	}
 }
 
+// freeModelDisplayCounts 只复用模型统计表最终显示的站点倍率。
+// 不能用这个展示数量补写账号实测账本，或判断账号能否请求某个模型。
+func freeModelDisplayCounts(rows []modelStatSnapshot) (cn, intl int) {
+	for _, row := range rows {
+		if row.CNMultiplier == "0.00x" {
+			cn++
+		}
+		if row.IntlMultiplier == "0.00x" {
+			intl++
+		}
+	}
+	return cn, intl
+}
+
+// 调用方持有 accountMu，仅在展示数量发生变化时记录，避免每 3 秒重复刷日志。
+var lastFreeModelDisplay struct {
+	initialized bool
+	cn, intl    int
+}
+
 // buildModelStatSnapshots 汇总「官方/静态模型目录 ∪ 有统计的模型」的统计行。
 func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot {
 	ids, source := mergedModelIDs()
