@@ -68,13 +68,23 @@ func credentialIdentity(tokens StoredTokens) (accountID, realm string) {
 // verifyAccountUsable 用只读接口确认凭据是否还能取到账号数据。
 //
 // 返回 (true, nil)  凭据可用；
-// 返回 (false, nil) 上游明确拒绝（401/403 等），凭据已不可用；
-// 返回 (false, err) 无法判定（网络、超时、上游 5xx），调用方不得据此销毁凭据。
+// 返回 (false, nil) 上游明确拒绝（401 或正文明确登录失效），凭据已不可用；
+// 返回 (false, err) 无法判定（普通 403、网络、超时、上游 5xx），调用方不得据此销毁凭据。
 func verifyAccountUsable(ctx context.Context, auth StoredAuth) (bool, error) {
+	registerCredentialSecrets(&auth)
+	traceID := newTraceID()
+	if state, ok := ctx.Value(debugRequestContextKey{}).(*debugRequestContext); ok {
+		state.mu.RLock()
+		traceID = state.traceID
+		state.mu.RUnlock()
+	}
+	log.Printf("[凭据校验] traceId=%s 阶段=只读校验开始 站点=%s 说明=确认账号接口是否可用，不写入凭据", traceID, auth.Edition)
 	if strings.TrimSpace(auth.Auth.AccessToken) == "" {
+		log.Printf("[凭据校验] traceId=%s 结果=无法判定 原因=缺少访问令牌 说明=未调用上游", traceID)
 		return false, fmt.Errorf("缺少访问令牌，无法校验")
 	}
 	if cfg.HttpClient == nil {
+		log.Printf("[凭据校验] traceId=%s 结果=无法判定 原因=HTTP客户端未就绪 说明=未调用上游", traceID)
 		return false, fmt.Errorf("HTTP 客户端未就绪，无法校验")
 	}
 	prof := profileForEdition(auth.Edition)
@@ -88,11 +98,16 @@ func verifyAccountUsable(ctx context.Context, auth StoredAuth) (bool, error) {
 	}
 	_, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.quotaSummaryURL(), headers, strings.NewReader("{}"))
 	if err != nil {
-		if isAuthFailure(status, err.Error()) {
+		// 普通 403 可能只是权限不足或风控拒绝，不能据此确认 Token 失效。
+		// 仅修正只读凭据校验，不改变其他调用方的 403 停用规则。
+		if status == http.StatusUnauthorized || isAuthFailure(0, err.Error()) {
+			log.Printf("[凭据校验] traceId=%s HTTP=%d 结果=不可用 原因=%v 说明=上游明确返回授权失效", traceID, status, err)
 			return false, nil // 上游明确拒绝：凭据确实不可用
 		}
+		log.Printf("[凭据校验] traceId=%s HTTP=%d 结果=无法判定 原因=%v 业务影响=不得仅凭此次结果销毁凭据", traceID, status, err)
 		return false, fmt.Errorf("只读校验未完成 HTTP=%d", status)
 	}
+	log.Printf("[凭据校验] traceId=%s HTTP=%d 结果=可用 说明=已成功取到账号数据", traceID, status)
 	return true, nil
 }
 

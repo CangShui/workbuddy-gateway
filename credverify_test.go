@@ -96,6 +96,7 @@ func TestRefreshCommitsOnlyVerifiedCredential(t *testing.T) {
 		{"账号一致且校验通过", "user-A", 200, `{"code":0,"data":{"Packages":[]}}`, true},
 		{"账号标识不一致", "user-B", 200, `{"code":0,"data":{"Packages":[]}}`, false},
 		{"新凭据校验被拒", "user-A", 401, `{"code":12153,"msg":"invalid_grant"}`, false},
+		{"权限403无法判定不丢弃新凭据", "user-A", 403, `{"code":10002,"msg":"forbidden"}`, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			chdirTemp(t)
@@ -189,7 +190,8 @@ func TestVerifyAccountUsableDistinguishesDeadFromUnknown(t *testing.T) {
 	}{
 		{"可用", 200, `{"code":0,"data":{}}`, true, false},
 		{"明确失效401", 401, `{"code":12153,"msg":"invalid_grant"}`, false, false},
-		{"明确失效403", 403, `{"code":10002,"msg":"forbidden"}`, false, false},
+		{"权限或风控403无法确认失效", 403, `{"code":10002,"msg":"forbidden"}`, false, true},
+		{"明确令牌无效403", 403, `{"code":10002,"msg":"invalid token"}`, false, false},
 		{"无法判定500", 500, `{"code":500,"msg":"oops"}`, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -224,6 +226,8 @@ func TestDisableAccountKeepsOrDeletesBasedOnVerification(t *testing.T) {
 	}{
 		{"凭据仍可用则保留", 200, `{"code":0,"data":{}}`, false},
 		{"无法判定则保守保留", 500, `{"code":500,"msg":"oops"}`, false},
+		{"普通403保留文件但仍停止调度", 403, `{"code":10002,"msg":"forbidden"}`, false},
+		{"明确令牌无效403才删除", 403, `{"code":10002,"msg":"invalid token"}`, true},
 		{"确认失效才删除", 401, `{"code":12153,"msg":"invalid_grant"}`, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
