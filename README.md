@@ -316,6 +316,14 @@ workbuddy-gateway serve -models-refresh 0
 | POST | `/admin/probe` | 供 `probe` 命令调用，**仅接受回环来源** |
 | GET | `/` | 简单文本说明 |
 
+从 v1.13.15 起，Responses `function_call_output.output` 支持文本和图片内容块数组：
+文本原样保留在 `tool` 结果中，`input_image` 图片提升为全部配对工具结果之后的
+`user` 多模态消息，图片 URL 和数据不变。图片不再被序列化成 Base64 文本混入
+上下文，避免截图会话异常消耗大量 token，最终触发 `11133 model_param_invalid`。
+并行工具调用的结果仍连续排列，不会因插入图片而破坏配对。普通字符串和 JSON
+工具结果保持原行为；网关不截断操作手册或会话历史。`11133` 本身是上游通用参数
+错误码，不仅限于图片或上下文长度问题；排障仍需结合模型、TraceID 与日志。
+
 后台任务（`serve` 启动后自动运行）：
 
 | 任务 | 周期 | 说明 |

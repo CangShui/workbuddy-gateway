@@ -90,6 +90,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	prepareSystemPromptForUpstream(chatReq, r, reqID, w.Header().Get("X-Trace-ID"))
 	repairReport := repairToolMessageSequence(chatReq)
 	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
+	logResponsesToolOutputConversion(r, reqID, respReq)
 	// 与 Chat 原生入口共用同一套 DeepSeek 多轮推理历史回填规则。
 	logReasoningHistoryRepair(r, reqID, modelName, repairReasoningHistory(chatReq))
 
@@ -319,11 +320,20 @@ func convertResponsesInputItem(item map[string]any) []any {
 		}}
 	case "function_call_output":
 		callID, _ := item["call_id"].(string)
-		return []any{map[string]any{
+		text, images := convertResponsesToolOutput(item["output"])
+		messages := []any{map[string]any{
 			"role":         "tool",
 			"tool_call_id": callID,
-			"content":      stringifyToolOutput(item["output"]),
+			"content":      text,
 		}}
+		if len(images) > 0 {
+			// 与 Anthropic tool_result 的图片处理一致：tool 保留文本，
+			// 图片提升成 user 多模态内容，不能把 Base64 当普通文本回放。
+			// handleResponses 随后的工具序列修复会将并行批次的图片消息
+			// 移至全部 tool 结果之后，避免打断调用/结果配对（11148）。
+			messages = append(messages, map[string]any{"role": "user", "content": images})
+		}
+		return messages
 	case "reasoning", "web_search_call":
 		// reasoning 的正文在 responsesToChatRequest 里挂到助手消息的 reasoning_content。
 		// web_search_call 不能转成消息：插在并行 function_call 与 output 之间会触发 11148。
@@ -385,6 +395,88 @@ func convertResponsesContent(content any) any {
 	default:
 		return fmt.Sprintf("%v", c)
 	}
+}
+
+// convertResponsesToolOutput 处理 Responses 的字符串或多模态工具结果。
+// 普通 JSON 对象/数组维持旧序列化行为；明确的文本块提取原文，图片块作为
+// 多模态内容返回。未知块仍作为 JSON 文本保留，不静默丢弃工具数据。
+func convertResponsesToolOutput(output any) (string, []any) {
+	blocks, ok := output.([]any)
+	if !ok {
+		return stringifyToolOutput(output), nil
+	}
+	typed := false
+	for _, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch stringField(block, "type") {
+		case "input_text", "output_text", "text", "input_image", "image_url":
+			typed = true
+		}
+	}
+	if !typed {
+		return stringifyToolOutput(output), nil
+	}
+	var texts []string
+	var images []any
+	for _, raw := range blocks {
+		if block, ok := raw.(map[string]any); ok {
+			switch stringField(block, "type") {
+			case "input_text", "output_text", "text":
+				if text, ok := block["text"].(string); ok {
+					texts = append(texts, text)
+					continue
+				}
+			case "input_image", "image_url":
+				url, _ := block["image_url"].(string)
+				detail, _ := block["detail"].(string)
+				if nested, ok := block["image_url"].(map[string]any); ok {
+					url, _ = nested["url"].(string)
+					detail, _ = nested["detail"].(string)
+				}
+				if url != "" {
+					image := map[string]any{"url": url}
+					if detail != "" {
+						image["detail"] = detail
+					}
+					images = append(images, map[string]any{"type": "image_url", "image_url": image})
+					continue
+				}
+			}
+		}
+		texts = append(texts, stringifyToolOutput(raw))
+	}
+	text := strings.Join(texts, "\n")
+	if text == "" && len(images) > 0 {
+		text = "[图片]"
+	}
+	return text, images
+}
+
+// logResponsesToolOutputConversion 只记录块数、位置与长度；图片 URL、
+// Base64、工具正文及提示词不进入日志，沿用请求的 TraceID 和文件日志。
+func logResponsesToolOutputConversion(r *http.Request, reqID uint64, request map[string]any) {
+	input, _ := request["input"].([]any)
+	outputs, textChars, imageCount := 0, 0, 0
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok || item["type"] != "function_call_output" {
+			continue
+		}
+		text, images := convertResponsesToolOutput(item["output"])
+		outputs++
+		textChars += utf8.RuneCountInString(text)
+		imageCount += len(images)
+	}
+	log.Printf("[Responses工具结果转换] traceId=%s requestId=%d 工具结果=%d 文本字符数=%d 图片块=%d 图片位置=工具结果之后的user多模态消息 结果=图片不再作为Base64文本计入上下文，原工具文本保留且不记录正文",
+		debugTraceID(r), reqID, outputs, textChars, imageCount)
+	debugEvent(r, "debug", "responses_tool_output_converted", map[string]any{
+		"tool_outputs": outputs, "text_chars": textChars, "image_blocks": imageCount,
+		"image_position":  "user_after_tool_results",
+		"business_impact": "保留工具文本与图片；避免Base64被当文本计费或撑满上下文；不记录正文",
+	})
 }
 
 // stringifyToolOutput 将 function_call_output 的 output 统一转为字符串。
