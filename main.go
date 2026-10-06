@@ -374,6 +374,7 @@ type Config struct {
 	KeepaliveHours     []int  // 主动续期时刻（本地小时），空表示关闭；到点主动刷新全部账号
 	ProbeModels        string // probe 专用：逗号分隔的模型列表
 	ProbeLimit         int    // probe 专用：未显式指定模型时的取用数量
+	WebUI              bool   // 启用只读管理台（/ui + /admin/api/*），需同时设置 -api-key
 	HttpClient         *http.Client
 }
 
@@ -515,6 +516,7 @@ func main() {
 	fs.Var(&keepaliveHours, "keepalive-hours", "主动续期时刻（本地小时，逗号分隔，默认 22）；留空关闭")
 	fs.StringVar(&cfg.ProbeModels, "models", "", "probe 专用：逗号分隔的待探测模型（默认取目录前几个）")
 	fs.IntVar(&cfg.ProbeLimit, "limit", 5, "probe 专用：未指定 -models 时探测的模型数量上限")
+	fs.BoolVar(&cfg.WebUI, "webui", false, "启用只读管理台 (/ui 与 /admin/api/*)；必须同时设置 -api-key，否则拒绝启动")
 	_ = fs.Parse(args)
 	cfg.KeepaliveHours = []int(keepaliveHours)
 
@@ -632,6 +634,9 @@ func printHelp() {
                     主动续期时刻（本地小时，逗号分隔，默认 22）
                     到点主动刷新全部账号登录凭据，不等访问令牌临近过期；
                     留空关闭。只调刷新接口，不请求模型、不消耗额度
+  -webui            启用只读管理台 (http://<addr>:<port>/ui/)：
+                    展示账号池/模型统计/日志/config.json/凭据（令牌脱敏）。
+                    必须同时设置 -api-key，否则拒绝启动；/admin/api/* 一律需要鉴权
 
 probe 选项:
   -auth <path>      只探测指定凭据文件（文件名或路径均可）；默认探测全部账号
@@ -2964,6 +2969,11 @@ func runLogin() {
 // -----------------------------------------------------------------------------
 
 func runServe() {
+	// 只读管理台会暴露账号/额度等运行信息，必须配合 API 密钥才能开启。
+	if err := webUIPreflightError(); err != nil {
+		fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
+		os.Exit(1)
+	}
 	loadModelsCache()
 	if err := loadAccounts(); err != nil {
 		fmt.Printf("警告: 未检测到有效凭据 (%v)。\n请先执行: workbuddy-gateway login 扫码登录，或确保凭据文件存在。\n\n", err)
@@ -3013,6 +3023,11 @@ func runServe() {
 	mux.HandleFunc("/admin/probe", handleAdminProbe)
 	mux.HandleFunc("/", handleIndex)
 
+	// 只读管理台：仅在显式启用时注册，避免默认暴露。
+	if cfg.WebUI {
+		registerWebUIRoutes(mux)
+	}
+
 	listenAddr := fmt.Sprintf("%s:%d", cfg.Addr, cfg.Port)
 	server := &http.Server{
 		Addr:        listenAddr,
@@ -3042,6 +3057,11 @@ func runServe() {
 		printAPIAuthBanner(os.Stdout)
 	} else {
 		fmt.Printf("   API 鉴权:      未启用 (任何客户端均可直连)\n")
+	}
+	if cfg.WebUI {
+		fmt.Printf("   只读管理台:    已启用 http://%s/ui/ (需 API 密钥)\n", listenAddr)
+	} else {
+		fmt.Printf("   只读管理台:    未启用 (-webui 可开启，需配合 -api-key)\n")
 	}
 	if cfg.ProxyURL != "" {
 		fmt.Printf("   上游出口代理:  %s\n", cfg.ProxyURL)
@@ -3215,9 +3235,20 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// isAuthExemptPath 返回无需 API 密钥即可访问的路径。
+// /health、/ping 与根路径保持原有放行；启用管理台时，/ui 静态外壳也放行
+// （外壳不含任何数据，浏览器导航无法携带 Authorization 头），
+// 但 /admin/api/* 一律需要密钥。
+func isAuthExemptPath(p string) bool {
+	if p == "/health" || p == "/ping" || p == "/" {
+		return true
+	}
+	return webUIIsExemptPath(p)
+}
+
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if cfg.APIKey != "" && r.URL.Path != "/health" && r.URL.Path != "/ping" && r.URL.Path != "/" {
+		if cfg.APIKey != "" && !isAuthExemptPath(r.URL.Path) {
 			authHeader := r.Header.Get("Authorization")
 			token := strings.TrimPrefix(authHeader, "Bearer ")
 			// Anthropic 客户端（Claude Code 等）用 x-api-key 头携带密钥。
