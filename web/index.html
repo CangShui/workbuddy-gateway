@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WorkBuddy 本地网关 · 管理台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>WorkBuddy 本地网关</h1>
+    <span class="tag">只读管理台</span>
+  </div>
+  <div class="topbar-right">
+    <span class="conn" id="conn">未连接</span>
+    <div class="meta" id="meta"></div>
+    <span class="key-field">
+      <span>API 密钥</span>
+      <input id="apiKey" type="password" placeholder="Bearer 密钥" autocomplete="off">
+    </span>
+    <button id="saveKey" type="button">保存并校验</button>
+    <button id="themeToggle" class="ghost" type="button" title="切换主题">主题</button>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-tab="overview" type="button">总览</button>
+  <button class="tab" data-tab="accounts" type="button">账号</button>
+  <button class="tab" data-tab="models" type="button">模型</button>
+  <button class="tab" data-tab="logs" type="button">日志</button>
+  <button class="tab" data-tab="config" type="button">配置</button>
+  <button class="tab" data-tab="credentials" type="button">凭据</button>
+</nav>
+
+<div id="alert" class="alert hidden"></div>
+
+<main>
+  <section id="panel-overview" class="panel active">
+    <div class="cards" id="summaryCards"></div>
+    <div class="card">
+      <div class="card-title">分站点总览</div>
+      <div id="siteSummary"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">运行信息</div>
+      <div class="kv" id="gatewayInfo"></div>
+    </div>
+  </section>
+
+  <section id="panel-accounts" class="panel">
+    <div class="card">
+      <div class="card-title">账号池</div>
+      <div class="table-wrap">
+        <table id="accountsTable">
+          <thead>
+            <tr>
+              <th>#</th><th>凭据文件</th><th>账号</th><th>站点</th><th>状态</th>
+              <th>Token 有效期</th><th>总额度</th><th>已用</th><th>剩余</th>
+              <th>套餐</th><th>免费模型</th><th>模型冷却</th>
+              <th>刷新令牌到期</th><th>上次续期</th><th>续期失败</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="panel-models" class="panel">
+    <div class="card">
+      <div class="card-title">
+        模型统计
+        <span class="filter">
+          <label><input type="checkbox" id="onlyUsable"> 仅显示可用账号 &gt; 0</label>
+        </span>
+      </div>
+      <div class="table-wrap">
+        <table id="modelsTable">
+          <thead>
+            <tr>
+              <th>模型</th><th>国内倍率</th><th>国际倍率</th><th>可用账号</th>
+              <th>请求</th><th>平均首字(5h)</th><th>平均总耗时(5h)</th><th>总Token(M)</th><th>末次状态</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="panel-logs" class="panel">
+    <div class="card">
+      <div class="card-title">
+        运行日志
+        <span class="filter">
+          <select id="logFile"></select>
+          <select id="logLines">
+            <option value="100">100 行</option>
+            <option value="200" selected>200 行</option>
+            <option value="500">500 行</option>
+            <option value="1000">1000 行</option>
+          </select>
+        </span>
+      </div>
+      <pre class="logbox" id="logBox">加载中…</pre>
+    </div>
+  </section>
+
+  <section id="panel-config" class="panel">
+    <div class="card">
+      <div class="card-title">
+        config.json（只读）
+        <span class="filter">
+          <label><input type="checkbox" id="maskHints" checked> 隐藏 systemPrompt 正文</label>
+        </span>
+      </div>
+      <pre class="logbox" id="configBox">加载中…</pre>
+    </div>
+  </section>
+
+  <section id="panel-credentials" class="panel">
+    <div class="card">
+      <div class="card-title">凭据文件（只读 · 令牌脱敏）</div>
+      <p class="hint" id="credHint"></p>
+      <div class="table-wrap">
+        <table id="credentialsTable">
+          <thead>
+            <tr>
+              <th>凭据文件</th><th>站点</th><th>昵称</th><th>UID</th><th>认证域名</th>
+              <th>Access Token</th><th>Refresh Token</th>
+              <th>Token 到期</th><th>刷新令牌到期</th><th>上次续期</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

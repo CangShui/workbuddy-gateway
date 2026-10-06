@@ -3,7 +3,7 @@
 <img width="917" height="754" alt="image" src="https://github.com/user-attachments/assets/7dcfc461-1357-4991-9565-279047687898" />
 
 
-基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。无 Web UI，全部通过命令行（CLI）完成登录、凭据续期与服务控制。
+基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。默认无 Web UI，全部通过命令行（CLI）完成登录、凭据续期与服务控制；可选开启只读管理台（`-webui`，见下文）。
 
 **同时支持两个上游站点**（同一套 `/v2/plugin/*` 协议，凭据按站点隔离，账号池可混挂轮询）：
 
@@ -23,6 +23,7 @@
 - [status](#status)
 - [refresh](#refresh)
 - [monitor](#monitor)
+- [webui（只读管理台）](#webui只读管理台)
 - [probe](#probe)
 - [reset](#reset)
 - [version / help](#version--help)
@@ -88,6 +89,7 @@ workbuddy-gateway [command] [options]
 | `-reload-interval <sec>` | `5` | 凭据热加载扫描间隔，`0` 关闭 |
 | `-models-refresh <min>` | `60` | 模型目录刷新间隔，`0` 关闭 |
 | `-disable-price-probes` | `false` | 禁止后台自动价格探测，避免自动发起模型生成请求；不影响客户端请求及显式 `probe` 命令 |
+| `-webui` | `false` | 启用只读管理台（`/ui` 与 `/admin/api/*`）；必须同时设置 `-api-key`，否则拒绝启动 |
 
 ### JSON 调试日志
 
@@ -314,6 +316,8 @@ workbuddy-gateway serve -models-refresh 0
 | GET | `/v1/models`、`/models` | 模型列表，响应头 `X-Model-Source` 标注来源 |
 | GET | `/health`、`/ping` | 健康检查，返回 `version`、`model_count`、`model_source` |
 | POST | `/admin/probe` | 供 `probe` 命令调用，**仅接受回环来源** |
+| GET | `/ui/` | 只读管理台静态页面（仅 `-webui` 启用时存在） |
+| GET | `/admin/api/*` | 只读管理台数据接口（仅 `-webui` 启用时存在，需 API 密钥） |
 | GET | `/` | 简单文本说明 |
 
 从 v1.13.15 起，Responses `function_call_output.output` 支持文本和图片内容块数组：
@@ -515,6 +519,33 @@ workbuddy-gateway monitor -interval 2 -lines 20
 | 平均首字(5h) | 最近 5 小时滚动窗口内的平均首字响应时间（TTFT），按小时分桶、自动淘汰过期样本 |
 | 平均总耗时(5h) | 最近 5 小时滚动窗口内的平均总耗时 |
 | 总Token(M) | 进程启动后累计的上游 usage token，单位百万；优先 `usage.total_tokens`，没有则用 `prompt_tokens + completion_tokens`；上游未返回 usage 的请求不估算 |
+
+---
+
+## webui（只读管理台）
+
+默认关闭。开启后在同一端口提供只读管理台，用于在浏览器查看账号池、模型统计、日志、`config.json` 与凭据文件（令牌脱敏），**不提供任何写操作**。
+
+```bash
+# 必须同时设置 -api-key，否则拒绝启动
+workbuddy-gateway serve -webui -api-key sk-changeme
+
+# 浏览器打开
+# http://127.0.0.1:8317/ui/
+```
+
+| 项 | 说明 |
+|---|---|
+| 入口 | `GET /ui/`（静态外壳，免鉴权，本身不含任何数据） |
+| 数据接口 | `GET /admin/api/status`、`/admin/api/models`、`/admin/api/logs`、`/admin/api/config`、`/admin/api/credentials`，**一律需要 `Authorization: Bearer <api-key>`** |
+| 页面 | 总览（含国内站 / 国际站的账号数量分站点统计）、账号、模型、日志、配置（只读）、凭据（只读 · 脱敏） |
+| 数据来源 | 复用 `serve` 周期写入的 `workbuddy-status.json`、`logs/` 日志与本地配置/凭据文件，不改变转发与调度逻辑 |
+| 凭据展示 | 只显示站点、昵称、UID、认证域名与到期时间；令牌仅保留前 6 位（如 `ACCESS****`），不返回明文 |
+
+- 未启用 `-webui` 时，`/ui` 与 `/admin/api/*` 均不注册路由：通过鉴权后返回 `404`；若同时设置了 `-api-key`，未携带密钥的请求会先在鉴权层被拦为 `401`。
+- `/admin/api/logs` 只允许读取 `logs/` 下的 `gateway-YYYY-MM-DD.log` 与 `debug-YYYY-MM-DD.jsonl`，拒绝任意路径与目录穿越。
+- 前端为原生 HTML/CSS/JS，通过 `go:embed` 嵌入二进制，无额外构建步骤与运行时依赖；首次访问需在页面填入与 `-api-key` 一致的密钥（存于浏览器 `localStorage`，随请求以 Bearer 头发送）。
+- 该功能为只读，不提供刷新 / 探测 / 重置等写操作。
 
 ---
 
