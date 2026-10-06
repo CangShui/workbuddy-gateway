@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	version = "1.13.15"
+	version = "1.13.16"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -356,6 +356,9 @@ type quotaSummaryData struct {
 type Config struct {
 	Addr               string
 	Port               int
+	PortExplicit       bool
+	WebPort            int
+	AdminKey           string
 	AuthFile           string
 	AuthDir            string
 	AuthExplicit       bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
@@ -374,7 +377,7 @@ type Config struct {
 	KeepaliveHours     []int  // 主动续期时刻（本地小时），空表示关闭；到点主动刷新全部账号
 	ProbeModels        string // probe 专用：逗号分隔的模型列表
 	ProbeLimit         int    // probe 专用：未显式指定模型时的取用数量
-	WebUI              bool   // 启用只读管理台（/ui + /admin/api/*），需同时设置 -api-key
+	WebUI              bool   // 仅显式 -webui 才启动独立管理端口
 	HttpClient         *http.Client
 }
 
@@ -497,12 +500,21 @@ func main() {
 	}
 
 	fs := flag.NewFlagSet(command, flag.ExitOnError)
+	// legacyAPIKeyFlag 仅用于吞掉旧启动命令里的 -api-key，避免升级后报未知参数而启动失败。
+	// 该值不会被任何逻辑读取，也不会产生任何日志或状态变化；用法说明留空，
+	// 使其不出现在 --help 与默认参数列表中。
+	// TODO(remove): 纯兼容占位，计划在后续版本连同下面这行注册一起删除。
+	var legacyAPIKeyFlag string
 	fs.StringVar(&cfg.Addr, "addr", "127.0.0.1", "网关监听地址")
-	fs.IntVar(&cfg.Port, "port", 8317, "网关监听端口")
+	fs.IntVar(&cfg.Port, "port", defaultAPIPort, "API 监听端口（显式传入时覆盖 config.json 的 gateway.apiPort）")
 	fs.StringVar(&cfg.AuthFile, "auth", "workbuddy.json", "凭据存储文件路径（支持逗号分隔多个文件实现多账号）")
 	fs.StringVar(&cfg.AuthDir, "auth-dir", "", "凭据目录：自动加载目录下所有 workbuddy*.json 作为多账号池")
-	fs.StringVar(&cfg.APIKey, "api-key", "", "可选：访问网关所需的 API Key (客户端 Bearer 校验)")
 	fs.StringVar(&cfg.ProxyURL, "proxy", "", "可选：上游请求代理 (如 http://127.0.0.1:7890)")
+	fs.StringVar(&legacyAPIKeyFlag, "api-key", "", "")
+	// 自定义参数错误提示，避免默认 PrintDefaults 把兼容占位参数列出来。
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "参数有误，请运行 %s --help 查看可用参数\n", os.Args[0])
+	}
 	fs.BoolVar(&cfg.Verbose, "verbose", false, "输出详细调试日志")
 	fs.BoolVar(&cfg.LoginIntl, "intl", false, "login 专用：登录国际站 (www.workbuddy.ai，浏览器内完成登录)；默认登录国内站")
 	fs.IntVar(&cfg.MonitorInterval, "interval", 3, "monitor 状态刷新间隔（秒）")
@@ -516,7 +528,7 @@ func main() {
 	fs.Var(&keepaliveHours, "keepalive-hours", "主动续期时刻（本地小时，逗号分隔，默认 22）；留空关闭")
 	fs.StringVar(&cfg.ProbeModels, "models", "", "probe 专用：逗号分隔的待探测模型（默认取目录前几个）")
 	fs.IntVar(&cfg.ProbeLimit, "limit", 5, "probe 专用：未指定 -models 时探测的模型数量上限")
-	fs.BoolVar(&cfg.WebUI, "webui", false, "启用只读管理台 (/ui 与 /admin/api/*)；必须同时设置 -api-key，否则拒绝启动")
+	fs.BoolVar(&cfg.WebUI, "webui", false, "启用独立网页控制台；管理 Key、API 鉴权与端口由 config.json 配置")
 	_ = fs.Parse(args)
 	cfg.KeepaliveHours = []int(keepaliveHours)
 
@@ -527,13 +539,17 @@ func main() {
 		if f.Name == "auth" {
 			cfg.AuthExplicit = true
 		}
+		if f.Name == "port" {
+			cfg.PortExplicit = true
+		}
 	})
 	serveCommand := command == "serve" || command == "run" || command == "start"
-	if serveCommand {
+	if serveCommand || command == "probe" {
 		if err := loadRuntimeConfig(runtimeConfigFile); err != nil {
 			fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
 			os.Exit(1)
 		}
+		ignoreLegacyAPIKeyFlag(legacyAPIKeyFlag)
 	}
 
 	// 初始化 HTTP 客户端
@@ -576,7 +592,9 @@ func main() {
 
 // initFileLogging 将运行日志同时写入控制台和按日期命名的项目日志文件。
 func initFileLogging(command string) func() {
-	registerSecrets(cfg.APIKey)
+	gatewayConfigMu.RLock()
+	registerSecrets(cfg.APIKey, cfg.AdminKey, gatewaySettings.APIKey)
+	gatewayConfigMu.RUnlock()
 	// 文件初始化失败时，控制台仍要隐藏秘密值。
 	log.SetOutput(&redactingLogWriter{writer: os.Stderr})
 	if err := os.MkdirAll(logDir, 0755); err != nil {
@@ -634,16 +652,16 @@ func printHelp() {
                     主动续期时刻（本地小时，逗号分隔，默认 22）
                     到点主动刷新全部账号登录凭据，不等访问令牌临近过期；
                     留空关闭。只调刷新接口，不请求模型、不消耗额度
-  -webui            启用只读管理台 (http://<addr>:<port>/ui/)：
-                    展示账号池/模型统计/日志/config.json/凭据（令牌脱敏）。
-                    必须同时设置 -api-key，否则拒绝启动；/admin/api/* 一律需要鉴权
+  -webui            启用独立网页控制台 (默认 http://<addr>:8316/ui/)：
+                    展示账号池/模型统计/日志/config.json/凭据（令牌脱敏），
+                    并可切换模型 API Key 校验；管理 Key 与端口在 config.json
+                    的 gateway 段配置，管理 Key 为空时可在服务器本机首次生成
 
 probe 选项:
   -auth <path>      只探测指定凭据文件（文件名或路径均可）；默认探测全部账号
   -models <m1,m2>   指定要探测的模型；默认取模型目录前几个
   -limit <n>        未指定 -models 时探测的模型数量（默认 5，上限 50）
-  -addr/-port       需与运行中的 serve 一致；-api-key 启用时 probe 会自动携带
-  -api-key <key>    设置后，调用网关必须携带 Bearer <key> 鉴权
+  -addr/-port       需与运行中的 serve 一致；模型 API 开启 Key 校验时 probe 自动携带 gateway.apiKey
   -proxy <url>      设置上游转发代理 (例如 http://127.0.0.1:7890 或 socks5://...)
   -verbose          输出详细调试日志 (请求/响应体)
 
@@ -2697,56 +2715,8 @@ func tailLines(path string, n int) ([]string, error) {
 		return nil, err
 	}
 	defer f.Close()
-	// 先定位到文件末尾，从后向前扫描 n 个换行符
-	const chunk = 4096
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	size := fi.Size()
-	var lines []string
-	buf := make([]byte, chunk)
-	pos := size
-	lineBuf := make([]byte, 0, chunk)
-	newlines := 0
-	for pos > 0 && newlines <= n {
-		read := int64(chunk)
-		if pos < chunk {
-			read = pos
-		}
-		pos -= read
-		if _, err := f.Seek(pos, io.SeekStart); err != nil {
-			break
-		}
-		rn, err := f.Read(buf[:read])
-		if err != nil && rn == 0 {
-			break
-		}
-		for i := rn - 1; i >= 0; i-- {
-			if buf[i] == '\n' {
-				if len(lineBuf) > 0 {
-					lines = append([]string{string(lineBuf)}, lines...)
-					lineBuf = lineBuf[:0]
-					newlines++
-					if newlines > n {
-						break
-					}
-				}
-			} else {
-				lineBuf = append([]byte{buf[i]}, lineBuf...)
-			}
-		}
-		if newlines > n {
-			break
-		}
-	}
-	if len(lineBuf) > 0 && newlines <= n {
-		lines = append([]string{string(lineBuf)}, lines...)
-	}
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
-	return lines, nil
+	lines, _, err := readTailLines(f, n, 0)
+	return lines, err
 }
 
 // journalLines 获取 systemd 服务最近 n 行日志（Linux journalctl）。
@@ -2969,11 +2939,17 @@ func runLogin() {
 // -----------------------------------------------------------------------------
 
 func runServe() {
-	// 只读管理台会暴露账号/额度等运行信息，必须配合 API 密钥才能开启。
-	if err := webUIPreflightError(); err != nil {
+	// 先绑定全部所需端口；任一失败就释放已经绑定的端口，不启动半套服务。
+	servers, listeners, err := prepareGatewayServers()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
 		os.Exit(1)
 	}
+	defer func() {
+		for _, listener := range listeners {
+			_ = listener.Close()
+		}
+	}()
 	loadModelsCache()
 	if err := loadAccounts(); err != nil {
 		fmt.Printf("警告: 未检测到有效凭据 (%v)。\n请先执行: workbuddy-gateway login 扫码登录，或确保凭据文件存在。\n\n", err)
@@ -3009,35 +2985,7 @@ func runServe() {
 		go accountReloaderLoop()
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", handleChatCompletions)
-	mux.HandleFunc("/chat/completions", handleChatCompletions)
-	mux.HandleFunc("/v1/responses", handleResponses)
-	mux.HandleFunc("/responses", handleResponses)
-	mux.HandleFunc("/v1/messages", handleMessages)
-	mux.HandleFunc("/v1/messages/count_tokens", handleCountTokens)
-	mux.HandleFunc("/v1/models", handleModels)
-	mux.HandleFunc("/models", handleModels)
-	mux.HandleFunc("/health", handleHealth)
-	mux.HandleFunc("/ping", handleHealth)
-	mux.HandleFunc("/admin/probe", handleAdminProbe)
-	mux.HandleFunc("/", handleIndex)
-
-	// 只读管理台：仅在显式启用时注册，避免默认暴露。
-	if cfg.WebUI {
-		registerWebUIRoutes(mux)
-	}
-
-	listenAddr := fmt.Sprintf("%s:%d", cfg.Addr, cfg.Port)
-	server := &http.Server{
-		Addr:        listenAddr,
-		Handler:     requestAuditMiddleware(corsMiddleware(authMiddleware(mux))),
-		ReadTimeout: 120 * time.Second,
-		// WriteTimeout 覆盖「读完请求头 → 响应写完」的总时长。流式对话可能持续数分钟，
-		// 原来的 300s 会给长流设硬上限并中途掐断，因此这里不限总时长，
-		// 改由上游 idleReadCloser 的空闲超时和客户端自身取消来控制。
-		WriteTimeout: 0,
-	}
+	listenAddr := servers[0].Addr
 
 	fmt.Println("================================================================")
 	fmt.Printf("WorkBuddy 本地网关已启动\n")
@@ -3053,15 +3001,18 @@ func runServe() {
 	} else {
 		fmt.Printf("   凭据热加载:    已关闭 (-reload-interval 0)\n")
 	}
-	if cfg.APIKey != "" {
+	if currentAPIKey() != "" {
 		printAPIAuthBanner(os.Stdout)
 	} else {
 		fmt.Printf("   API 鉴权:      未启用 (任何客户端均可直连)\n")
 	}
 	if cfg.WebUI {
-		fmt.Printf("   只读管理台:    已启用 http://%s/ui/ (需 API 密钥)\n", listenAddr)
+		fmt.Printf("   网页控制台:    已启用 http://%s/ui/ (独立管理 Key)\n", servers[1].Addr)
+		if currentAdminKey() == "" {
+			fmt.Println("   管理初始化:    请在本机或 SSH 隧道打开网页生成管理 Key，保存成功后仅弹窗展示一次")
+		}
 	} else {
-		fmt.Printf("   只读管理台:    未启用 (-webui 可开启，需配合 -api-key)\n")
+		fmt.Println("   网页控制台:    未启用 (-webui 可开启)")
 	}
 	if cfg.ProxyURL != "" {
 		fmt.Printf("   上游出口代理:  %s\n", cfg.ProxyURL)
@@ -3121,18 +3072,32 @@ func runServe() {
 
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP 服务异常退出: %v", err)
-		}
-	}()
-
-	<-stopChan
+	defer signal.Stop(stopChan)
+	serveErrors := make(chan error, len(servers))
+	for i := range servers {
+		go func(i int) {
+			if err := servers[i].Serve(listeners[i]); err != nil && err != http.ErrServerClosed {
+				serveErrors <- err
+			}
+		}(i)
+	}
+	select {
+	case <-stopChan:
+	case err := <-serveErrors:
+		log.Printf("[服务异常] traceId=%s 原因=%v 说明=同时关闭API与管理监听，避免半可用状态", newTraceID(), err)
+	}
 	fmt.Println("\n正在关闭网关服务...")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = server.Shutdown(ctx)
+	var shutdown sync.WaitGroup
+	for _, server := range servers {
+		shutdown.Go(func() {
+			if err := server.Shutdown(ctx); err != nil {
+				_ = server.Close()
+			}
+		})
+	}
+	shutdown.Wait()
 	fmt.Println("网关已安全停止。")
 }
 
@@ -3235,27 +3200,22 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// isAuthExemptPath 返回无需 API 密钥即可访问的路径。
-// /health、/ping 与根路径保持原有放行；启用管理台时，/ui 静态外壳也放行
-// （外壳不含任何数据，浏览器导航无法携带 Authorization 头），
-// 但 /admin/api/* 一律需要密钥。
+// API 端口只保留原有健康与根路径免鉴权；管理端口使用独立鉴权链。
 func isAuthExemptPath(p string) bool {
-	if p == "/health" || p == "/ping" || p == "/" {
-		return true
-	}
-	return webUIIsExemptPath(p)
+	return p == "/health" || p == "/ping" || p == "/"
 }
 
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if cfg.APIKey != "" && !isAuthExemptPath(r.URL.Path) {
+		apiKey := currentAPIKey()
+		if apiKey != "" && !isAuthExemptPath(r.URL.Path) {
 			authHeader := r.Header.Get("Authorization")
 			token := strings.TrimPrefix(authHeader, "Bearer ")
 			// Anthropic 客户端（Claude Code 等）用 x-api-key 头携带密钥。
 			if token == "" {
 				token = r.Header.Get("x-api-key")
 			}
-			if subtle.ConstantTimeCompare([]byte(token), []byte(cfg.APIKey)) != 1 {
+			if subtle.ConstantTimeCompare([]byte(token), []byte(apiKey)) != 1 {
 				debugEvent(r, "warn", "authentication_rejected", map[string]any{
 					"status_code":     http.StatusUnauthorized,
 					"reason":          "invalid_api_key",

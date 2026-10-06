@@ -321,8 +321,8 @@ func runProbe() {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if cfg.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	if key := currentAPIKey(); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	fmt.Printf("正在请求 %s（账号=%s，模型=%s）...\n", url, ifEmpty(reqBody.Auth, "全部"), ifEmpty(strings.Join(reqBody.Models, ","), "目录前若干"))
 

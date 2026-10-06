@@ -15,7 +15,7 @@ import (
 var sensitiveSecrets sync.Map
 
 var (
-	namedSecretPattern  = regexp.MustCompile(`(?i)(\b(?:access[_-]?token|refresh[_-]?token|api[_-]?key|x-api-key|x-refresh-token|authorization)\b["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'[^']*'|(?:Bearer[ \t]+)?[^\s,;}\[\]]+)`)
+	namedSecretPattern  = regexp.MustCompile(`(?i)(\b(?:access[_-]?token|refresh[_-]?token|admin[_-]?key|api[_-]?key|x-api-key|x-refresh-token|authorization)\b["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'[^']*'|(?:Bearer[ \t]+)?[^\s,;}\[\]]+)`)
 	bearerSecretPattern = regexp.MustCompile(`(?i)(\bBearer[ \t]+)[A-Za-z0-9._~+/=-]+`)
 )
 
@@ -160,7 +160,7 @@ func redactDebugValue(value any) any {
 func secretLogField(key string) bool {
 	key = strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(key))
 	switch key {
-	case "accesstoken", "refreshtoken", "apikey", "xapikey", "xrefreshtoken", "authorization":
+	case "accesstoken", "refreshtoken", "adminkey", "apikey", "xapikey", "xrefreshtoken", "authorization":
 		return true
 	default:
 		return false

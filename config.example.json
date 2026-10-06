@@ -1,4 +1,11 @@
 {
+  "gateway": {
+    "apiPort": 8317,
+    "webPort": 8316,
+    "adminKey": "",
+    "apiKeyEnabled": false,
+    "apiKey": ""
+  },
   "systemPrompt": {
     "fallback": "",
     "force": ""

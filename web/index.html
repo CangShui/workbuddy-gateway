@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>WorkBuddy 本地网关 · 管理台</title>
+<title>WorkBuddy 本地网关 · 网页控制台</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -11,32 +11,43 @@
   <div class="brand">
     <span class="dot"></span>
     <h1>WorkBuddy 本地网关</h1>
-    <span class="tag">只读管理台</span>
+    <span class="tag">网页控制台</span>
   </div>
   <div class="topbar-right">
     <span class="conn" id="conn">未连接</span>
     <div class="meta" id="meta"></div>
     <span class="key-field">
-      <span>API 密钥</span>
-      <input id="apiKey" type="password" placeholder="Bearer 密钥" autocomplete="off">
+      <label for="apiKey">管理 Key</label>
+      <input id="apiKey" type="password" placeholder="独立管理 Key" autocomplete="off">
     </span>
-    <button id="saveKey" type="button">保存并校验</button>
+    <button id="saveKey" type="button">登录</button>
+    <button id="logout" class="ghost" type="button">退出</button>
     <button id="themeToggle" class="ghost" type="button" title="切换主题">主题</button>
   </div>
 </header>
 
-<nav class="tabs" id="tabs">
+<nav class="tabs hidden" id="tabs">
   <button class="tab active" data-tab="overview" type="button">总览</button>
   <button class="tab" data-tab="accounts" type="button">账号</button>
   <button class="tab" data-tab="models" type="button">模型</button>
   <button class="tab" data-tab="logs" type="button">日志</button>
   <button class="tab" data-tab="config" type="button">配置</button>
   <button class="tab" data-tab="credentials" type="button">凭据</button>
+  <button class="tab" data-tab="settings" type="button">访问设置</button>
 </nav>
 
 <div id="alert" class="alert hidden"></div>
 
-<main>
+<section id="setupPanel" class="setup-panel card hidden">
+  <h2>首次设置管理 Key</h2>
+  <p id="setupHelp">服务器将生成一个 32 字符随机管理 Key，写入 config.json，并仅在本次操作完成后弹窗展示。请妥善保存。</p>
+  <p class="hint">两种设置方式：① 在服务器本机（或 SSH 本地端口转发）打开本页，一键生成 32 字符随机 Key；
+    ② 直接在服务器上编辑 config.json，把 gateway.adminKey 设为随机字符串后重启网关。
+    自动生成仅限本机，避免远程抢先初始化；设置完成后可从其他设备使用管理 Key 登录。</p>
+  <button id="initializeAdmin" type="button">生成并保存管理 Key</button>
+</section>
+
+<main id="dashboard" class="hidden">
   <section id="panel-overview" class="panel active">
     <div class="cards" id="summaryCards"></div>
     <div class="card">
@@ -111,7 +122,7 @@
   <section id="panel-config" class="panel">
     <div class="card">
       <div class="card-title">
-        config.json（只读）
+        config.json（只读 · Key 已隐藏）
         <span class="filter">
           <label><input type="checkbox" id="maskHints" checked> 隐藏 systemPrompt 正文</label>
         </span>
@@ -135,6 +146,28 @@
           </thead>
           <tbody></tbody>
         </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="panel-settings" class="panel">
+    <div class="card settings-card">
+      <div class="card-title">模型 API 访问设置</div>
+      <p class="hint">这里只控制模型 API。管理 Key 始终需要验证，与本开关无关。</p>
+      <div class="settings-row">
+        <label for="apiKeyEnabled"><input id="apiKeyEnabled" type="checkbox"> 开启模型 API Key 校验</label>
+      </div>
+      <div class="settings-row">
+        <label for="modelAPIKey">模型 API Key</label>
+        <input id="modelAPIKey" type="password" autocomplete="new-password" placeholder="开启校验时必须设置；已有 Key 可留空保留">
+        <span id="apiKeyState" class="hint"></span>
+      </div>
+      <p class="hint">关闭时，客户端不带 Key 或使用任意 Key 均可调用模型。开启时必须匹配已保存的 API Key；保存后立即生效，已有流式请求不被主动中断。</p>
+      <button id="saveAPISettings" type="button">保存 API 访问设置</button>
+      <div class="settings-ports">
+        <div>API 监听端口：<strong id="apiPortValue">-</strong></div>
+        <div>Web 监听端口：<strong id="webPortValue">-</strong></div>
+        <p class="hint">端口在 config.json 的 gateway.apiPort / gateway.webPort 中配置，修改后重启生效。默认 API 8317、Web 8316。</p>
       </div>
     </div>
   </section>

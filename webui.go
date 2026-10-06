@@ -4,10 +4,11 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
+	"log"
+	"net"
 	"net/http"
 	"os"
 	"path"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -15,7 +16,7 @@ import (
 	"time"
 )
 
-// WebUI 是只读管理台：浏览器静态外壳 + /admin/api/* 只读 JSON 接口。
+// WebUI 是独立端口的管理台：状态接口只读，仅首次设置与鉴权配置允许写入。
 // 设计约束：不改变转发主链路与调度逻辑，仅复用进程已有的状态快照、模型统计、
 // 日志文件与配置/凭据文件，凭据令牌一律脱敏。
 //
@@ -30,11 +31,10 @@ const (
 // webuiEnabled 返回当前进程是否启用只读管理台。
 func webuiEnabled() bool { return cfg.WebUI }
 
-// webUIPreflightError 校验管理台启动前置条件：启用时必须设置 API 密钥，
-// 否则接口会暴露账号与额度信息。
+// 管理 Key 可在首次本机访问时初始化，不能再强制开启模型 API 鉴权。
 func webUIPreflightError() error {
-	if cfg.WebUI && cfg.APIKey == "" {
-		return errors.New("启用 -webui 时必须同时设置 -api-key（管理台接口会暴露账号与额度信息）")
+	if cfg.WebUI && cfg.Port == cfg.WebPort {
+		return errors.New("API 与 Web 端口不能相同")
 	}
 	return nil
 }
@@ -57,6 +57,9 @@ func registerWebUIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/logs", handleWebUILogs)
 	mux.HandleFunc("/admin/api/config", handleWebUIConfig)
 	mux.HandleFunc("/admin/api/credentials", handleWebUICredentials)
+	mux.HandleFunc("/admin/api/setup", handleWebUISetup)
+	mux.HandleFunc("/admin/api/settings", handleWebUISettings)
+	mux.HandleFunc("/admin/api/client-events", handleWebUIClientEvent)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -72,6 +75,10 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 // handleWebUIIndex 提供管理台静态外壳与静态资源。
 // 访问 /ui 时跳到 /ui/，保证相对资源路径正确；/ui/<file> 按名读取嵌入资源。
 func handleWebUIIndex(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeJSONError(w, http.StatusMethodNotAllowed, "仅支持 GET/HEAD")
+		return
+	}
 	if r.URL.Path == webUIPrefix {
 		http.Redirect(w, r, webUIPrefixSlash, http.StatusFound)
 		return
@@ -115,6 +122,7 @@ type webGatewayMeta struct {
 	APIKeyEnabled bool   `json:"apiKeyEnabled"`
 	WebUIEnabled  bool   `json:"webuiEnabled"`
 	ModelSource   string `json:"modelSource,omitempty"`
+	WebListen     string `json:"webListen,omitempty"`
 }
 
 // webStatusResponse 是 /admin/api/status 的响应体。
@@ -125,19 +133,23 @@ type webStatusResponse struct {
 	SiteSummary map[string]map[string]int `json:"siteSummary"`
 	Accounts    []accountSnapshot         `json:"accounts"`
 	Models      []modelStatSnapshot       `json:"models"`
+	Stale       bool                      `json:"stale"`
 }
 
 // readStatusSnapshot 读取 serve 周期写入的状态快照（与 monitor 命令同一数据源）。
-func readStatusSnapshot() (statusSnapshot, bool) {
+func readStatusSnapshot() (statusSnapshot, error) {
 	data, err := os.ReadFile(statusSnapshotFile)
 	if err != nil {
-		return statusSnapshot{}, false
+		return statusSnapshot{}, err
 	}
 	var snap statusSnapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
-		return statusSnapshot{}, false
+		return statusSnapshot{}, err
 	}
-	return snap, true
+	if snap.UpdatedAt <= 0 {
+		return statusSnapshot{}, errors.New("状态快照没有有效更新时间")
+	}
+	return snap, nil
 }
 
 func summarizeAccounts(accs []accountSnapshot) map[string]int {
@@ -184,18 +196,24 @@ func handleWebUIStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "仅支持 GET")
 		return
 	}
-	snap, _ := readStatusSnapshot()
+	snap, err := readStatusSnapshot()
+	if err != nil {
+		webSnapshotUnavailable(w, r, err)
+		return
+	}
 	resp := webStatusResponse{
 		Gateway: webGatewayMeta{
 			Version:       version,
-			Listen:        cfg.Addr + ":" + strconv.Itoa(cfg.Port),
-			APIKeyEnabled: cfg.APIKey != "",
+			Listen:        net.JoinHostPort(cfg.Addr, strconv.Itoa(cfg.Port)),
+			WebListen:     net.JoinHostPort(cfg.Addr, strconv.Itoa(cfg.WebPort)),
+			APIKeyEnabled: currentAPIKey() != "",
 			WebUIEnabled:  webuiEnabled(),
 			ModelSource:   modelSourceLabel(modelSourceFromSnapshots(snap.Models)),
 		},
 		UpdatedAt: snap.UpdatedAt,
 		Accounts:  snap.Accounts,
 		Models:    snap.Models,
+		Stale:     time.Now().Unix()-snap.UpdatedAt > 15,
 	}
 	if resp.Accounts == nil {
 		resp.Accounts = []accountSnapshot{}
@@ -205,7 +223,8 @@ func handleWebUIStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Summary = summarizeAccounts(resp.Accounts)
 	resp.SiteSummary = summarizeAccountsBySite(resp.Accounts)
-	writeJSON(w, http.StatusOK, resp)
+	log.Printf("[管理状态] traceId=%s 结果=读取成功 账号数=%d 模型数=%d 快照过旧=%t 说明=只展示快照，不调用上游或改变账本", debugTraceID(r), len(resp.Accounts), len(resp.Models), resp.Stale)
+	writeAdminData(w, r, resp)
 }
 
 func handleWebUIModels(w http.ResponseWriter, r *http.Request) {
@@ -213,15 +232,26 @@ func handleWebUIModels(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "仅支持 GET")
 		return
 	}
-	snap, _ := readStatusSnapshot()
+	snap, err := readStatusSnapshot()
+	if err != nil {
+		webSnapshotUnavailable(w, r, err)
+		return
+	}
 	models := snap.Models
 	if models == nil {
 		models = []modelStatSnapshot{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	log.Printf("[管理模型] traceId=%s 结果=读取成功 模型数=%d", debugTraceID(r), len(models))
+	writeAdminData(w, r, map[string]any{
 		"source": modelSourceLabel(modelSourceFromSnapshots(models)),
 		"models": models,
+		"stale":  time.Now().Unix()-snap.UpdatedAt > 15,
 	})
+}
+
+func webSnapshotUnavailable(w http.ResponseWriter, r *http.Request, err error) {
+	log.Printf("[管理状态] traceId=%s 阶段=读取快照 结果=失败 原因=%v 状态码=503 业务影响=前端保留上次数据，不伪装成零账号", debugTraceID(r), err)
+	writeJSONError(w, http.StatusServiceUnavailable, "状态快照暂不可用，请稍后重试；已有页面数据不是新的零账号结果")
 }
 
 var logFilePattern = regexp.MustCompile(`^(gateway-\d{4}-\d{2}-\d{2}\.log|debug-\d{4}-\d{2}-\d{2}\.jsonl)$`)
@@ -240,7 +270,7 @@ func listLogFiles() []logFileInfo {
 	}
 	files := make([]logFileInfo, 0, len(entries))
 	for _, e := range entries {
-		if e.IsDir() || !logFilePattern.MatchString(e.Name()) {
+		if !e.Type().IsRegular() || !logFilePattern.MatchString(e.Name()) {
 			continue
 		}
 		info, err := e.Info()
@@ -259,8 +289,9 @@ func handleWebUILogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	files := listLogFiles()
-	name := baseNameSafe(r.URL.Query().Get("file"))
-	if name != "" && !logFilePattern.MatchString(name) {
+	name := r.URL.Query().Get("file")
+	if name != "" && (baseNameSafe(name) != name || !logFilePattern.MatchString(name)) {
+		log.Printf("[管理日志] traceId=%s 结果=拒绝 原因=日志文件名不合法 状态码=400", debugTraceID(r))
 		writeJSONError(w, http.StatusBadRequest, "非法的日志文件名")
 		return
 	}
@@ -278,15 +309,38 @@ func handleWebUILogs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resp := map[string]any{"files": files, "file": name, "lines": []string{}}
+	resp := map[string]any{"files": files, "file": name, "lines": []string{}, "truncated": false, "readBudgetBytes": webUILogReadBudget}
 	if name != "" {
-		if lines, err := tailLines(filepath.Join(logDir, name), linesN); err == nil {
-			resp["lines"] = lines
-		} else {
-			resp["error"] = err.Error()
+		log.Printf("[管理日志] traceId=%s 阶段=读取 文件=%s 请求行数=%d 扫描字节预算=%d", debugTraceID(r), name, linesN, webUILogReadBudget)
+		lines, truncated, err := readWebLog(name, linesN)
+		if err != nil {
+			log.Printf("[管理日志] traceId=%s 结果=失败 文件=%s 原因=%v 状态码=503", debugTraceID(r), name, err)
+			writeJSONError(w, http.StatusServiceUnavailable, "日志暂不可读，请刷新文件列表后重试")
+			return
 		}
+		// 脱敏完整行副本，覆盖旧版本写出的日志；不改动文件或业务错误。
+		if len(lines) > 0 {
+			// 一批日志只建立一次秘密值替换器，避免逐行重复构建。
+			lines = strings.Split(redactSensitiveText(strings.Join(lines, "\n")), "\n")
+		}
+		resp["lines"], resp["truncated"] = lines, truncated
+		log.Printf("[管理日志] traceId=%s 结果=成功 返回行数=%d 预算截断=%t 秘密值已隐藏=true", debugTraceID(r), len(lines), truncated)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func readWebLog(name string, lines int) ([]string, bool, error) {
+	root, err := os.OpenRoot(logDir)
+	if err != nil {
+		return nil, false, err
+	}
+	defer root.Close()
+	f, err := root.Open(name)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	return readTailLines(f, lines, webUILogReadBudget)
 }
 
 // baseNameSafe 只取基名，避免任何目录穿越意图进入后续校验。
@@ -304,17 +358,36 @@ func handleWebUIConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "仅支持 GET")
 		return
 	}
+	gatewayConfigMu.RLock()
 	data, err := os.ReadFile(runtimeConfigFile)
+	gatewayConfigMu.RUnlock()
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"exists": false, "path": runtimeConfigFile, "content": "",
-		})
+		if errors.Is(err, os.ErrNotExist) {
+			writeJSON(w, http.StatusOK, map[string]any{"exists": false, "path": runtimeConfigFile, "content": ""})
+		} else {
+			log.Printf("[管理配置读取] traceId=%s 结果=失败 原因=%v", debugTraceID(r), err)
+			writeJSONError(w, http.StatusServiceUnavailable, "配置文件暂不可读")
+		}
 		return
 	}
+	var parsed any
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&parsed); err != nil || ensureJSONEOF(decoder) != nil {
+		log.Printf("[管理配置读取] traceId=%s 结果=失败 原因=配置文件不是有效JSON，拒绝返回未脱敏原文", debugTraceID(r))
+		writeJSONError(w, http.StatusServiceUnavailable, "配置文件暂不可解析")
+		return
+	}
+	safe, err := json.MarshalIndent(redactDebugValue(parsed), "", "  ")
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "配置展示编码失败")
+		return
+	}
+	log.Printf("[管理配置读取] traceId=%s 结果=成功 管理Key与APIKey已隐藏=true 说明=磁盘配置仍按用户要求明文保存", debugTraceID(r))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"exists":  true,
 		"path":    runtimeConfigFile,
-		"content": string(data),
+		"content": string(safe),
 	})
 }
 
@@ -379,7 +452,8 @@ func handleWebUICredentials(w http.ResponseWriter, r *http.Request) {
 		view.RefreshTokenMasked = maskToken(sa.Auth.RefreshToken)
 		views = append(views, view)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	log.Printf("[管理凭据] traceId=%s 结果=读取完成 文件数=%d 说明=只返回脱敏视图，不触发刷新或写入", debugTraceID(r), len(views))
+	writeAdminData(w, r, map[string]any{
 		"hint":  "令牌已脱敏，仅显示前缀；完整凭据仅保存在本地凭据文件中。",
 		"files": views,
 		// 保留字段名便于前端展示生成时间

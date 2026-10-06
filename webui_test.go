@@ -8,26 +8,24 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // setWebUI 临时启用/关闭管理台并在用例结束后还原，避免污染其他测试。
 func setWebUI(t *testing.T, enabled bool, apiKey string) {
 	t.Helper()
-	oldWebUI, oldKey := cfg.WebUI, cfg.APIKey
+	oldCfg := cfg
 	cfg.WebUI = enabled
-	cfg.APIKey = apiKey
+	cfg.AdminKey = apiKey
+	cfg.Port, cfg.WebPort = defaultAPIPort, defaultWebPort
 	t.Cleanup(func() {
-		cfg.WebUI = oldWebUI
-		cfg.APIKey = oldKey
+		cfg = oldCfg
 	})
 }
 
-// newWebUIMux 构造与 runServe 一致的中间件链（不含审计中间件，避免测试日志噪音）。
+// 使用真实的独立管理端口中间件链，包括鉴权、来源校验及审计。
 func newWebUIMux() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", handleIndex)
-	registerWebUIRoutes(mux)
-	return corsMiddleware(authMiddleware(mux))
+	return newWebUIHandler()
 }
 
 func TestWebUIPreflightError(t *testing.T) {
@@ -38,7 +36,7 @@ func TestWebUIPreflightError(t *testing.T) {
 	}{
 		{false, "", false},
 		{false, "k", false},
-		{true, "", true},
+		{true, "", false}, // 没有管理 Key 时允许启动本机首次设置页面。
 		{true, "k", false},
 	}
 	for _, c := range cases {
@@ -64,7 +62,12 @@ func TestWebUIDisabledRoutesAbsent(t *testing.T) {
 }
 
 func TestWebUIEnabledAuthAndStaticShell(t *testing.T) {
+	chdirTemp(t)
 	setWebUI(t, true, "webui-key")
+	raw, _ := json.Marshal(statusSnapshot{UpdatedAt: time.Now().Unix()})
+	if err := os.WriteFile(statusSnapshotFile, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
 	handler := newWebUIMux()
 
 	// 静态外壳免鉴权，浏览器才能加载页面。
@@ -187,7 +190,7 @@ func TestWebUICredentialsMaskedAndNoPlaintext(t *testing.T) {
 }
 
 func TestWebUILogsRejectsIllegalName(t *testing.T) {
-	for _, bad := range []string{"evil.txt", "../etc/passwd", "workbuddy.json"} {
+	for _, bad := range []string{"evil.txt", "../etc/passwd", "../gateway-2026-10-06.log", "workbuddy.json"} {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/admin/api/logs?file="+bad, nil)
 		handleWebUILogs(rec, req)

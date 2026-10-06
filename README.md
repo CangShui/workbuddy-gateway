@@ -79,17 +79,44 @@ workbuddy-gateway [command] [options]
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | `-addr <ip>` | `127.0.0.1` | 网关监听地址 |
-| `-port <port>` | `8317` | 网关监听端口 |
+| `-port <port>` | `8317` | API 监听端口；显式传入时覆盖 `config.json` 的 `gateway.apiPort` |
 | `-auth <path>` | 自动发现 | 凭据文件路径，支持逗号分隔多个 |
 | `-auth-dir <dir>` | 空 | 凭据目录，自动加载目录内所有 `workbuddy*.json` |
-| `-api-key <key>` | 空 | 设置后调用网关必须携带 `Authorization: Bearer <key>` |
 | `-proxy <url>` | 空 | 上游请求代理，如 `http://127.0.0.1:7890`、`socks5://...` |
 | `-verbose` | `false` | 输出详细调试日志 |
 | `-intl` | `false` | 仅 `login` 生效：登录国际站 |
 | `-reload-interval <sec>` | `5` | 凭据热加载扫描间隔，`0` 关闭 |
 | `-models-refresh <min>` | `60` | 模型目录刷新间隔，`0` 关闭 |
 | `-disable-price-probes` | `false` | 禁止后台自动价格探测，避免自动发起模型生成请求；不影响客户端请求及显式 `probe` 命令 |
-| `-webui` | `false` | 启用只读管理台（`/ui` 与 `/admin/api/*`）；必须同时设置 `-api-key`，否则拒绝启动 |
+| `-webui` | `false` | 启用独立网页控制台（默认 `http://127.0.0.1:8316/ui/`）；管理 Key 与模型 API 鉴权由 `config.json` 配置 |
+
+### 配置网页控制台与模型 API 鉴权
+
+工作目录 `config.json` 的 `gateway` 段控制监听端口、网页控制台管理 Key 和模型 API 鉴权，全部为明文配置（`config.json` 已被 Git 忽略，请自行限制文件权限）：
+
+```json
+{
+  "gateway": {
+    "apiPort": 8317,
+    "webPort": 8316,
+    "adminKey": "",
+    "apiKeyEnabled": false,
+    "apiKey": ""
+  }
+}
+```
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `apiPort` | `8317` | 模型 API 监听端口，省略或 `0` 使用默认值；也可用 `-port` 临时覆盖 |
+| `webPort` | `8316` | 网页控制台监听端口，省略或 `0` 使用默认值；仅在显式 `-webui` 时监听 |
+| `adminKey` | `""` | 网页控制台管理 Key，有两种设置方式：**① 页面一键生成**——为空时在服务器本机（或 SSH 本地端口转发）打开网页，生成 32 字符随机 Key 写入本文件，并在弹窗中**仅展示一次**；**② 手动编辑本文件**——直接把本字段改成任意随机字符串（建议 32 位）后重启网关。设置完成后可从其他设备用该 Key 登录 |
+| `apiKeyEnabled` | `false` | 模型 API 是否校验 Key。关闭时不带 Key 或任意 Key 均可调用模型；开启时必须匹配 `apiKey` |
+| `apiKey` | `""` | 模型 API Key。开启校验时必须非空；关闭时保留原值，重新开启即可继续使用 |
+
+网页控制台也可在「访问设置」页切换 `apiKeyEnabled` 并设置 `apiKey`，保存后立即生效并写回本文件；端口修改需要重启。管理 Key 与模型 API Key **相互独立**：关闭模型 API 鉴权不会关闭管理鉴权，模型 API Key 也不能登录网页控制台。为避免他人抢先生成，**页面一键生成**管理 Key 只允许本机访问；**手动编辑 `config.json` 设置 `gateway.adminKey`** 不受此限制，效果与一键生成完全相同。
+
+> **升级顺序（重要）**：新版本能读取不含 `gateway` 段的旧配置，但**旧版本二进制遇到含 `gateway` 段的新配置会启动失败**（`json: unknown field "gateway"`）。请**先替换二进制、再添加 `gateway` 配置**。
 
 ### JSON 调试日志
 
@@ -295,8 +322,8 @@ workbuddy-gateway serve -auth workbuddy.json,workbuddy2.json
 # 目录模式：加载目录内所有 workbuddy*.json
 workbuddy-gateway serve -auth-dir ./auths
 
-# 上游走代理 + 开启客户端鉴权 + 详细日志
-workbuddy-gateway serve -proxy http://127.0.0.1:7890 -api-key sk-xxx -verbose
+# 上游走代理 + 详细日志（客户端鉴权在 config.json 的 gateway 段配置）
+workbuddy-gateway serve -proxy http://127.0.0.1:7890 -verbose
 
 # 关闭凭据热加载
 workbuddy-gateway serve -reload-interval 0
@@ -316,8 +343,8 @@ workbuddy-gateway serve -models-refresh 0
 | GET | `/v1/models`、`/models` | 模型列表，响应头 `X-Model-Source` 标注来源 |
 | GET | `/health`、`/ping` | 健康检查，返回 `version`、`model_count`、`model_source` |
 | POST | `/admin/probe` | 供 `probe` 命令调用，**仅接受回环来源** |
-| GET | `/ui/` | 只读管理台静态页面（仅 `-webui` 启用时存在） |
-| GET | `/admin/api/*` | 只读管理台数据接口（仅 `-webui` 启用时存在，需 API 密钥） |
+| GET | `/ui/` | 网页控制台静态页面（独立端口，仅 `-webui` 启用时存在） |
+| GET | `/admin/api/*` | 网页控制台数据接口（独立端口，仅 `-webui` 启用时存在，需管理 Key） |
 | GET | `/` | 简单文本说明 |
 
 从 v1.13.15 起，Responses `function_call_output.output` 支持文本和图片内容块数组：
@@ -522,30 +549,47 @@ workbuddy-gateway monitor -interval 2 -lines 20
 
 ---
 
-## webui（只读管理台）
+## webui（网页控制台）
 
-默认关闭。开启后在同一端口提供只读管理台，用于在浏览器查看账号池、模型统计、日志、`config.json` 与凭据文件（令牌脱敏），**不提供任何写操作**。
+默认关闭。显式 `-webui` 后在 `gateway.webPort`（默认 `8316`）提供独立网页控制台，用于在浏览器查看账号池、模型统计、日志、`config.json` 与凭据文件（令牌脱敏），并在「访问设置」页切换模型 API Key 校验。它与模型 API 端口分离，未启用时两个端口都不监听。
 
 ```bash
-# 必须同时设置 -api-key，否则拒绝启动
-workbuddy-gateway serve -webui -api-key sk-changeme
+# 只有显式 -webui 才开启网页控制台；模型 API 仍监听 8317
+workbuddy-gateway serve -webui
 
+# 方式一：本机或 SSH 本地端口转发打开页面，一键生成管理 Key
+ssh -L 8316:127.0.0.1:8316 root@服务器
 # 浏览器打开
-# http://127.0.0.1:8317/ui/
+# http://127.0.0.1:8316/ui/
+
+# 方式二：不打开页面，直接在服务器上手动设置管理 Key（建议 32 位随机字符串）
+python3 - <<'PY'
+import json, secrets, pathlib
+p = pathlib.Path("/opt/workbuddy-gateway/config.json")
+cfg = json.loads(p.read_text())
+cfg.setdefault("gateway", {})["adminKey"] = secrets.token_hex(16)  # 32 字符
+p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+print("已写入 gateway.adminKey，重启网关后生效")
+PY
+systemctl restart workbuddy-gateway
 ```
 
 | 项 | 说明 |
 |---|---|
-| 入口 | `GET /ui/`（静态外壳，免鉴权，本身不含任何数据） |
-| 数据接口 | `GET /admin/api/status`、`/admin/api/models`、`/admin/api/logs`、`/admin/api/config`、`/admin/api/credentials`，**一律需要 `Authorization: Bearer <api-key>`** |
-| 页面 | 总览（含国内站 / 国际站的账号数量分站点统计）、账号、模型、日志、配置（只读）、凭据（只读 · 脱敏） |
+| 入口 | `GET /ui/`（独立管理端口，静态外壳不含任何数据） |
+| 数据接口 | `GET /admin/api/status`、`/admin/api/models`、`/admin/api/logs`、`/admin/api/config`、`/admin/api/credentials`，**一律需要 `Authorization: Bearer <adminKey>`** |
+| 写入接口 | `POST /admin/api/setup`（仅本机首次生成管理 Key；也可改用下方“手动编辑配置文件”方式）、`POST /admin/api/settings`（切换模型 API 鉴权并写入 `config.json`） |
+| 页面 | 总览（含国内站 / 国际站账号数量）、账号、模型、日志、配置（只读 · Key 已隐藏）、凭据（只读 · 脱敏）、访问设置 |
 | 数据来源 | 复用 `serve` 周期写入的 `workbuddy-status.json`、`logs/` 日志与本地配置/凭据文件，不改变转发与调度逻辑 |
 | 凭据展示 | 只显示站点、昵称、UID、认证域名与到期时间；令牌仅保留前 6 位（如 `ACCESS****`），不返回明文 |
 
-- 未启用 `-webui` 时，`/ui` 与 `/admin/api/*` 均不注册路由：通过鉴权后返回 `404`；若同时设置了 `-api-key`，未携带密钥的请求会先在鉴权层被拦为 `401`。
-- `/admin/api/logs` 只允许读取 `logs/` 下的 `gateway-YYYY-MM-DD.log` 与 `debug-YYYY-MM-DD.jsonl`，拒绝任意路径与目录穿越。
-- 前端为原生 HTML/CSS/JS，通过 `go:embed` 嵌入二进制，无额外构建步骤与运行时依赖；首次访问需在页面填入与 `-api-key` 一致的密钥（存于浏览器 `localStorage`，随请求以 Bearer 头发送）。
-- 该功能为只读，不提供刷新 / 探测 / 重置等写操作。
+- 未启用 `-webui` 时，管理端口不监听，`/ui` 与 `/admin/api/*` 也不注册路由。
+- **管理 Key 的两种设置方式**（二选一即可）：
+  1. **页面一键生成**：`adminKey` 为空时，在服务器本机、或用 SSH 本地端口转发（`ssh -L 8316:127.0.0.1:8316 用户@服务器`）后访问 `http://127.0.0.1:8316/ui/`，点击生成 32 字符随机 Key；Key 写入 `config.json` 并**仅在弹窗中展示一次**。远程（非本机）访问不能触发一键生成，避免他人抢先生成；但远程仍可用已设置好的 Key 登录。
+  2. **手动编辑配置文件**：直接在服务器上编辑 `config.json`，把 `gateway.adminKey` 设为你自己的随机字符串（建议 32 位），保存后重启网关即可。此方式不需要本机访问，也不需要页面操作；登录时填写该字符串即可。
+- `/admin/api/logs` 只允许读取 `logs/` 下的 `gateway-YYYY-MM-DD.log` 与 `debug-YYYY-MM-DD.jsonl`，拒绝任意路径与目录穿越；返回日志先做秘密值脱敏，且单次读取有约 1 MiB 的扫描预算，超长单行会被省略。
+- 前端为原生 HTML/CSS/JS，通过 `go:embed` 嵌入二进制，无额外构建步骤与运行时依赖；管理 Key 只保存在当前标签页的 `sessionStorage`，验证成功后才保存。
+- 状态快照缺失或损坏时接口返回 `503`，页面保留上次数据并提示，不会把读取失败显示成零账号。
 
 ---
 
@@ -599,7 +643,7 @@ workbuddy4.json        intl   hy3      paid     0.42    820     usage.credit=0.4
 | `skipped` | 账号失效或无凭据 |
 | `error` | 网络 / 协议错误 |
 
-> 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源；服务启用 `-api-key` 时同样需要鉴权。
+> 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源；模型 API 启用 Key 校验时同样需要携带 `gateway.apiKey`。
 
 ---
 
@@ -743,7 +787,7 @@ Claude Code（Anthropic 协议直连，免外部翻译层）：
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
-export ANTHROPIC_API_KEY=你的网关-api-key   # 网关未启用 -api-key 时随意填
+export ANTHROPIC_API_KEY=你的模型APIKey   # config.json 未开启 apiKeyEnabled 时随意填
 claude
 ```
 
@@ -845,10 +889,14 @@ sudo systemctl stop workbuddy-gateway
 sudo systemctl disable workbuddy-gateway
 ```
 
-对外开放时（例如局域网其他设备）把 `-addr` 改为 `0.0.0.0`，并**务必**设置 `-api-key`：
+对外开放时（例如局域网其他设备）把 `-addr` 改为 `0.0.0.0`，并在 `config.json` 中开启模型 API Key 校验：
+
+```json
+{"gateway":{"apiKeyEnabled":true,"apiKey":"sk-changeme"}}
+```
 
 ```ini
-ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 8317 -api-key sk-changeme
+ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 ```
 
 ### macOS
@@ -898,7 +946,8 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 ## 安全提示
 
 - `workbuddy*.json` 包含真实访问凭据（Access Token / Refresh Token），**严禁提交到 Git 或公开分享**；本仓库 `.gitignore` 已排除。
-- 网关默认只监听 `127.0.0.1`。需要局域网 / 公网访问时改用 `-addr 0.0.0.0` 并配合 `-api-key`，或置于反向代理之后。
+- 网关默认只监听 `127.0.0.1`。需要局域网 / 公网访问时改用 `-addr 0.0.0.0`，并在 `config.json` 中开启模型 API Key 校验（`gateway.apiKeyEnabled`），或置于反向代理之后。
+- `config.json` 中的 `gateway.adminKey` 与 `gateway.apiKey` 按要求明文保存，请限制该文件权限；网页配置页只显示脱敏后的内容。
 - `/admin/probe` 仅接受回环来源调用。
 - 不再需要某账号授权时，删除对应凭据文件并在 CodeBuddy 控制台撤销授权。
 

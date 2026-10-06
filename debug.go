@@ -25,6 +25,7 @@ import (
 const runtimeConfigFile = "config.json"
 
 type runtimeFileConfig struct {
+	Gateway gatewayFileConfig `json:"gateway"`
 	// SystemPrompt 控制保底文本及实验性全局强制文本（后置于 system 末尾）。空值均保持旧行为。
 	SystemPrompt struct {
 		Fallback string `json:"fallback"`
@@ -94,7 +95,7 @@ func loadRuntimeConfig(path string) error {
 		setModelFilter(nil, nil)
 		_ = setModelAccountFilter(nil)
 		setSystemPromptConfig("", "")
-		return nil
+		return applyGatewayConfig(gatewayFileConfig{})
 	}
 	if err != nil {
 		return fmt.Errorf("读取配置文件 %s: %w", path, err)
@@ -109,6 +110,9 @@ func loadRuntimeConfig(path string) error {
 	}
 	if err := ensureJSONEOF(dec); err != nil {
 		return fmt.Errorf("解析配置文件 %s: %w", path, err)
+	}
+	if err := applyGatewayConfig(fileCfg.Gateway); err != nil {
+		return fmt.Errorf("解析网关配置 %s: %w", path, err)
 	}
 	cfg.DebugEnabled = fileCfg.Debug.Enabled
 
