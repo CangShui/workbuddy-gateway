@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	version = "1.13.16"
+	version = "1.13.17"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -3504,6 +3504,9 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 会话结构归一化：保证首条消息为 system，修复部分非 harness 客户端
 	//（以 assistant / tool 续写或回传工具结果）触发的上游 11128 错误
 	prepareSystemPromptForUpstream(reqObj, r, reqID, w.Header().Get("X-Trace-ID"))
+	// 输出预算归一化：客户端未声明 max_tokens 时补模型输出上限，
+	// 避免上游默认预留 384000 导致长会话在远未到窗口上限时被 11133 拒绝
+	ensureUpstreamMaxTokens(reqObj, r, reqID, w.Header().Get("X-Trace-ID"), modelName)
 	repairReport := repairToolMessageSequence(reqObj)
 	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
 	// 11155 防护：与 Responses 入口共用出站推理历史回填，不伪造思维链正文。

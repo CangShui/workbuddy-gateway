@@ -142,6 +142,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	applyThinkingRules(chatReq, modelName)
 	sanitizeMessages(chatReq)
 	prepareSystemPromptForUpstream(chatReq, r, reqID, w.Header().Get("X-Trace-ID"))
+	// 输出预算归一化：客户端未声明 max_tokens 时补模型输出上限，
+	// 避免上游默认预留 384000 导致长会话在远未到窗口上限时被 11133 拒绝
+	ensureUpstreamMaxTokens(chatReq, r, reqID, w.Header().Get("X-Trace-ID"), modelName)
 	repairReport := repairToolMessageSequence(chatReq)
 	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
 	// 与 Chat / Responses 入口共用同一套 DeepSeek 多轮推理历史回填规则。
