@@ -992,22 +992,28 @@ func handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "无效的 JSON 请求体")
 		return
 	}
-	tokens := estimateAnthropicInputTokens(msgReq)
+	tokens, mode, source := estimateAnthropicInputTokens(msgReq)
 	debugEvent(r, "info", "tokens_estimated_locally", map[string]any{
-		"input_tokens": tokens, "business_impact": "仅估算客户端输入，不调用上游、不消耗账号额度，不含网关注入的提示词",
+		"input_tokens": tokens, "prompt_mode": mode, "fallback_source": source,
+		"business_impact": "本地估算本次请求真正发往上游的输入（已按生效模式计入注入/覆盖后的 system），不调用上游、不消耗账号额度",
 	})
-	log.Printf("[Token估算] traceId=%s requestId=%d 输入字节=%d 估算token=%d 结果=仅本地估算客户端输入，不含网关注入提示词，未调用上游",
-		w.Header().Get("X-Trace-ID"), requestIDFor(r), len(bodyBytes), tokens)
+	log.Printf("[Token估算] traceId=%s requestId=%d 输入字节=%d 估算token=%d 生效模式=%s 文本来源=%s 结果=按实际发往上游的system估算（含注入/覆盖/强制后置），未调用上游",
+		w.Header().Get("X-Trace-ID"), requestIDFor(r), len(bodyBytes), tokens, mode, source)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"input_tokens": tokens,
 	})
 }
 
-func estimateAnthropicInputTokens(body map[string]any) int {
+// estimateAnthropicInputTokens 本地估算本次请求发往上游的输入 token（CJK 约 1 token/字、ASCII 约 4 字符/token）。
+// system 部分按 resolveUpstreamSystemText 的生效结果计算：fallback 非空时客户端自带 system 会被丢弃，
+// 因此这里估的是 fallback（客户端没给 system 时同为 fallback），而不是那份不会发出去的客户端原文；
+// 同时返回生效模式与文本来源，供日志与调试事件复用同一套口径。
+func estimateAnthropicInputTokens(body map[string]any) (int, string, string) {
+	systemText, mode, source := resolveUpstreamSystemText(extractAnthropicSystemText(body["system"]))
 	var sb strings.Builder
-	if sys := extractAnthropicSystemText(body["system"]); sys != "" {
-		sb.WriteString(sys)
+	if systemText != "" {
+		sb.WriteString(systemText)
 		sb.WriteByte('\n')
 	}
 	if msgs, ok := body["messages"].([]any); ok {
@@ -1024,7 +1030,7 @@ func estimateAnthropicInputTokens(body map[string]any) int {
 			n += len(b) / 4
 		}
 	}
-	return n
+	return n, mode, source
 }
 
 func appendAnthropicContentText(sb *strings.Builder, content any) {

@@ -8,6 +8,7 @@ import (
 	"testing"
 )
 
+// withSystemPrompts 设置 systemPrompt 配置（fallback / force），测试结束自动还原。
 func withSystemPrompts(t *testing.T, fallback, force string) {
 	t.Helper()
 	old := configuredSystemPrompts()
@@ -18,12 +19,14 @@ func withSystemPrompts(t *testing.T, fallback, force string) {
 func TestSystemPromptConfigurationAndMissingConfig(t *testing.T) {
 	old := configuredSystemPrompts()
 	oldDebug := cfg.DebugEnabled
+	oldLogBody := cfg.DebugLogSystemPrompt
 	t.Cleanup(func() {
 		setSystemPromptConfig(old.fallback, old.force)
 		cfg.DebugEnabled = oldDebug
+		cfg.DebugLogSystemPrompt = oldLogBody
 	})
 	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(`{"systemPrompt":{"fallback":"新保底","force":"全局实验规则"}}`), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"systemPrompt":{"fallback":"新保底","force":"全局实验规则"},"debug":{"enabled":true,"logSystemPrompt":true}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := loadRuntimeConfig(path); err != nil {
@@ -32,26 +35,60 @@ func TestSystemPromptConfigurationAndMissingConfig(t *testing.T) {
 	if got := configuredSystemPrompts(); got.fallback != "新保底" || got.force != "全局实验规则" {
 		t.Fatalf("配置没有生效: %#v", got)
 	}
+	if !cfg.DebugEnabled || !cfg.DebugLogSystemPrompt {
+		t.Fatalf("debug.logSystemPrompt 未随配置生效: enabled=%t logSystemPrompt=%t", cfg.DebugEnabled, cfg.DebugLogSystemPrompt)
+	}
+	// 语义完全由 fallback 决定：非空即覆盖，无需任何模式字段。
+	if err := os.WriteFile(path, []byte(`{"systemPrompt":{"fallback":"","force":"全局实验规则"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadRuntimeConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := configuredSystemPrompts(); got.fallback != "" || got.force != "全局实验规则" {
+		t.Fatalf("空 fallback 配置没有生效: %#v", got)
+	}
+	// systemPrompt 段的未知字段仍然在启动阶段直接报错，不静默忽略。
+	if err := os.WriteFile(path, []byte(`{"systemPrompt":{"fallback":"x","overWrite":true}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadRuntimeConfig(path); err == nil {
+		t.Fatal("systemPrompt 段的未知字段必须加载失败")
+	}
 	if err := loadRuntimeConfig(path + ".missing"); err != nil {
 		t.Fatal(err)
 	}
 	if got := configuredSystemPrompts(); got.fallback != "" || got.force != "" {
 		t.Fatalf("配置文件缺失时应重置为空: %#v", got)
 	}
+	if cfg.DebugLogSystemPrompt {
+		t.Fatal("配置文件缺失时 debug.logSystemPrompt 必须重置为关闭")
+	}
 }
 
-func TestFallbackPromptOnlyChangesMissingSystem(t *testing.T) {
+// TestFallbackNonEmptyCoversClientSystem 固定核心语义：fallback 非空即覆盖客户端 system。
+func TestFallbackNonEmptyCoversClientSystem(t *testing.T) {
 	withSystemPrompts(t, "自定义保底", "")
-	userOnly := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hi"}}}
-	prepareSystemPromptForUpstream(userOnly, httptest.NewRequest("POST", "/v1/chat/completions", nil), 1, "test-trace")
-	msgs := userOnly["messages"].([]any)
-	if len(msgs) != 2 || msgs[0].(map[string]any)["content"] != "自定义保底" {
-		t.Fatalf("没有用配置的保底提示词: %#v", msgs)
+	obj := map[string]any{"messages": []any{map[string]any{"role": "system", "content": "客户端规则"}, map[string]any{"role": "user", "content": "hi"}}}
+	prepareSystemPromptForUpstream(obj, httptest.NewRequest("POST", "/v1/chat/completions", nil), 2, "test-trace")
+	if got := obj["messages"].([]any)[0].(map[string]any)["content"]; got != "自定义保底" {
+		t.Fatalf("fallback 非空时必须覆盖客户端 system: %#v", got)
 	}
-	original := map[string]any{"messages": []any{map[string]any{"role": "system", "content": "客户端规则"}, map[string]any{"role": "user", "content": "hi"}}}
-	prepareSystemPromptForUpstream(original, httptest.NewRequest("POST", "/v1/chat/completions", nil), 2, "test-trace")
-	if got := original["messages"].([]any)[0].(map[string]any)["content"]; got != "客户端规则" {
-		t.Fatalf("已有 system 不应被配置保底覆盖: %#v", got)
+}
+
+// TestEmptyFallbackPassesThroughClientSystem 固定另一半语义：fallback 为空即原样透传。
+func TestEmptyFallbackPassesThroughClientSystem(t *testing.T) {
+	withSystemPrompts(t, "   ", "")
+	obj := map[string]any{"messages": []any{map[string]any{"role": "system", "content": "客户端规则"}, map[string]any{"role": "user", "content": "hi"}}}
+	prepareSystemPromptForUpstream(obj, httptest.NewRequest("POST", "/v1/chat/completions", nil), 2, "test-trace")
+	if got := obj["messages"].([]any)[0].(map[string]any)["content"]; got != "客户端规则" {
+		t.Fatalf("fallback 为空时必须透传客户端 system: %#v", got)
+	}
+	// 客户端没给 system 时用内置兜底。
+	userOnly := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hi"}}}
+	prepareSystemPromptForUpstream(userOnly, httptest.NewRequest("POST", "/v1/chat/completions", nil), 3, "test-trace")
+	if got := userOnly["messages"].([]any)[0].(map[string]any)["content"]; got != defaultSystemPrompt {
+		t.Fatalf("fallback 为空且客户端无 system 时应使用内置兜底: %#v", got)
 	}
 }
 
@@ -87,8 +124,8 @@ func TestSystemPromptConfigurationReachesChatAndResponses(t *testing.T) {
 		t.Fatalf("Chat 缺 system 时应保留保底并把全局规则追加到末尾: %#v", got)
 	}
 	responses := captureUpstreamMessages(t, "/v1/responses", `{"model":"m","stream":true,"instructions":"客户端已有system","input":"hi"}`)
-	if got := responses[0].(map[string]any)["content"]; got != "客户端已有system\n\n统一规则" {
-		t.Fatalf("Responses 应保留 instructions 并把全局规则追加到末尾: %#v", got)
+	if got := responses[0].(map[string]any)["content"]; got != "定制保底\n\n统一规则" {
+		t.Fatalf("Responses 应覆盖 instructions 并把全局规则追加到末尾: %#v", got)
 	}
 	if strings.Contains(chat[1].(map[string]any)["content"].(string), "统一规则") {
 		t.Fatal("全局规则不能重复写入用户消息")
@@ -101,8 +138,8 @@ func TestSystemPromptConfigurationReachesMessages(t *testing.T) {
 		name, body, want string
 	}{
 		{"fallback", `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`, "定制保底\n\n统一规则"},
-		{"client_system", `{"model":"m","system":"客户端规则","messages":[{"role":"user","content":"hi"}]}`, "客户端规则\n\n统一规则"},
-		{"system_blocks", `{"model":"m","system":[{"type":"text","text":"规则一"},{"type":"text","text":"规则二"}],"messages":[{"role":"user","content":"hi"}]}`, "规则一\n规则二\n\n统一规则"},
+		{"client_system", `{"model":"m","system":"客户端规则","messages":[{"role":"user","content":"hi"}]}`, "定制保底\n\n统一规则"},
+		{"system_blocks", `{"model":"m","system":[{"type":"text","text":"规则一"},{"type":"text","text":"规则二"}],"messages":[{"role":"user","content":"hi"}]}`, "定制保底\n\n统一规则"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			messages := captureUpstreamMessages(t, "/v1/messages", tc.body)
@@ -121,7 +158,7 @@ func TestSystemPromptConfigurationReachesMessages(t *testing.T) {
 // 这条顺序直接决定冲突时的实际效果：网关只发送一条 system 消息，内容形如
 // 「<客户端自己的系统提示词>\n\n<强制文本>」。强制文本位于整段提示词的最末尾，
 // 紧贴其后的用户消息，是最"新近"的指令，因此人设类、风格类指令通常最有影响力。
-// 这不是优先级字段，而是同一段文本里的先后顺序。
+// 这不是优先级字段，而是同一段文本里的先后顺序。fallback 为空时才会出现这种"原文 + 强制"的形态。
 func TestForcedPromptIsAppendedAfterClientSystem(t *testing.T) {
 	withSystemPrompts(t, "", "【强制后置】")
 	body := `{"model":"m","stream":true,"messages":[{"role":"system","content":"【客户端自己的系统提示词】"},{"role":"user","content":"hi"}]}`

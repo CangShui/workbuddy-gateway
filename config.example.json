@@ -11,7 +11,8 @@
     "force": ""
   },
   "debug": {
-    "enabled": false
+    "enabled": false,
+    "logSystemPrompt": false
   },
   "upstream": {
     "headerTimeoutSeconds": 300,

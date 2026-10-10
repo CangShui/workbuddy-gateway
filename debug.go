@@ -26,13 +26,17 @@ const runtimeConfigFile = "config.json"
 
 type runtimeFileConfig struct {
 	Gateway gatewayFileConfig `json:"gateway"`
-	// SystemPrompt 控制保底文本及实验性全局强制文本（后置于 system 末尾）。空值均保持旧行为。
+	// SystemPrompt 控制配置提示词与实验性全局强制文本（后置于 system 末尾）。
+	// 语义只由 fallback 是否为空决定：非空即覆盖客户端 system（客户端没给则保底），为空则原样透传。
 	SystemPrompt struct {
 		Fallback string `json:"fallback"`
 		Force    string `json:"force"`
 	} `json:"systemPrompt"`
 	Debug struct {
 		Enabled bool `json:"enabled"`
+		// LogSystemPrompt：仅当 enabled 同时为 true 时，才在 system_prompt_policy_applied
+		// 调试事件中记录最终发往上游的 system 正文（默认关闭；普通运行日志永不记录正文）。
+		LogSystemPrompt bool `json:"logSystemPrompt"`
 	} `json:"debug"`
 	// Upstream 段可选，用于按网络状况调整上游超时（单位秒，<=0 或省略表示用默认值）。
 	Upstream struct {
@@ -90,6 +94,7 @@ var (
 
 func loadRuntimeConfig(path string) error {
 	cfg.DebugEnabled = false
+	cfg.DebugLogSystemPrompt = false
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		setModelFilter(nil, nil)
@@ -115,6 +120,7 @@ func loadRuntimeConfig(path string) error {
 		return fmt.Errorf("解析网关配置 %s: %w", path, err)
 	}
 	cfg.DebugEnabled = fileCfg.Debug.Enabled
+	cfg.DebugLogSystemPrompt = fileCfg.Debug.LogSystemPrompt
 
 	// 模型黑白名单：先清空再按配置重建，避免热加载时残留旧规则。
 	setModelFilter(fileCfg.Models.Blocklist, fileCfg.Models.Allowlist)

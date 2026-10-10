@@ -286,3 +286,85 @@ func TestMessagesCountTokensAndValidation(t *testing.T) {
 		}
 	}
 }
+
+// TestCountTokensFollowsEffectiveSystemPrompt 固定 count_tokens 的口径：估算的是"这次真正会发往上游的输入"。
+// fallback 非空时客户端自带 system 会被丢弃，就不能再按那份原文计数；force 追加的文本同样要计入。
+// 期望值按 approxTokens 规则手算：CJK 每字 1 token，非 CJK 每 4 字符 1 token（向上取整），
+// 每段文本各带一个换行分隔符。
+func TestCountTokensFollowsEffectiveSystemPrompt(t *testing.T) {
+	for _, tc := range []struct {
+		name, fallback, force, system string
+		wantTokens                    int
+		wantMode, wantSource          string
+	}{
+		// 400 个 'a' + 换行 + "你好" + 换行 → 2 CJK + 402/4 → 2+101
+		{"覆盖：按 fallback 计，不按被丢弃的客户端 system", strings.Repeat("a", 400), "", "客户端", 103, "覆盖", "配置覆盖"},
+		// "客户端" + 换行 + "你好" + 换行 → 5 CJK + 2 非 CJK
+		{"透传：按客户端 system 计", "", "", "客户端", 6, "透传", "客户端透传"},
+		// "You are a helpful assistant."(28) + 换行 + "你好" + 换行 → 2 CJK + 30 非 CJK
+		{"保底：按内置兜底计", "", "", "", 10, "保底", "内置保底"},
+		// "aaaa\n\nbbbb" + 换行 + "你好" + 换行 → 2 CJK + 12 非 CJK
+		{"覆盖 + 强制后置：覆盖结果与强制文本都计入", "aaaa", "bbbb", "客户端", 5, "覆盖", "配置覆盖"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withSystemPrompts(t, tc.fallback, tc.force)
+			body := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "你好"}}}
+			if tc.system != "" {
+				body["system"] = tc.system
+			}
+			got, mode, source := estimateAnthropicInputTokens(body)
+			if got != tc.wantTokens || mode != tc.wantMode || source != tc.wantSource {
+				t.Fatalf("估算=%d 模式=%s 来源=%s，期望 %d/%s/%s", got, mode, source, tc.wantTokens, tc.wantMode, tc.wantSource)
+			}
+		})
+	}
+}
+
+// TestCountTokensEndpointUsesEffectivePrompt 确认 HTTP 出口也走同一个口径，并在调试事件里带上模式与来源。
+func TestCountTokensEndpointUsesEffectivePrompt(t *testing.T) {
+	var output bytes.Buffer
+	debugSinkMu.Lock()
+	oldSink := debugSink
+	debugSink = &debugJSONSink{writer: &output}
+	debugSinkMu.Unlock()
+	oldEnabled := cfg.DebugEnabled
+	t.Cleanup(func() {
+		cfg.DebugEnabled = oldEnabled
+		debugSinkMu.Lock()
+		debugSink = oldSink
+		debugSinkMu.Unlock()
+	})
+	cfg.DebugEnabled = true
+	withSystemPrompts(t, strings.Repeat("a", 400), "")
+
+	rec := httptest.NewRecorder()
+	body := `{"system":"客户端","messages":[{"role":"user","content":"你好"}]}`
+	requestAuditMiddleware(http.HandlerFunc(handleCountTokens)).ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages/count_tokens", strings.NewReader(body)))
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if got := out["input_tokens"].(float64); got != 103 {
+		t.Fatalf("count_tokens 未按生效后的 system 估算: %v", got)
+	}
+	// 调试日志里同一请求有 request_received / tokens_estimated_locally / response_returned 多条事件，按事件名取。
+	var record map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+		var candidate map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &candidate); err != nil {
+			t.Fatalf("调试日志不是单行 JSON: %v: %s", err, line)
+		}
+		if candidate["event"] == "tokens_estimated_locally" {
+			record = candidate
+		}
+	}
+	if record == nil {
+		t.Fatalf("未找到 tokens_estimated_locally 事件: %s", output.String())
+	}
+	if record["prompt_mode"] != "覆盖" || record["fallback_source"] != "配置覆盖" {
+		t.Fatalf("估算事件未带上生效模式与文本来源: %#v", record)
+	}
+}

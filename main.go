@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	version = "1.13.16"
+	version = "1.13.17"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -354,31 +354,32 @@ type quotaSummaryData struct {
 // -----------------------------------------------------------------------------
 
 type Config struct {
-	Addr               string
-	Port               int
-	PortExplicit       bool
-	WebPort            int
-	AdminKey           string
-	AuthFile           string
-	AuthDir            string
-	AuthExplicit       bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
-	LoginIntl          bool // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
-	APIKey             string
-	ProxyURL           string
-	Verbose            bool
-	DebugEnabled       bool   // 仅由工作目录 config.json 的 debug.enabled 控制
-	ReloadInterval     int    // 账号池热加载扫描间隔（秒），0 关闭
-	MonitorInterval    int    // monitor 状态刷新间隔（秒）
-	LogFile            string // monitor 附加展示的日志文件路径
-	JournalService     string // monitor 附加展示的 systemd 服务名（journalctl -u）
-	LogLines           int    // monitor 展示的最近日志行数
-	ModelsRefresh      int    // 官方模型目录刷新间隔（分钟），0 关闭
-	DisablePriceProbes bool   // 禁止后台价格探测，不影响客户端请求及显式 probe 命令
-	KeepaliveHours     []int  // 主动续期时刻（本地小时），空表示关闭；到点主动刷新全部账号
-	ProbeModels        string // probe 专用：逗号分隔的模型列表
-	ProbeLimit         int    // probe 专用：未显式指定模型时的取用数量
-	WebUI              bool   // 仅显式 -webui 才启动独立管理端口
-	HttpClient         *http.Client
+	Addr                 string
+	Port                 int
+	PortExplicit         bool
+	WebPort              int
+	AdminKey             string
+	AuthFile             string
+	AuthDir              string
+	AuthExplicit         bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
+	LoginIntl            bool // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
+	APIKey               string
+	ProxyURL             string
+	Verbose              bool
+	DebugEnabled         bool   // 仅由工作目录 config.json 的 debug.enabled 控制
+	DebugLogSystemPrompt bool   // 仅由 config.json 的 debug.logSystemPrompt 控制；需 debug.enabled 同时开启才记录提示词正文
+	ReloadInterval       int    // 账号池热加载扫描间隔（秒），0 关闭
+	MonitorInterval      int    // monitor 状态刷新间隔（秒）
+	LogFile              string // monitor 附加展示的日志文件路径
+	JournalService       string // monitor 附加展示的 systemd 服务名（journalctl -u）
+	LogLines             int    // monitor 展示的最近日志行数
+	ModelsRefresh        int    // 官方模型目录刷新间隔（分钟），0 关闭
+	DisablePriceProbes   bool   // 禁止后台价格探测，不影响客户端请求及显式 probe 命令
+	KeepaliveHours       []int  // 主动续期时刻（本地小时），空表示关闭；到点主动刷新全部账号
+	ProbeModels          string // probe 专用：逗号分隔的模型列表
+	ProbeLimit           int    // probe 专用：未显式指定模型时的取用数量
+	WebUI                bool   // 仅显式 -webui 才启动独立管理端口
+	HttpClient           *http.Client
 }
 
 // Account 表示一个 CodeBuddy 账号凭据及其运行时状态。
@@ -3019,8 +3020,21 @@ func runServe() {
 	}
 	if cfg.DebugEnabled {
 		fmt.Printf("   JSON 调试日志: 已开启 (%s)\n", filepath.Join(logDir, "debug-YYYY-MM-DD.jsonl"))
+		if cfg.DebugLogSystemPrompt {
+			fmt.Printf("   提示词正文记录: 已开启 (%s 中 debug.logSystemPrompt=true；仅 JSON 调试日志，普通运行日志仍不记录正文)\n", runtimeConfigFile)
+		}
 	} else {
 		fmt.Printf("   JSON 调试日志: 已关闭 (%s 中 debug.enabled=false)\n", runtimeConfigFile)
+		if cfg.DebugLogSystemPrompt {
+			// 半开的开关最容易让人以为"已经记了正文"，这里显式提示它不会生效。
+			fmt.Printf("   提示词正文记录: 未生效 (%s 中 debug.logSystemPrompt=true，但 debug.enabled=false，正文不会写入任何日志)\n", runtimeConfigFile)
+		}
+	}
+	if settings := configuredSystemPrompts(); strings.TrimSpace(settings.fallback) != "" {
+		fmt.Printf("   系统提示词:     覆盖模式 (fallback 非空，%d 字符；客户端自带 system 将被覆盖，客户端未提供时以同一段 fallback 保底；%s 可配置)\n",
+			utf8.RuneCountInString(settings.fallback), runtimeConfigFile)
+	} else {
+		fmt.Printf("   系统提示词:     默认模式 (fallback 为空；客户端自带 system 原样透传，客户端未提供时使用内置兜底提示词；%s 可配置)\n", runtimeConfigFile)
 	}
 	fmt.Printf("   上游超时:      响应头等待 %v / 流空闲 %v (%s 可覆盖)\n",
 		upstreamHeaderTimeout, upstreamIdleTimeout, runtimeConfigFile)

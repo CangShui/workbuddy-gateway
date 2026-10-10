@@ -125,16 +125,43 @@ workbuddy-gateway [command] [options]
 ```json
 {
   "debug": {
-    "enabled": true
+    "enabled": true,
+    "logSystemPrompt": false
   }
 }
 ```
 
 开启后，网关把单行 JSON 写入 `logs/debug-YYYY-MM-DD.jsonl`；普通运行日志仍写入原来的 `logs/gateway-YYYY-MM-DD.log`，两者互不替代。可复制 `config.example.json` 作为起点。
 
+`debug.logSystemPrompt` 默认 `false`。置为 `true` **且** `debug.enabled` 同时为 `true` 时，`system_prompt_policy_applied` 事件会额外记录提示词正文：
+
+- `final_system_body`：最终发往上游的首条 system 正文（含 `fallback` / `force` 组合后的结果），排查人设、风格类问题最实用；
+- `client_system_body`：覆盖发生前客户端提供的 system 原正文（仅在 `fallback` 非空、真的覆盖了客户端 system 时出现，便于对比）；
+- 内容块数组场景记录各 text 块拼接后的纯文本（以换行分隔）。
+
+无论该开关是否开启，事件始终记录不含正文的审计字段，便于判断"到底哪一版提示词发出去了"：
+
+- `final_system_chars` / `client_system_chars`：最终 / 覆盖前正文的字符数（后者仅在真的覆盖了客户端自带 system 时出现）；
+- `final_system_kind`：最终 system 内容的形态（`字符串` / `内容块数组` / `空内容` / `未支持的内容类型`）。内容不是字符串或 text 块数组时取不到正文，`final_system_chars` 会是 `0`，此时靠本字段区分"没有 system"与"取不到正文"；
+- `final_system_sha256_prefix` / `client_system_sha256_prefix`：对应正文的 SHA-256 前 12 位十六进制指纹，可用于跨请求、跨版本比对提示词是否漂移；
+- `prompt_mode`（生效模式：`覆盖` / `透传` / `保底`——`fallback` 非空一律为 `覆盖`；`fallback` 为空时按客户端是否自带 system 记 `透传` 或 `保底`）/ `fallback_source`（文本来源：`配置覆盖` / `配置保底` / `内置保底` / `客户端透传`）/ `override_applied`（是否真的丢弃了客户端自带 system）：本次命中的模式、来源与分支；
+- `forced_applied` / `forced_content_kind`（`未修改` / `字符串` / `内容块数组` / `空内容` / `未支持的内容类型，已跳过强制后置`）/ `forced_chars`：`force` 是否真的追加到了末尾、以什么形态追加、追加了多少字符。
+
+普通运行日志里同一事件另有一行中文摘要，字段与上面一一对应，例如：
+
+```
+[系统提示词规则] traceId=… requestId=2 阶段=上游请求序列化前 生效模式=覆盖 文本来源=配置覆盖 强制全局已应用=false 强制位置=后置(紧贴用户消息) 强制内容类型=未修改 强制字符数=0 结果=覆盖客户端system为配置fallback且未记录提示词正文
+```
+
+`结果=` 只有四种取值，与 `文本来源=` 一一对应：`覆盖客户端system为配置fallback` / `客户端未提供system，已注入配置fallback` / `客户端未提供system，已使用内置兜底提示词` / `保留客户端原有system`。
+
+> 提示词正文可能很长（例如上万字的人设）：开启 `logSystemPrompt` 后单条事件可达数十 KB。只有在确需正文时才开启，排查完建议改回 `false`；`debug.enabled=false` 时即使把 `logSystemPrompt` 设为 `true` 也不会记录正文，启动横幅会明确提示"未生效"。
+
+普通运行日志（`logs/gateway-*.log` 与终端输出）在任何配置下都**不记录提示词正文**，该开关只影响 JSON 调试日志；正文仍会经过统一的敏感值脱敏。
+
 ### 配置系统提示词
 
-工作目录 `config.json` 的 `systemPrompt` 段有两个独立选项（修改后需重启 `serve`）：
+工作目录 `config.json` 的 `systemPrompt` 段只有两个选项（修改后需重启 `serve`）；**语义完全由 `fallback` 是否为空决定，没有模式开关**：
 
 ```json
 {
@@ -145,16 +172,27 @@ workbuddy-gateway [command] [options]
 }
 ```
 
-| 配置 | 空值的默认行为 | 非空时的行为 |
+| 客户端 system | `fallback` 非空 | `fallback` 空/全空白 |
 |---|---|---|
-| `fallback` | 继续使用 `You are a helpful assistant.` | **仅在客户端没有任何 system 时**，替换网关注入的保底提示词；已有 system 不变 |
-| `force` | 不启用；请求提示词完全按原规则处理 | **实验功能**：在 Chat、Responses、Anthropic Messages 三个入口的首条 system 内容**末尾追加**配置文本（后置），使其成为位置最靠后、紧贴用户消息的指令；原 system 内容仍完整保留 |
+| 有 | **`fallback`**（覆盖客户端，客户端原文丢弃） | 客户端原 system（透传） |
+| 无 | **`fallback`**（保底注入） | 内置保底 `You are a helpful assistant.` |
 
-例如 `{"systemPrompt":{"fallback":"你是一个助手。","force":"请用中文回答。"}}`：客户端没有 system 时，发往上游的是 `你是一个助手。\n\n请用中文回答。`；客户端自带 system 时，发往上游的是 `<客户端原 system>\n\n请用中文回答。`。配置值仅支持 JSON 字符串；空串或全空白视为未配置。不会写出或替换客户端的 user、assistant、tool 消息，也不改变账号选择。普通日志和 JSON 调试日志只记录规则分支、位置与字符数，**不记录提示词正文**。
+| 配置 | 空值行为 | 非空行为 |
+|---|---|---|
+| `fallback` | 覆盖关闭：客户端自带 system 原样透传；客户端没给时才用内置保底 | 覆盖开启：无论客户端是否自带 system，发往上游的首条 system 都是这段文本（客户端没给时即"保底"） |
+| `force` | 不启用 | **实验功能**：在三个入口的首条 system 内容**末尾追加**配置文本（后置），使其成为位置最靠后、紧贴用户消息的指令；未发生覆盖时原 system 内容仍完整保留 |
 
-> **实验功能风险自负：** `force` 后置于 system 末尾（紧贴用户消息），因此比客户端自带指令更"新近"，冲突时通常更有影响力——这正是人设类、风格类指令希望达到的效果，但也可能与客户端的 system 指令冲突、改变模型行为、增加 token 消耗，或触发上游内容/参数校验。需要回退时将 `force` 改回 `""` 并重启；建议先在测试会话验证，切勿在配置中写入密码、密钥或个人隐私。`config.json` 已被 Git 忽略，不要将真实配置提交到仓库。
+要点：
 
-`/v1/messages/count_tokens` 仅对客户端提供的内容做本地近似估算，不调用上游，也不计入网关随后注入的 `fallback` / `force` 文本；最终消耗以模型返回的 usage 为准。
+- 空串与全空白视为未配置（`"  "` 等同 `""`），不会触发覆盖。
+- 「首条消息必须是 system」的兜底注入始终存在（上游 code 11128 硬校验依赖它）；它只决定客户端**没有** system 时用什么文本，与是否覆盖无关。
+- `force` 与覆盖正交：`fallback` 非空且 `force` 非空时，发往上游的是 `fallback\n\nforce`（字符串形态）或「fallback 文本块 + force 文本块」（内容块数组形态）。
+- 例：`{"fallback":"你是一个助手。","force":"请用中文回答。"}` → 无论客户端是否自带 system，上游收到的都是 `你是一个助手。\n\n请用中文回答。`；把 `fallback` 改成 `""` 后，客户端自带 system 时上游收到的是 `<客户端原 system>\n\n请用中文回答。`。
+- 配置值仅支持 JSON 字符串。不会改写客户端的 user、assistant、tool 消息，也不改变账号选择。普通日志和 JSON 调试日志只记录规则分支、位置与字符数，**不记录提示词正文**（需要正文时显式开启 `debug.logSystemPrompt`）。
+
+> **实验功能风险自负：** `force` 后置于 system 末尾（紧贴用户消息），因此比客户端自带指令更"新近"，冲突时通常更有影响力——这正是人设类、风格类指令希望达到的效果，但也可能与客户端的 system 指令冲突、改变模型行为、增加 token 消耗，或触发上游内容/参数校验。`fallback` 非空时会**丢弃客户端自带 system**：客户端原本靠自己的 system 声明的角色、工具约定、输出格式都会失效，请只在自己的客户端上使用。需要回退时将 `fallback` 清空、`force` 改回 `""` 并重启；建议先在测试会话验证，切勿在配置中写入密码、密钥或个人隐私。`config.json` 已被 Git 忽略，不要将真实配置提交到仓库。
+
+`/v1/messages/count_tokens` 按**本次真正会发往上游的 system**做本地近似估算（`fallback` 非空时计 `fallback`，为空时计客户端自带 system、缺省时计内置兜底，再叠加 `force`），不调用上游、不消耗账号额度。估算规则：CJK 每字 1 token、ASCII 每 4 字符 1 token，所以纯中文会偏高约三成、以 ASCII 为主的长文本误差约 5%；最终消耗以模型返回的 usage 为准。日志与调试事件会同时给出 `生效模式` / `文本来源`，与 `[系统提示词规则]` 的口径一致。
 
 ### 套餐识别与官网一致性
 
@@ -339,7 +377,7 @@ workbuddy-gateway serve -models-refresh 0
 | POST | `/v1/chat/completions`、`/chat/completions` | Chat Completions，支持 SSE 流式与非流式 |
 | POST | `/v1/responses`、`/responses` | OpenAI Responses API |
 | POST | `/v1/messages` | Anthropic Messages API（Claude Code 直连，内部转 Chat 走同一条上游管线） |
-| POST | `/v1/messages/count_tokens` | Anthropic 令牌计数（本地估算，CJK 1 token/字、ASCII 4 字符/token） |
+| POST | `/v1/messages/count_tokens` | Anthropic 令牌计数（本地估算，按生效后的 system 计；CJK 1 token/字、ASCII 4 字符/token） |
 | GET | `/v1/models`、`/models` | 模型列表，响应头 `X-Model-Source` 标注来源 |
 | GET | `/health`、`/ping` | 健康检查，返回 `version`、`model_count`、`model_source` |
 | POST | `/admin/probe` | 供 `probe` 命令调用，**仅接受回环来源** |
