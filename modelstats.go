@@ -263,6 +263,8 @@ func extractBusinessCode(body string) string {
 // modelStatSnapshot 是写入状态快照的单个模型统计。
 type modelStatSnapshot struct {
 	ID             string `json:"id"`
+	Enabled        *bool  `json:"enabled,omitempty"`
+	PolicyReason   string `json:"policyReason,omitempty"`
 	Source         string `json:"source,omitempty"`
 	CNFree         string `json:"cnFree,omitempty"`         // 国内站：是 | 否 | 混合 | -
 	IntlFree       string `json:"intlFree,omitempty"`       // 国际站：是 | 否 | 混合 | -
@@ -356,7 +358,25 @@ var lastFreeModelDisplay struct {
 
 // buildModelStatSnapshots 汇总「官方/静态模型目录 ∪ 有统计的模型」的统计行。
 func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot {
-	ids, source := mergedModelIDs()
+	return buildModelRows(now, accs, false)
+}
+
+func buildAllModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot {
+	return buildModelRows(now, accs, true)
+}
+
+func buildModelRows(now time.Time, accs []*Account, includeDisabled bool) []modelStatSnapshot {
+	ids, source := collectModelIDs(includeDisabled)
+	if includeDisabled {
+		modelFilterMu.RLock()
+		for id := range currentFilter.blocklist {
+			ids = append(ids, id)
+		}
+		for id := range currentFilter.allowlist {
+			ids = append(ids, id)
+		}
+		modelFilterMu.RUnlock()
+	}
 	seen := make(map[string]bool, len(ids))
 	rows := make([]modelStatSnapshot, 0, len(ids))
 
@@ -369,17 +389,20 @@ func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot
 			return
 		}
 		// 被配置禁用的模型在统计附表中直接隐藏（即使历史上有过请求）。
-		if disabled, _ := modelDisabled(id); disabled {
+		disabled, reason := modelDisabled(id)
+		if disabled && !includeDisabled {
 			return
 		}
 		seen[id] = true
 		row := modelStatSnapshot{ID: id, Source: source}
+		enabled := !disabled
+		row.Enabled, row.PolicyReason = &enabled, reason
 		// 免费/收费按站点分别聚合：同一模型名在 cn 与 intl 结论可能不同，
 		// 若混在一起会显示成无意义的“混合”。
 		var cnFree, cnPaid, intlFree, intlPaid bool
 		for _, acc := range accs {
 			allowed, _ := modelAccountAllowed(id, acc, accs)
-			if allowed && modelServableLocked(acc, id, now) {
+			if !disabled && allowed && modelServableLocked(acc, id, now) {
 				row.AvailableAccounts++
 			}
 			state := acc.ModelStates[id]

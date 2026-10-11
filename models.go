@@ -616,6 +616,10 @@ func catalogSnapshot() (map[string][]catalogModel, string) {
 }
 
 func mergedModelIDs() ([]string, string) {
+	return collectModelIDs(false)
+}
+
+func collectModelIDs(includeDisabled bool) ([]string, string) {
 	catalogs, source := catalogSnapshot()
 	seen := map[string]bool{}
 	ids := make([]string, 0, 64)
@@ -625,7 +629,7 @@ func mergedModelIDs() ([]string, string) {
 				continue
 			}
 			// 被配置禁用的模型不出现在任何模型列表（/v1/models、monitor 统计表、health 计数）。
-			if disabled, _ := modelDisabled(m.ID); disabled {
+			if disabled, _ := modelDisabled(m.ID); disabled && !includeDisabled {
 				continue
 			}
 			seen[m.ID] = true
@@ -1054,6 +1058,11 @@ func probeModelPrice(acc *Account, model string) (string, float64, int64, string
 	defer acc.lock.Unlock()
 
 	accountMu.Lock()
+	if allowed, reason := modelAccountAllowed(model, acc, accounts); !allowed {
+		accountMu.Unlock()
+		log.Printf("[ModelPrice] traceId=%s 模型=%s 凭据=%s 结果=跳过 原因=%s 说明=等待账号锁后重新检查热配置，未调用上游", newTraceID(), model, filepath.Base(acc.Path), reason)
+		return "", 0, 0, "账号名单排除：" + reason
+	}
 	if acc.Disabled || acc.Auth == nil {
 		accountMu.Unlock()
 		return "", 0, 0, "账号不可用"
@@ -1061,6 +1070,9 @@ func probeModelPrice(acc *Account, model string) (string, float64, int64, string
 	auth := *acc.Auth
 	prof := acc.Profile()
 	accountMu.Unlock()
+	if disabled, reason := modelDisabled(model); disabled {
+		return "", 0, 0, reason
+	}
 
 	payload, _ := json.Marshal(map[string]any{
 		"model": model, "stream": true, "max_tokens": 300,

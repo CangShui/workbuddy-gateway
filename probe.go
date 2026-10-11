@@ -126,6 +126,13 @@ func handleAdminProbe(w http.ResponseWriter, r *http.Request) {
 			if r.Context().Err() != nil {
 				break
 			}
+			if disabled, reason := modelDisabled(model); disabled {
+				result := probeResult{Account: acc.Path, Edition: acc.Profile().Key, Model: model, Status: "skipped", Detail: reason}
+				resp.Results = append(resp.Results, result)
+				resp.Summary[result.Status]++
+				log.Printf("[Probe] traceId=%s 模型=%s 结果=跳过 原因=模型已停用 说明=不会调用上游", debugTraceID(r), model)
+				continue
+			}
 			if allowed, reason := modelAccountAllowed(model, acc, candidates); !allowed {
 				result := probeResult{Account: acc.Path, Edition: acc.Profile().Key, Model: model, Status: "skipped", Detail: "账号名单排除：" + reason}
 				resp.Results = append(resp.Results, result)
@@ -176,6 +183,12 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 	defer acc.lock.Unlock()
 
 	accountMu.Lock()
+	if allowed, reason := modelAccountAllowed(model, acc, accounts); !allowed {
+		accountMu.Unlock()
+		result.Status, result.Detail = "skipped", "账号名单排除："+reason
+		log.Printf("[Probe] traceId=%s 模型=%s 凭据=%s 结果=跳过 原因=%s 说明=等待账号锁后重新检查热配置，未调用上游", newTraceID(), model, filepath.Base(acc.Path), reason)
+		return result
+	}
 	if acc.Disabled || acc.Auth == nil || acc.Auth.Auth.AccessToken == "" {
 		accountMu.Unlock()
 		result.Status = "skipped"
@@ -185,6 +198,10 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 	auth := *acc.Auth
 	prof := acc.Profile()
 	accountMu.Unlock()
+	if disabled, reason := modelDisabled(model); disabled {
+		result.Status, result.Detail = "skipped", reason
+		return result
+	}
 
 	body := map[string]any{
 		"model":      model,

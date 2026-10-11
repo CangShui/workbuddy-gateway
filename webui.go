@@ -9,16 +9,14 @@ import (
 	"net/http"
 	"os"
 	"path"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// WebUI 是独立端口的管理台：状态接口只读，仅首次设置与鉴权配置允许写入。
-// 设计约束：不改变转发主链路与调度逻辑，仅复用进程已有的状态快照、模型统计、
-// 日志文件与配置/凭据文件，凭据令牌一律脱敏。
+// WebUI 是独立端口的管理台：鉴权设置、账号/模型开关允许受控写入配置。
+// 开关通过配置名单影响调度，不删除凭据、不改变历史统计；凭据令牌一律脱敏。
 //
 //go:embed web/index.html web/app.js web/style.css
 var webFS embed.FS
@@ -28,7 +26,7 @@ const (
 	webUIPrefixSlash = "/ui/"
 )
 
-// webuiEnabled 返回当前进程是否启用只读管理台。
+// webuiEnabled 返回当前进程是否启用管理台。
 func webuiEnabled() bool { return cfg.WebUI }
 
 // 管理 Key 可在首次本机访问时初始化，不能再强制开启模型 API 鉴权。
@@ -48,7 +46,7 @@ func webUIIsExemptPath(p string) bool {
 	return p == webUIPrefix || p == webUIPrefixSlash || strings.HasPrefix(p, webUIPrefixSlash)
 }
 
-// registerWebUIRoutes 在启用管理台时注册静态资源与只读 API 路由。
+// registerWebUIRoutes 注册静态资源、只读数据与受鉴权保护的配置写入路由。
 func registerWebUIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(webUIPrefix, handleWebUIIndex)
 	mux.HandleFunc(webUIPrefixSlash, handleWebUIIndex)
@@ -60,6 +58,11 @@ func registerWebUIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/setup", handleWebUISetup)
 	mux.HandleFunc("/admin/api/settings", handleWebUISettings)
 	mux.HandleFunc("/admin/api/client-events", handleWebUIClientEvent)
+	mux.HandleFunc("/admin/api/account-toggle", handleWebUIAccountToggle)
+	mux.HandleFunc("/admin/api/model-toggle", handleWebUIModelToggle)
+	mux.HandleFunc("/admin/api/credential-edit", handleWebUICredentialEdit)
+	mux.HandleFunc("/admin/api/log-settings", handleWebUILogSettings)
+	mux.HandleFunc("/admin/api/log-cleanup", handleWebUILogCleanup)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -155,9 +158,13 @@ func readStatusSnapshot() (statusSnapshot, error) {
 func summarizeAccounts(accs []accountSnapshot) map[string]int {
 	summary := map[string]int{
 		"total": len(accs), "active": 0, "cooldown": 0,
-		"paidExhausted": 0, "expired": 0, "disabled": 0,
+		"paidExhausted": 0, "expired": 0, "disabled": 0, "paused": 0,
 	}
 	for _, a := range accs {
+		if a.SchedulingEnabled != nil && !*a.SchedulingEnabled {
+			summary["paused"]++
+			continue
+		}
 		switch a.State {
 		case "active":
 			summary["active"]++
@@ -218,6 +225,7 @@ func handleWebUIStatus(w http.ResponseWriter, r *http.Request) {
 	if resp.Accounts == nil {
 		resp.Accounts = []accountSnapshot{}
 	}
+	annotateAccountPolicies(resp.Accounts)
 	if resp.Models == nil {
 		resp.Models = []modelStatSnapshot{}
 	}
@@ -237,15 +245,27 @@ func handleWebUIModels(w http.ResponseWriter, r *http.Request) {
 		webSnapshotUnavailable(w, r, err)
 		return
 	}
-	models := snap.Models
+	models := snap.ModelCatalog
+	if models == nil {
+		models = snap.Models // 兼容旧版本状态快照。
+	}
 	if models == nil {
 		models = []modelStatSnapshot{}
 	}
+	for i := range models {
+		disabled, reason := modelDisabled(models[i].ID)
+		enabled := !disabled
+		models[i].Enabled, models[i].PolicyReason = &enabled, reason
+		if disabled {
+			models[i].AvailableAccounts = 0
+		}
+	}
 	log.Printf("[管理模型] traceId=%s 结果=读取成功 模型数=%d", debugTraceID(r), len(models))
 	writeAdminData(w, r, map[string]any{
-		"source": modelSourceLabel(modelSourceFromSnapshots(models)),
-		"models": models,
-		"stale":  time.Now().Unix()-snap.UpdatedAt > 15,
+		"source":     modelSourceLabel(modelSourceFromSnapshots(models)),
+		"models":     models,
+		"stale":      time.Now().Unix()-snap.UpdatedAt > 15,
+		"policyMode": currentModelPolicyMode(),
 	})
 }
 
@@ -254,7 +274,7 @@ func webSnapshotUnavailable(w http.ResponseWriter, r *http.Request, err error) {
 	writeJSONError(w, http.StatusServiceUnavailable, "状态快照暂不可用，请稍后重试；已有页面数据不是新的零账号结果")
 }
 
-var logFilePattern = regexp.MustCompile(`^(gateway-\d{4}-\d{2}-\d{2}\.log|debug-\d{4}-\d{2}-\d{2}\.jsonl)$`)
+var logFilePattern = managedLogPattern
 
 type logFileInfo struct {
 	Name    string `json:"name"`
@@ -358,9 +378,9 @@ func handleWebUIConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "仅支持 GET")
 		return
 	}
-	gatewayConfigMu.RLock()
+	runtimeConfigMu.Lock()
 	data, err := os.ReadFile(runtimeConfigFile)
-	gatewayConfigMu.RUnlock()
+	runtimeConfigMu.Unlock()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			writeJSON(w, http.StatusOK, map[string]any{"exists": false, "path": runtimeConfigFile, "content": ""})
@@ -454,7 +474,7 @@ func handleWebUICredentials(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[管理凭据] traceId=%s 结果=读取完成 文件数=%d 说明=只返回脱敏视图，不触发刷新或写入", debugTraceID(r), len(views))
 	writeAdminData(w, r, map[string]any{
-		"hint":  "令牌已脱敏，仅显示前缀；完整凭据仅保存在本地凭据文件中。",
+		"hint":  "列表令牌已脱敏；点击编辑可由管理员读取和保存完整凭据。完整令牌不会写入日志或浏览器持久存储。",
 		"files": views,
 		// 保留字段名便于前端展示生成时间
 		"generatedAt": time.Now().Unix(),

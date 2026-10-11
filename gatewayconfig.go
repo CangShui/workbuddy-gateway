@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -34,8 +33,8 @@ func (e gatewayValidationError) Error() string { return string(e) }
 var (
 	gatewayConfigMu sync.RWMutex // 串行配置写入及运行时 Key 切换；不持锁调用 HTTP handler
 	gatewaySettings gatewayFileConfig
-	errSetupDone    = errors.New("管理 Key 已配置；如配置文件被外部修改，请重启加载")
-	errConfigChange = errors.New("管理 Key 已被外部修改，请重启加载配置后再操作")
+	errSetupDone    = errors.New("管理 Key 已配置；外部修改后请等待配置热加载并重新登录")
+	errConfigChange = errors.New("管理 Key 已被外部修改，请等待配置热加载并使用新 Key 重新登录")
 )
 
 func normalizeGatewayConfig(g gatewayFileConfig) (gatewayFileConfig, error) {
@@ -115,14 +114,9 @@ func readGatewayDocumentLocked() (map[string]json.RawMessage, gatewayFileConfig,
 	if err != nil {
 		return nil, gatewayFileConfig{}, nil, err
 	}
-	var typed runtimeFileConfig
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&typed); err != nil {
+	typed, err := parseRuntimeConfig(data)
+	if err != nil {
 		return nil, gatewayFileConfig{}, nil, fmt.Errorf("配置文件不可解析，拒绝覆盖: %w", err)
-	}
-	if err := ensureJSONEOF(dec); err != nil {
-		return nil, gatewayFileConfig{}, nil, err
 	}
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(data, &doc); err != nil || doc == nil {
@@ -181,11 +175,15 @@ func persistGatewayConfigLocked(doc map[string]json.RawMessage, g gatewayFileCon
 	}
 	gatewaySettings = g
 	setGatewayKeysLocked(g)
+	// 本函数只应用 gateway 段；强制下轮完整重载其他外部编辑的配置。
+	runtimeHasAppliedHash = false
 	log.Printf("[管理配置] traceId=%s 结果=保存成功 API鉴权启用=%t 说明=后续请求使用新鉴权状态，管理鉴权始终独立启用，监听端口不热切换", trace, g.APIKeyEnabled)
 	return nil
 }
 
 func initializeAdminKey(trace string) (string, error) {
+	runtimeConfigMu.Lock()
+	defer runtimeConfigMu.Unlock()
 	gatewayConfigMu.Lock()
 	defer gatewayConfigMu.Unlock()
 	if cfg.AdminKey != "" {
@@ -211,6 +209,12 @@ func initializeAdminKey(trace string) (string, error) {
 }
 
 func saveAPIKeySettings(enabled bool, key, trace string) error {
+	return saveGatewaySettings(&enabled, key, nil, nil, trace)
+}
+
+func saveGatewaySettings(enabled *bool, key string, apiPort, webPort *int, trace string) error {
+	runtimeConfigMu.Lock()
+	defer runtimeConfigMu.Unlock()
 	gatewayConfigMu.Lock()
 	defer gatewayConfigMu.Unlock()
 	doc, g, old, err := readGatewayDocumentLocked()
@@ -220,7 +224,15 @@ func saveAPIKeySettings(enabled bool, key, trace string) error {
 	if cfg.AdminKey == "" || g.AdminKey != cfg.AdminKey {
 		return errConfigChange
 	}
-	g.APIKeyEnabled = enabled
+	if enabled != nil {
+		g.APIKeyEnabled = *enabled
+	}
+	if apiPort != nil {
+		g.APIPort = *apiPort
+	}
+	if webPort != nil {
+		g.WebPort = *webPort
+	}
 	// 空输入表示保留已配置 Key；关闭校验不删除原 Key。
 	if key != "" {
 		g.APIKey = key
@@ -229,6 +241,15 @@ func saveAPIKeySettings(enabled bool, key, trace string) error {
 	if err != nil {
 		return err
 	}
+	effectiveAPIPort := g.APIPort
+	if cfg.PortExplicit {
+		effectiveAPIPort = cfg.Port
+	}
+	if cfg.WebUI && effectiveAPIPort == g.WebPort {
+		return gatewayValidationError("Web 端口不能与实际 API 端口冲突（含 -port 命令行覆盖）")
+	}
+	log.Printf("[管理端口设置] traceId=%s 配置API端口=%d 配置Web端口=%d 当前API端口=%d 当前Web端口=%d 说明=保存等效于编辑gateway配置，监听端口重启后改变",
+		trace, g.APIPort, g.WebPort, cfg.Port, cfg.WebPort)
 	registerSecrets(g.APIKey)
 	return persistGatewayConfigLocked(doc, g, old, trace)
 }
@@ -241,6 +262,10 @@ func gatewaySettingsView() map[string]any {
 		"apiKeyConfigured":   gatewaySettings.APIKey != "",
 		"adminKeyConfigured": cfg.AdminKey != "",
 		"apiPort":            cfg.Port, "webPort": cfg.WebPort,
+		"configuredApiPort": gatewaySettings.APIPort,
+		"configuredWebPort": gatewaySettings.WebPort,
+		"apiPortOverridden": cfg.PortExplicit,
+		"restartRequired":   gatewaySettings.WebPort != cfg.WebPort || !cfg.PortExplicit && gatewaySettings.APIPort != cfg.Port,
 	}
 }
 

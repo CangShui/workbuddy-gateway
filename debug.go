@@ -34,6 +34,9 @@ type runtimeFileConfig struct {
 	Debug struct {
 		Enabled bool `json:"enabled"`
 	} `json:"debug"`
+	Logs struct {
+		RetentionDays int `json:"retentionDays"` // 0 保留全部；正数保留含今天在内的 N 个日历日。
+	} `json:"logs"`
 	// Upstream 段可选，用于按网络状况调整上游超时（单位秒，<=0 或省略表示用默认值）。
 	Upstream struct {
 		// HeaderTimeoutSeconds：请求发送完成 → 收到响应头的等待上限。
@@ -49,8 +52,8 @@ type runtimeFileConfig struct {
 		// Blocklist：被禁用的模型名列表，命中即拒绝。
 		Blocklist []string `json:"blocklist"`
 		// Allowlist：白名单；非空时只允许列表内的模型，其余一律拒绝。
-		Allowlist []string `json:"allowlist"`
-		// Accounts：按模型限定可使用的凭据 JSON 文件名，不影响其他模型。
+		Allowlist []string `json:"allowlist,omitempty"`
+		// Accounts：all 控制全局调度，其余键限定各模型的凭据文件名。
 		Accounts map[string]modelAccountFileConfig `json:"accounts"`
 	} `json:"models"`
 }
@@ -87,57 +90,6 @@ var (
 	debugSink   *debugJSONSink
 	instanceID  = hostInstanceID()
 )
-
-func loadRuntimeConfig(path string) error {
-	cfg.DebugEnabled = false
-	f, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		setModelFilter(nil, nil)
-		_ = setModelAccountFilter(nil)
-		setSystemPromptConfig("", "")
-		return applyGatewayConfig(gatewayFileConfig{})
-	}
-	if err != nil {
-		return fmt.Errorf("读取配置文件 %s: %w", path, err)
-	}
-	defer f.Close()
-
-	var fileCfg runtimeFileConfig
-	dec := json.NewDecoder(f)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&fileCfg); err != nil {
-		return fmt.Errorf("解析配置文件 %s: %w", path, err)
-	}
-	if err := ensureJSONEOF(dec); err != nil {
-		return fmt.Errorf("解析配置文件 %s: %w", path, err)
-	}
-	if err := applyGatewayConfig(fileCfg.Gateway); err != nil {
-		return fmt.Errorf("解析网关配置 %s: %w", path, err)
-	}
-	cfg.DebugEnabled = fileCfg.Debug.Enabled
-
-	// 模型黑白名单：先清空再按配置重建，避免热加载时残留旧规则。
-	setModelFilter(fileCfg.Models.Blocklist, fileCfg.Models.Allowlist)
-	if err := setModelAccountFilter(fileCfg.Models.Accounts); err != nil {
-		return fmt.Errorf("解析模型账号名单 %s: %w", path, err)
-	}
-	setSystemPromptConfig(fileCfg.SystemPrompt.Fallback, fileCfg.SystemPrompt.Force)
-
-	// 上游超时覆盖：仅当配置为正数时生效，否则保持内置默认值。
-	upstreamHeaderTimeout = upstreamHeaderTimeoutDefault
-	upstreamIdleTimeout = upstreamIdleTimeoutDefault
-	upstreamTransientRetries = upstreamTransientRetriesDefault
-	if secs := fileCfg.Upstream.HeaderTimeoutSeconds; secs > 0 {
-		upstreamHeaderTimeout = time.Duration(secs) * time.Second
-	}
-	if secs := fileCfg.Upstream.IdleTimeoutSeconds; secs > 0 {
-		upstreamIdleTimeout = time.Duration(secs) * time.Second
-	}
-	if n := fileCfg.Upstream.TransientRetries; n != nil && *n >= 0 {
-		upstreamTransientRetries = *n
-	}
-	return nil
-}
 
 // modelFilter 保存生效的模型黑白名单（已归一化为小写、去重）。
 type modelFilter struct {
@@ -219,15 +171,28 @@ type modelAccountFileRule struct {
 
 // setModelAccountFilter 校验并原子替换按模型的凭据文件规则，不能用路径或通配符匹配凭据。
 func setModelAccountFilter(config map[string]modelAccountFileConfig) error {
+	rules, err := buildModelAccountRules(config)
+	if err != nil {
+		return err
+	}
+	modelAccountFilterMu.Lock()
+	modelAccountFilters = rules
+	modelAccountFilterMu.Unlock()
+	return nil
+}
+
+func buildModelAccountRules(config map[string]modelAccountFileConfig) (map[string]modelAccountFileRule, error) {
 	rules := make(map[string]modelAccountFileRule, len(config))
+	seen := make(map[string]bool, len(config))
 	for model, entry := range config {
 		id := normalizeModelName(model)
 		if id == "" {
-			return fmt.Errorf("模型名不能为空")
+			return nil, fmt.Errorf("模型名不能为空")
 		}
-		if _, exists := rules[id]; exists {
-			return fmt.Errorf("模型 %s 重复配置", id)
+		if seen[id] {
+			return nil, fmt.Errorf("模型 %s 重复配置", id)
 		}
+		seen[id] = true
 		rule := modelAccountFileRule{allow: map[string]bool{}, block: map[string]bool{}}
 		for _, item := range []struct {
 			list []string
@@ -236,7 +201,7 @@ func setModelAccountFilter(config map[string]modelAccountFileConfig) error {
 			for _, raw := range item.list {
 				name := strings.TrimSpace(raw)
 				if name == "" || name != filepath.Base(name) || strings.ContainsAny(name, `/\\*?[]`) || !strings.HasSuffix(strings.ToLower(name), ".json") {
-					return fmt.Errorf("模型 %s 的凭据文件名 %q 无效：仅支持以 .json 结尾的精确文件名，不支持路径或通配符", id, raw)
+					return nil, fmt.Errorf("模型 %s 的凭据文件名 %q 无效：仅支持以 .json 结尾的精确文件名，不支持路径或通配符", id, raw)
 				}
 				item.into[name] = true
 			}
@@ -246,19 +211,17 @@ func setModelAccountFilter(config map[string]modelAccountFileConfig) error {
 		}
 		rules[id] = rule
 	}
-	modelAccountFilterMu.Lock()
-	modelAccountFilters = rules
-	modelAccountFilterMu.Unlock()
-	return nil
+	return rules, nil
 }
 
-// modelAccountAllowed 判断该账号能否用于指定模型；模型未配置时不限制账号。
+// modelAccountAllowed 同时检查全局 all 与模型专属账号规则。
 // 重名文件拒绝匹配，避免不同目录下同名凭据被一起误放行。
 func modelAccountAllowed(model string, acc *Account, pool []*Account) (bool, string) {
 	modelAccountFilterMu.RLock()
 	rule, configured := modelAccountFilters[normalizeModelName(model)]
+	global, globalConfigured := modelAccountFilters["all"]
 	modelAccountFilterMu.RUnlock()
-	if !configured || (len(rule.allow) == 0 && len(rule.block) == 0) || acc == nil {
+	if acc == nil || !configured && !globalConfigured {
 		return true, ""
 	}
 	name := filepath.Base(acc.Path)
@@ -267,11 +230,16 @@ func modelAccountAllowed(model string, acc *Account, pool []*Account) (bool, str
 			return false, "凭据文件名重复"
 		}
 	}
-	if rule.block[name] {
-		return false, "命中账号黑名单"
-	}
-	if len(rule.allow) > 0 && !rule.allow[name] {
-		return false, "不在账号白名单"
+	for _, item := range []struct {
+		rule  modelAccountFileRule
+		label string
+	}{{global, "全局"}, {rule, "模型"}} {
+		if item.rule.block[name] {
+			return false, "命中" + item.label + "账号黑名单"
+		}
+		if len(item.rule.allow) > 0 && !item.rule.allow[name] {
+			return false, "不在" + item.label + "账号白名单"
+		}
 	}
 	return true, ""
 }
@@ -280,21 +248,28 @@ func modelAccountAllowed(model string, acc *Account, pool []*Account) (bool, str
 func modelAccountRuleConfigured(model string) bool {
 	modelAccountFilterMu.RLock()
 	rule, ok := modelAccountFilters[normalizeModelName(model)]
+	global, globalOK := modelAccountFilters["all"]
 	modelAccountFilterMu.RUnlock()
-	return ok && (len(rule.allow) > 0 || len(rule.block) > 0)
+	return ok && (len(rule.allow) > 0 || len(rule.block) > 0) || globalOK && (len(global.allow) > 0 || len(global.block) > 0)
 }
 
 func modelAccountRuleCount() int {
 	modelAccountFilterMu.RLock()
 	defer modelAccountFilterMu.RUnlock()
-	return len(modelAccountFilters)
+	n := len(modelAccountFilters)
+	if _, ok := modelAccountFilters["all"]; ok {
+		n--
+	}
+	return n
 }
 
 func modelAccountRuleIDs() []string {
 	modelAccountFilterMu.RLock()
 	ids := make([]string, 0, len(modelAccountFilters))
 	for id := range modelAccountFilters {
-		ids = append(ids, id)
+		if id != "all" {
+			ids = append(ids, id)
+		}
 	}
 	modelAccountFilterMu.RUnlock()
 	sort.Strings(ids)
@@ -315,13 +290,9 @@ func initDebugLogging() (func(), error) {
 	if !cfg.DebugEnabled {
 		return func() {}, nil
 	}
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		return nil, fmt.Errorf("创建调试日志目录 %s: %w", logDir, err)
-	}
-	path := filepath.Join(logDir, "debug-"+time.Now().Format("2006-01-02")+".jsonl")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	f, err := newDailyLogWriter("debug", ".jsonl")
 	if err != nil {
-		return nil, fmt.Errorf("打开调试日志 %s: %w", path, err)
+		return nil, fmt.Errorf("打开调试日志: %w", err)
 	}
 	sink := &debugJSONSink{writer: f, closer: f}
 	debugSinkMu.Lock()

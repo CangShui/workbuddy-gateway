@@ -51,13 +51,15 @@ func decodeObject(t *testing.T, raw []byte) map[string]any {
 	return obj
 }
 
-// 示例文件必须覆盖运行时结构的每个字段，避免新增配置项后用户照着示例部署却缺项。
+// 示例覆盖默认运行时字段及全局账号规则；互斥的模型 allowlist 作为替代模式不同时列出。
 func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "config.example.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	schema, err := json.Marshal(runtimeFileConfig{})
+	exampleSchema := runtimeFileConfig{}
+	exampleSchema.Models.Accounts = map[string]modelAccountFileConfig{"all": {}}
+	schema, err := json.Marshal(exampleSchema)
 	if err != nil {
 		t.Fatal(err)
 	}

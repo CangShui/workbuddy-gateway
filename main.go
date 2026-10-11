@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	version = "1.13.17"
+	version = "1.14.0"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -144,7 +144,8 @@ func isTransientNetworkError(err error) bool {
 // 返回的 cancel 用于在流式读取结束后取消上游 context（调用方负责）。
 func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, upstreamBytes []byte, reqID uint64, traceID string) (*http.Response, context.CancelFunc, error) {
 	var lastErr error
-	for try := 0; try <= upstreamTransientRetries; try++ {
+	_, _, retries := upstreamSettings()
+	for try := 0; try <= retries; try++ {
 		upstreamCtx, upstreamCancel := context.WithCancel(r.Context())
 		var headersWritten, bodyWritten atomic.Bool
 		trace := &httptrace.ClientTrace{
@@ -161,7 +162,7 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 			return nil, nil, err
 		}
 		backendHeaders(req, acc.Auth, prof)
-		if cfg.DebugEnabled {
+		if debugLoggingEnabled() {
 			req.Header.Set("X-Trace-ID", debugTraceID(r))
 			req.Header.Set("X-Parent-Request-ID", strconv.FormatUint(reqID, 10))
 		}
@@ -170,7 +171,7 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 			req.Close = true
 			cfg.HttpClient.CloseIdleConnections()
 			log.Printf("[网络重试] traceId=%s requestId=%d 账号=%s 第 %d/%d 次重试，上一尝试请求头未写出，已重建连接（错误: %s）",
-				traceID, reqID, acc.Path, try, upstreamTransientRetries, safeDebugError(lastErr))
+				traceID, reqID, acc.Path, try, retries, safeDebugError(lastErr))
 		}
 
 		resp, err := cfg.HttpClient.Do(req)
@@ -191,7 +192,7 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 			})
 			return nil, nil, err
 		}
-		if try < upstreamTransientRetries {
+		if try < retries {
 			debugEvent(r, "warn", "upstream_send_retry", map[string]any{
 				"retry": try + 1, "reason": "request_headers_not_written",
 				"business_impact": "换新连接重试尚未发出的模型请求",
@@ -602,7 +603,7 @@ func initFileLogging(command string) func() {
 		return func() {}
 	}
 	path := filepath.Join(logDir, "gateway-"+time.Now().Format("2006-01-02")+".log")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	f, err := newDailyLogWriter("gateway", ".log")
 	if err != nil {
 		log.Printf("[Log] 无法打开日志文件 %s，将仅输出到控制台: %v", path, err)
 		return func() {}
@@ -705,13 +706,14 @@ monitor 选项:
 
 func initHTTPClient() {
 	jar, _ := cookiejar.New(nil)
+	headerTimeout, _, _ := upstreamSettings()
 	transport := &http.Transport{
 		MaxIdleConns:        50,
 		IdleConnTimeout:     90 * time.Second,
 		MaxIdleConnsPerHost: 10,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
 		// 只约束到「收到响应头」为止；流式响应体的长时间传输由 upstreamIdleTimeout 的空闲看门狗保护。
-		ResponseHeaderTimeout: upstreamHeaderTimeout,
+		ResponseHeaderTimeout: headerTimeout,
 	}
 	if cfg.ProxyURL != "" {
 		pURL, err := url.Parse(cfg.ProxyURL)
@@ -724,7 +726,7 @@ func initHTTPClient() {
 	// 总超时会给整条流设一个硬上限（原为 180s），大请求长时间但持续有输出的流会被中途掐断，
 	// 导致上游 usage 丢失、客户端收到不完整响应，并被 CPA 判为 provider 故障而触发 503。
 	cfg.HttpClient = &http.Client{
-		Transport: transport,
+		Transport: &hotConfigTransport{transport: transport},
 		Jar:       jar,
 	}
 }
@@ -2419,22 +2421,24 @@ func runRefresh() {
 
 // accountSnapshot 是写入状态快照文件的单个账号状态。
 type accountSnapshot struct {
-	Path           string  `json:"path"`
-	Edition        string  `json:"edition,omitempty"` // 站点标识（cn/intl）
-	Nickname       string  `json:"nickname"`
-	UID            string  `json:"uid"`
-	State          string  `json:"state"` // active | cooldown | paid_exhausted | expired | disabled
-	CooldownUntil  int64   `json:"cooldownUntil,omitempty"`
-	CooldownMsg    string  `json:"cooldownMsg,omitempty"`
-	DisabledReason string  `json:"disabledReason,omitempty"`
-	TokenExpiresAt int64   `json:"tokenExpiresAt,omitempty"`
-	QuotaTotal     float64 `json:"quotaTotal,omitempty"`
-	QuotaUsed      float64 `json:"quotaUsed,omitempty"`
-	QuotaRemaining float64 `json:"quotaRemaining"`
-	IsPaidUser     bool    `json:"isPaidUser"`
-	PlanLabel      string  `json:"planLabel,omitempty"` // 官方套餐名称或已知短名称
-	PlanCheckedAt  int64   `json:"planCheckedAt,omitempty"`
-	PlanStale      bool    `json:"planStale,omitempty"`
+	Path              string  `json:"path"`
+	SchedulingEnabled *bool   `json:"schedulingEnabled,omitempty"`
+	SchedulingReason  string  `json:"schedulingReason,omitempty"`
+	Edition           string  `json:"edition,omitempty"` // 站点标识（cn/intl）
+	Nickname          string  `json:"nickname"`
+	UID               string  `json:"uid"`
+	State             string  `json:"state"` // active | cooldown | paid_exhausted | expired | disabled
+	CooldownUntil     int64   `json:"cooldownUntil,omitempty"`
+	CooldownMsg       string  `json:"cooldownMsg,omitempty"`
+	DisabledReason    string  `json:"disabledReason,omitempty"`
+	TokenExpiresAt    int64   `json:"tokenExpiresAt,omitempty"`
+	QuotaTotal        float64 `json:"quotaTotal,omitempty"`
+	QuotaUsed         float64 `json:"quotaUsed,omitempty"`
+	QuotaRemaining    float64 `json:"quotaRemaining"`
+	IsPaidUser        bool    `json:"isPaidUser"`
+	PlanLabel         string  `json:"planLabel,omitempty"` // 官方套餐名称或已知短名称
+	PlanCheckedAt     int64   `json:"planCheckedAt,omitempty"`
+	PlanStale         bool    `json:"planStale,omitempty"`
 	// 登录续期状态：刷新令牌到期时间与最近成功续期时间，便于提前发现需要重新登录的账号。
 	RefreshExpiresAt int64                         `json:"refreshExpiresAt,omitempty"`
 	LastRefreshTime  int64                         `json:"lastRefreshTime,omitempty"`
@@ -2457,14 +2461,17 @@ type modelStateSnapshot struct {
 
 // statusSnapshot 是写入 workbuddy-status.json 的完整快照。
 type statusSnapshot struct {
-	UpdatedAt int64               `json:"updatedAt"`
-	Accounts  []accountSnapshot   `json:"accounts"`
-	Models    []modelStatSnapshot `json:"models,omitempty"`
+	UpdatedAt    int64               `json:"updatedAt"`
+	Accounts     []accountSnapshot   `json:"accounts"`
+	Models       []modelStatSnapshot `json:"models,omitempty"`
+	ModelCatalog []modelStatSnapshot `json:"modelCatalog,omitempty"` // 管理页完整模型目录，含停用项。
 }
 
 // writeStatusSnapshot 将账号池实时状态（含冷却/失效）原子写入状态快照文件。
 // serve 后台周期调用；monitor 命令前台读取展示。
 func writeStatusSnapshot() {
+	statusSnapshotWriteMu.Lock()
+	defer statusSnapshotWriteMu.Unlock()
 	accountMu.Lock()
 	snap := statusSnapshot{UpdatedAt: time.Now().Unix()}
 	now := time.Now()
@@ -2545,7 +2552,13 @@ func writeStatusSnapshot() {
 		}
 		snap.Accounts = append(snap.Accounts, as)
 	}
-	snap.Models = buildModelStatSnapshots(now, accounts)
+	annotateAccountPolicies(snap.Accounts)
+	snap.ModelCatalog = buildAllModelStatSnapshots(now, accounts)
+	for _, row := range snap.ModelCatalog {
+		if disabled, _ := modelDisabled(row.ID); !disabled {
+			snap.Models = append(snap.Models, row)
+		}
+	}
 	cnFree, intlFree := freeModelDisplayCounts(snap.Models)
 	for i := range snap.Accounts {
 		if profileForEdition(snap.Accounts[i].Edition).Key == "intl" {
@@ -2950,6 +2963,8 @@ func runServe() {
 			_ = listener.Close()
 		}
 	}()
+	configCtx, stopConfigReload := context.WithCancel(context.Background())
+	defer stopConfigReload()
 	loadModelsCache()
 	if err := loadAccounts(); err != nil {
 		fmt.Printf("警告: 未检测到有效凭据 (%v)。\n请先执行: workbuddy-gateway login 扫码登录，或确保凭据文件存在。\n\n", err)
@@ -3033,6 +3048,7 @@ func runServe() {
 		fmt.Printf("   模型黑白名单:  未启用 (%s 中 models 段可配置)\n", runtimeConfigFile)
 	}
 	fmt.Printf("   模型账号名单:  %d 个模型配置了凭据文件规则（%s）\n", modelAccountRuleCount(), runtimeConfigFile)
+	fmt.Println("   配置热生效:    每 1s 扫描 config.json；端口变更需重启")
 
 	// 启动时展示所有账号状态（与 status 命令一致）
 	accountMu.Lock()
@@ -3069,6 +3085,7 @@ func runServe() {
 
 	fmt.Println("================================================================")
 	fmt.Println("等待客户端请求中 (按 Ctrl+C 安全停止)...")
+	go runtimeConfigLoop(configCtx)
 
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
@@ -3423,7 +3440,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		recordModelSuccess(modelName)
 		// 用空闲看门狗包装响应体：持续有数据就永不超时，超过 upstreamIdleTimeout 无数据才中断。
 		// 关闭响应体时会一并取消上游 context，完成清理。
-		resp.Body = newIdleReadCloser(resp.Body, upstreamIdleTimeout, upstreamCancel)
+		resp.Body = newIdleReadCloser(resp.Body, currentIdleTimeout(), upstreamCancel)
 		return resp, acc, prof, true
 	}
 
@@ -3589,7 +3606,7 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		})
 		reason := "上游流式响应中断，本次回复不完整"
 		if errors.Is(scanErr, context.DeadlineExceeded) {
-			reason = fmt.Sprintf("上游超过 %v 无数据，判定连接卡死并中断，本次回复不完整", upstreamIdleTimeout)
+			reason = fmt.Sprintf("上游超过 %v 无数据，判定连接卡死并中断，本次回复不完整", currentIdleTimeout())
 		}
 		errPayload, _ := json.Marshal(map[string]any{
 			"error": map[string]any{

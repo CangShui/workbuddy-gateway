@@ -61,14 +61,14 @@ func TestModelFilterDisabledByDefault(t *testing.T) {
 	}
 }
 
-// config.json 的 models 段应能加载黑名单与白名单。
+// config.json 的 models 段应能加载白名单；旧示例的空黑名单仍兼容。
 func TestRuntimeConfigLoadsModelFilter(t *testing.T) {
 	resetModelFilter()
 	defer resetModelFilter()
 
 	dir := t.TempDir()
 	path := dir + "/config.json"
-	content := `{"models":{"blocklist":["blocked-model"],"allowlist":["allowed-model"]}}`
+	content := `{"models":{"blocklist":[],"allowlist":["allowed-model"]}}`
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		t.Fatal(err)
 	}

@@ -3,7 +3,9 @@
 <img width="917" height="754" alt="image" src="https://github.com/user-attachments/assets/7dcfc461-1357-4991-9565-279047687898" />
 
 
-基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。默认无 Web UI，全部通过命令行（CLI）完成登录、凭据续期与服务控制；可选开启只读管理台（`-webui`，见下文）。
+基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。默认无 Web UI，全部通过命令行（CLI）完成登录、凭据续期与服务控制；可选开启网页管理台（`-webui`，见下文）。
+
+**v1.14.0**：新增配置热生效、全局账号与模型网页开关、凭据 JSON 编辑、端口设置及日志保留/清理。旧配置缺省日志保留天数时不自动删除；端口修改仍需重启。请先升级二进制，再添加新增配置字段。
 
 **同时支持两个上游站点**（同一套 `/v2/plugin/*` 协议，凭据按站点隔离，账号池可混挂轮询）：
 
@@ -23,7 +25,7 @@
 - [status](#status)
 - [refresh](#refresh)
 - [monitor](#monitor)
-- [webui（只读管理台）](#webui只读管理台)
+- [webui（网页控制台）](#webui网页控制台)
 - [probe](#probe)
 - [reset](#reset)
 - [version / help](#version--help)
@@ -110,7 +112,7 @@ workbuddy-gateway [command] [options]
 |---|---|---|
 | `apiPort` | `8317` | 模型 API 监听端口，省略或 `0` 使用默认值；也可用 `-port` 临时覆盖 |
 | `webPort` | `8316` | 网页控制台监听端口，省略或 `0` 使用默认值；仅在显式 `-webui` 时监听 |
-| `adminKey` | `""` | 网页控制台管理 Key，有两种设置方式：**① 页面一键生成**——为空时在服务器本机（或 SSH 本地端口转发）打开网页，生成 32 字符随机 Key 写入本文件，并在弹窗中**仅展示一次**；**② 手动编辑本文件**——直接把本字段改成任意随机字符串（建议 32 位）后重启网关。设置完成后可从其他设备用该 Key 登录 |
+| `adminKey` | `""` | 网页控制台管理 Key，有两种设置方式：**① 页面一键生成**——为空时在服务器本机（或 SSH 本地端口转发）打开网页，生成 32 字符随机 Key 写入本文件，并在弹窗中**仅展示一次**；**② 手动编辑本文件**——直接把本字段改成任意随机字符串（建议 32 位），保存后约 1 秒热生效。设置完成后可从其他设备用该 Key 登录 |
 | `apiKeyEnabled` | `false` | 模型 API 是否校验 Key。关闭时不带 Key 或任意 Key 均可调用模型；开启时必须匹配 `apiKey` |
 | `apiKey` | `""` | 模型 API Key。开启校验时必须非空；关闭时保留原值，重新开启即可继续使用 |
 
@@ -120,7 +122,7 @@ workbuddy-gateway [command] [options]
 
 ### JSON 调试日志
 
-工作目录中的 `config.json` 控制结构化调试日志，默认关闭。修改后需要重启网关进程：
+工作目录中的 `config.json` 控制结构化调试日志，默认关闭。修改后约 1 秒热生效，无需重启：
 
 ```json
 {
@@ -132,9 +134,25 @@ workbuddy-gateway [command] [options]
 
 开启后，网关把单行 JSON 写入 `logs/debug-YYYY-MM-DD.jsonl`；普通运行日志仍写入原来的 `logs/gateway-YYYY-MM-DD.log`，两者互不替代。可复制 `config.example.json` 作为起点。
 
+### 日志保留与清理
+
+```json
+{
+  "logs": {
+    "retentionDays": 7
+  }
+}
+```
+
+- `retentionDays` 范围为 `0～36500`：`0` 或省略表示保留全部，兼容旧配置；`7` 表示按服务器本地日期保留今天及此前 6 天。**设为正数后会自动删除过期日志，删除不可撤销。**
+- 配置热加载后应用新规则；启动/规则变化时扫描，此后每小时自动扫描。网页「日志」页可以保存保留天数，也可以立即按已保存规则清理。
+- 只删除 `logs/` 内日期合法的 `gateway-*.log`、`debug-*.jsonl`、`deployment-*.jsonl`、`frontend-*.log`；不跟随符号链接，不删除目录、凭据、配置、报告或其他文件，不删除正在写入的日志。
+- 普通日志和调试日志在跨午夜后的下一次写入切换到新日期文件。尚未切换的旧日志保持保护，关闭后在后续扫描清理。
+- 请先替换新二进制，再添加 `logs` 段；旧二进制可能因未知配置字段拒绝启动。
+
 ### 配置系统提示词
 
-工作目录 `config.json` 的 `systemPrompt` 段有两个独立选项（修改后需重启 `serve`）：
+工作目录 `config.json` 的 `systemPrompt` 段有两个独立选项（修改后约 1 秒热生效）：
 
 ```json
 {
@@ -152,7 +170,7 @@ workbuddy-gateway [command] [options]
 
 例如 `{"systemPrompt":{"fallback":"你是一个助手。","force":"请用中文回答。"}}`：客户端没有 system 时，发往上游的是 `你是一个助手。\n\n请用中文回答。`；客户端自带 system 时，发往上游的是 `<客户端原 system>\n\n请用中文回答。`。配置值仅支持 JSON 字符串；空串或全空白视为未配置。不会写出或替换客户端的 user、assistant、tool 消息，也不改变账号选择。普通日志和 JSON 调试日志只记录规则分支、位置与字符数，**不记录提示词正文**。
 
-> **实验功能风险自负：** `force` 后置于 system 末尾（紧贴用户消息），因此比客户端自带指令更"新近"，冲突时通常更有影响力——这正是人设类、风格类指令希望达到的效果，但也可能与客户端的 system 指令冲突、改变模型行为、增加 token 消耗，或触发上游内容/参数校验。需要回退时将 `force` 改回 `""` 并重启；建议先在测试会话验证，切勿在配置中写入密码、密钥或个人隐私。`config.json` 已被 Git 忽略，不要将真实配置提交到仓库。
+> **实验功能风险自负：** `force` 后置于 system 末尾（紧贴用户消息），因此比客户端自带指令更"新近"，冲突时通常更有影响力——这正是人设类、风格类指令希望达到的效果，但也可能与客户端的 system 指令冲突、改变模型行为、增加 token 消耗，或触发上游内容/参数校验。需要回退时将 `force` 改回 `""` 并保存；建议先在测试会话验证，切勿在配置中写入密码、密钥或个人隐私。`config.json` 已被 Git 忽略，不要将真实配置提交到仓库。
 
 `/v1/messages/count_tokens` 仅对客户端提供的内容做本地近似估算，不调用上游，也不计入网关随后注入的 `fallback` / `force` 文本；最终消耗以模型返回的 usage 为准。
 
@@ -233,8 +251,7 @@ workbuddy-gateway serve -keepalive-hours ""
 ```json
 {
   "models": {
-    "blocklist": ["deepseek-v4-pro"],
-    "allowlist": []
+    "blocklist": ["deepseek-v4-pro"]
   }
 }
 ```
@@ -246,7 +263,7 @@ workbuddy-gateway serve -keepalive-hours ""
 
 规则：
 
-- 黑名单优先：命中黑名单直接禁用，即使同时出现在白名单里。
+- 模型黑名单与白名单**选择一种**。非空 `allowlist` 和非空 `blocklist` 同时存在会校验失败，避免配置歧义；旧示例同时包含两个空数组、或其中一个为空时仍可读取。
 - 两个列表都为空或省略时不做任何限制（默认行为不变）。
 - 被禁用的模型会从 `/v1/models`、`/health` 的 `model_count` 和 `monitor` 的模型统计附表中**直接隐藏**。
 - 请求被禁用模型时返回 `403` 与中文提示，**不会消耗任何上游账号额度**：
@@ -265,14 +282,17 @@ workbuddy-gateway serve -keepalive-hours ""
 
 ### 按模型限制账号文件
 
-`models.accounts` 是**模型专属**的凭据 JSON 文件黑白名单，不是全局账号名单；未配置的模型仍可使用原有账号池。与上面的 `models.allowlist` / `models.blocklist`（控制模型是否可调用）互不替代：
+`models.accounts` 是凭据 JSON 文件黑白名单：保留键 **`all`** 控制所有模型的全局账号调度，其余键控制对应模型。未配置 `all` 或全局列表为空时与旧版本相同。全局规则和模型专属规则**都通过**才允许调度，模型专属白名单不能绕过全局停用。与上面的 `models.allowlist` / `models.blocklist`（控制模型是否可调用）互不替代：
 
 ```json
 {
   "models": {
     "blocklist": [],
-    "allowlist": [],
     "accounts": {
+      "all": {
+        "allowlist": [],
+        "blocklist": ["paused-account.json"]
+      },
       "deepseek-v4.1-flash": {
         "allowlist": ["intl-a.json", "intl-b.json"],
         "blocklist": ["intl-b.json"]
@@ -286,10 +306,31 @@ workbuddy-gateway serve -keepalive-hours ""
 ```
 
 - 同一模型内黑名单优先；账号白名单为空表示不限制，黑名单为空表示不排除。上述示例中 `deepseek-v4.1-flash` 最终只允许 `intl-a.json`，`hy3` 仅排除 `old-account.json`。
+- `all.blocklist` 中的账号不再参与任何模型的请求调度、失败换号和模型生成探测。账号仍显示在管理台，凭据、额度账本和历史统计保留；后台凭据保活/额度查询不属于模型生成，保持原有行为。
+- 全局账号白名单非空时，账号池开关反映白名单规则。首次网页账号操作会删除 `all.allowlist`（包括空数组或 `null`），将**当前账号池**的全局启停状态转换为 `all.blocklist`，再应用本次操作；其他当前账号状态和模型专属规则保留，之后新增账号默认开启（黑名单语义）。
 - 只接受凭据**文件名**（如 `intl-a.json`），不接受路径或通配符；同名凭据位于多个目录时会拒绝匹配，避免误用。模型名忽略大小写，文件名必须与实际凭据文件一致。
 - 请求调度与失败换号都不会绕过账号名单；后台价格探测与本机 `/admin/probe` 也会跳过不允许的账号。若没有匹配的账号，请求返回 `403 model_account_disabled` 中文提示，且不会调用上游。
 - 实时运行日志 `logs/gateway-YYYY-MM-DD.log` 在有账号被排除时记录汇总一行（模型、候选账号数、排除明细）；开启调试时 `logs/debug-YYYY-MM-DD.jsonl` 记录每个账号的 `model_account_policy_checked`。`monitor` 模型统计表的“可用账号”列已按名单过滤，只统计符合规则的账号。
-- `config.json` 在服务启动时读取，修改后需重启网关；示例中的文件名均为占位值。没有配置 `models.accounts` 时原行为不变。
+- 修改 `config.json` 约 1 秒热生效；示例中的文件名均为占位值。没有配置 `models.accounts` 时原行为不变。
+
+### config.json 热生效与旧版本升级
+
+`serve` 独立每 1 秒按文件内容检测配置变化，不受 `-reload-interval 0`（只关闭凭据扫描）影响。网页开关先写入配置文件、再立即应用；外部编辑器修改则在下一次扫描应用。
+
+| 配置 | 生效方式 |
+|---|---|
+| 模型名单、`models.accounts`（含 `all`） | 热生效，控制后续调度 |
+| `gateway.adminKey` / `apiKeyEnabled` / `apiKey` | 热生效；管理 Key 改变后需使用新 Key 登录 |
+| `systemPrompt` / `debug.enabled` | 热生效 |
+| `upstream` 超时、网络重试次数 | 后续上游请求使用新值；已有流式响应保持原空闲超时 |
+| `gateway.apiPort` / `webPort` | 写入配置但**重启后**变更监听；页面仍显示实际监听端口 |
+
+- 配置先整体解析、校验，再应用。运行时遇到半写 JSON、空文件、文件短暂缺失、错误类型或非法账号路径时，**保留上一份有效配置**，错误原因写入 `logs/gateway-YYYY-MM-DD.log`。修正并保存后自动重试；不会把配置读取失败误当作“全部开启”。
+- 要恢复默认规则，请保存有效的 `{}` 或将对应列表设为 `[]`，而不是删除运行中的配置文件。
+- 上一版本省略 `all`、`accounts`、`models` 或 `gateway` 的配置仍可读取；`accounts: {}`、`accounts: null`、`all: {}` 和空名单均表示无全局限制。默认示例包含空的 `models.accounts.all.allowlist/blocklist`。
+- 如旧配置同时填写了**两种非空模型名单**，请在升级前选择并保留一种；新版本不再接受相互冲突的模型黑白名单。运行中错误配置会保留上次生效状态，启动时则给出明确错误。
+- 旧配置中只有白名单生效时，管理页开关反映白名单；首次网页模型操作会删除 `models.allowlist`，将**当前已知模型**的启停状态转换为 `models.blocklist`。其他已知模型状态不变，之后新增的模型默认开启（黑名单语义）。模型账号规则保持独立。
+- 新版本中的 `all` 是保留键；不要把它当作真实模型 ID。**先升级二进制，再添加 `all`**；旧二进制不识别全局语义，会把它当作名为 `all` 的模型专属规则。
 
 每条 JSON 调试日志都包含时间、级别、稳定事件名、`trace_id`、`request_id`、服务/实例/版本、路由、方法、模型、账号、流式标记和累计耗时，并记录客户端地址、代理头、协议、TLS、Content-Type、Content-Length、deadline 等请求元数据。客户端传入的 `X-Trace-ID` 会优先复用并透传到上游。
 
@@ -561,7 +602,7 @@ workbuddy-gateway monitor -interval 2 -lines 20
 
 ## webui（网页控制台）
 
-默认关闭。显式 `-webui` 后在 `gateway.webPort`（默认 `8316`）提供独立网页控制台，用于在浏览器查看账号池、模型统计、日志、`config.json` 与凭据文件（令牌脱敏），并在「访问设置」页切换模型 API Key 校验。它与模型 API 端口分离，未启用时两个端口都不监听。
+默认关闭。显式 `-webui` 后在 `gateway.webPort`（默认 `8316`）提供独立网页控制台，用于在浏览器管理账号池开关、模型列表开关，查看日志、`config.json` 与凭据文件（令牌脱敏），并在「访问设置」页切换模型 API Key 校验。它与模型 API 端口分离，未启用时两个端口都不监听。
 
 ```bash
 # 只有显式 -webui 才开启网页控制台；模型 API 仍监听 8317
@@ -579,7 +620,7 @@ p = pathlib.Path("/opt/workbuddy-gateway/config.json")
 cfg = json.loads(p.read_text())
 cfg.setdefault("gateway", {})["adminKey"] = secrets.token_hex(16)  # 32 字符
 p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
-print("已写入 gateway.adminKey，重启网关后生效")
+print("已写入 gateway.adminKey，运行中的新版本约 1 秒热生效")
 PY
 systemctl restart workbuddy-gateway
 ```
@@ -588,16 +629,25 @@ systemctl restart workbuddy-gateway
 |---|---|
 | 入口 | `GET /ui/`（独立管理端口，静态外壳不含任何数据） |
 | 数据接口 | `GET /admin/api/status`、`/admin/api/models`、`/admin/api/logs`、`/admin/api/config`、`/admin/api/credentials`，**一律需要 `Authorization: Bearer <adminKey>`** |
-| 写入接口 | `POST /admin/api/setup`（仅本机首次生成管理 Key；也可改用下方“手动编辑配置文件”方式）、`POST /admin/api/settings`（切换模型 API 鉴权并写入 `config.json`） |
-| 页面 | 总览（含国内站 / 国际站账号数量）、账号、模型、日志、配置（只读 · Key 已隐藏）、凭据（只读 · 脱敏）、访问设置 |
-| 数据来源 | 复用 `serve` 周期写入的 `workbuddy-status.json`、`logs/` 日志与本地配置/凭据文件，不改变转发与调度逻辑 |
-| 凭据展示 | 只显示站点、昵称、UID、认证域名与到期时间；令牌仅保留前 6 位（如 `ACCESS****`），不返回明文 |
+| 写入接口 | `POST /admin/api/setup`（仅本机首次生成管理 Key）、`POST /admin/api/settings`（模型 API 鉴权与端口）、`POST /admin/api/account-toggle` / `model-toggle`（账号/模型开关）、`POST /admin/api/credential-edit`（凭据 JSON）、`POST /admin/api/log-settings` / `log-cleanup`（保留设置与过期清理） |
+| 页面 | 总览（含国内站 / 国际站数量与已停用账号）、账号池（全局调度开关）、模型列表（启停开关，含停用模型）、日志（保留天数与清理）、配置（只读 · Key 已隐藏，systemPrompt 正文直接展示）、凭据（脱敏列表与受控 JSON 编辑器）、访问设置（鉴权与端口编辑） |
+| 数据来源 | 复用 `serve` 的状态快照、完整模型目录、`logs/` 日志与本地配置/凭据文件；开关受控写入配置并应用原有调度过滤 |
+| 凭据列表 | 显示站点、昵称、UID、认证域名与到期时间；令牌只保留前 6 位（如 `ACCESS****`）。管理员主动打开编辑器后才显示完整 JSON |
+
+#### 网页编辑凭据与端口
+
+- **凭据列表仍脱敏**。点击「编辑」后，`GET /admin/api/credential-edit?file=已配置凭据路径` 才在管理鉴权及同源保护下返回完整 JSON；编辑器显示明文令牌，请勿分享截图或正文。内容不写入浏览器持久存储，离开凭据页、退出或重新登录时清空编辑器。
+- 保存调用 `POST /admin/api/credential-edit`，提交 `path`、`revision` 和 `content`。只允许编辑当前配置加载的普通凭据文件，不支持任意路径或符号链接；最大 256 KiB。JSON 必须有效，`auth.accessToken` 非空且不能是脱敏占位值。
+- 编辑器使用文件摘要做版本检查。后台续期或其他操作已修改文件时返回 `409`，不会覆盖新令牌，请重新加载再编辑。保存与账号当前请求串行，原文件权限保留；不调用上游验证。同一账号保留额度账本；UID 或站点改变时重置对应运行状态，避免误用旧账号的余额/免费判定。日志不记录凭据正文或令牌。
+- 「访问设置」可编辑 `gateway.apiPort` / `gateway.webPort`，保存调用原来的 `POST /admin/api/settings`。配置端口与实际监听端口分别显示，修改后**需重启网关**，不会直接中断当前页面或流式请求；显式 `-port` 仍优先于配置。
+- 「日志」页通过 `GET/POST /admin/api/log-settings` 读写 `logs.retentionDays`，通过 `POST /admin/api/log-cleanup`（空 JSON 对象）清理过期日志，返回删除数量、回收字节、正在写入跳过数量与失败数量。
+- 所有新接口均需要独立管理 Key，并复用同源校验和 TraceID 落盘审计；模型 API Key 不能编辑凭据、修改端口或清理日志。
 
 - 未启用 `-webui` 时，管理端口不监听，`/ui` 与 `/admin/api/*` 也不注册路由。
 - **管理 Key 的两种设置方式**（二选一即可）：
   1. **页面一键生成**：`adminKey` 为空时，在服务器本机、或用 SSH 本地端口转发（`ssh -L 8316:127.0.0.1:8316 用户@服务器`）后访问 `http://127.0.0.1:8316/ui/`，点击生成 32 字符随机 Key；Key 写入 `config.json` 并**仅在弹窗中展示一次**。远程（非本机）访问不能触发一键生成，避免他人抢先生成；但远程仍可用已设置好的 Key 登录。
-  2. **手动编辑配置文件**：直接在服务器上编辑 `config.json`，把 `gateway.adminKey` 设为你自己的随机字符串（建议 32 位），保存后重启网关即可。此方式不需要本机访问，也不需要页面操作；登录时填写该字符串即可。
-- `/admin/api/logs` 只允许读取 `logs/` 下的 `gateway-YYYY-MM-DD.log` 与 `debug-YYYY-MM-DD.jsonl`，拒绝任意路径与目录穿越；返回日志先做秘密值脱敏，且单次读取有约 1 MiB 的扫描预算，超长单行会被省略。
+   2. **手动编辑配置文件**：直接在服务器上编辑 `config.json`，把 `gateway.adminKey` 设为你自己的随机字符串（建议 32 位），保存后约 1 秒生效。此方式不需要本机访问，也不需要页面操作；登录时填写该字符串即可。
+- `/admin/api/logs` 只允许读取 `logs/` 下命名受限的普通、调试、部署和前端审计日志，拒绝任意路径与目录穿越；返回日志先做秘密值脱敏，且单次读取有约 1 MiB 的扫描预算，超长单行会被省略。
 - 前端为原生 HTML/CSS/JS，通过 `go:embed` 嵌入二进制，无额外构建步骤与运行时依赖；管理 Key 只保存在当前标签页的 `sessionStorage`，验证成功后才保存。
 - 状态快照缺失或损坏时接口返回 `503`，页面保留上次数据并提示，不会把读取失败显示成零账号。
 

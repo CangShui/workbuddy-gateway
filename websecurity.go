@@ -102,7 +102,11 @@ func localAdminSetupRequest(r *http.Request) bool {
 }
 
 func decodeAdminJSON(w http.ResponseWriter, r *http.Request, dst any) error {
-	r.Body = http.MaxBytesReader(w, r.Body, 16<<10) // 仅小型管理表单，不影响模型请求。
+	return decodeAdminJSONLimit(w, r, dst, 16<<10)
+}
+
+func decodeAdminJSONLimit(w http.ResponseWriter, r *http.Request, dst any, limit int64) error {
+	r.Body = http.MaxBytesReader(w, r.Body, limit) // 仅管理表单，不影响模型请求。
 	defer r.Body.Close()
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -125,7 +129,7 @@ func handleWebUISetup(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusForbidden,
 				"首次自动生成管理 Key 仅允许本机访问。可选方式：① 在服务器本机打开本页面；"+
 					"② 使用 SSH 本地端口转发（如 ssh -L 8316:127.0.0.1:8316 用户@服务器）后访问；"+
-					"③ 直接在服务器上编辑 config.json，把 gateway.adminKey 设为随机字符串后重启网关")
+					"③ 直接在服务器上编辑 config.json，把 gateway.adminKey 设为随机字符串，保存后约 1 秒生效")
 			return
 		}
 		var empty map[string]json.RawMessage
@@ -163,14 +167,16 @@ func handleWebUISettings(w http.ResponseWriter, r *http.Request) {
 		var input struct {
 			Enabled *bool  `json:"apiKeyEnabled"`
 			Key     string `json:"apiKey"`
+			APIPort *int   `json:"apiPort"`
+			WebPort *int   `json:"webPort"`
 		}
-		if err := decodeAdminJSON(w, r, &input); err != nil || input.Enabled == nil {
+		if err := decodeAdminJSON(w, r, &input); err != nil || input.Enabled == nil && input.APIPort == nil && input.WebPort == nil && input.Key == "" {
 			log.Printf("[管理配置] traceId=%s 阶段=参数校验 结果=拒绝 状态码=400 原因=必须提供有效API鉴权开关和JSON", debugTraceID(r))
-			writeJSONError(w, http.StatusBadRequest, "必须提供 apiKeyEnabled 布尔值；apiKey 为可选字符串")
+			writeJSONError(w, http.StatusBadRequest, "至少提供 API 鉴权设置或端口设置，字段类型必须正确")
 			return
 		}
-		log.Printf("[管理配置] traceId=%s 阶段=参数校验 API鉴权目标=%t 新Key已提供=%t 说明=Key原文不记录", debugTraceID(r), *input.Enabled, input.Key != "")
-		if err := saveAPIKeySettings(*input.Enabled, input.Key, debugTraceID(r)); err != nil {
+		log.Printf("[管理配置] traceId=%s 阶段=参数校验 鉴权开关已提供=%t 端口已提供=%t 新Key已提供=%t 说明=Key原文不记录", debugTraceID(r), input.Enabled != nil, input.APIPort != nil || input.WebPort != nil, input.Key != "")
+		if err := saveGatewaySettings(input.Enabled, input.Key, input.APIPort, input.WebPort, debugTraceID(r)); err != nil {
 			log.Printf("[管理配置] traceId=%s 结果=失败 原因=%v 业务影响=当前运行时鉴权状态保留", debugTraceID(r), err)
 			status := http.StatusInternalServerError
 			var validation gatewayValidationError
@@ -204,10 +210,12 @@ func handleWebUIClientEvent(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "无效的前端审计事件")
 		return
 	}
-	allowed := map[string]bool{"request_completed": true, "request_failed": true, "settings_validation_failed": true}
+	allowed := map[string]bool{"request_completed": true, "request_failed": true, "settings_validation_failed": true, "credential_validation_failed": true, "log_validation_failed": true}
 	routes := map[string]bool{
 		"/admin/api/status": true, "/admin/api/models": true, "/admin/api/logs": true,
 		"/admin/api/config": true, "/admin/api/credentials": true, "/admin/api/settings": true,
+		"/admin/api/account-toggle": true, "/admin/api/model-toggle": true,
+		"/admin/api/credential-edit": true, "/admin/api/log-settings": true, "/admin/api/log-cleanup": true,
 	}
 	if !allowed[input.Event] || !routes[input.Route] || input.Status < 0 || input.Status > 599 {
 		writeJSONError(w, http.StatusBadRequest, "不接受未定义的前端审计事件")

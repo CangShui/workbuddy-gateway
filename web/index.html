@@ -28,8 +28,8 @@
 
 <nav class="tabs hidden" id="tabs">
   <button class="tab active" data-tab="overview" type="button">总览</button>
-  <button class="tab" data-tab="accounts" type="button">账号</button>
-  <button class="tab" data-tab="models" type="button">模型</button>
+  <button class="tab" data-tab="accounts" type="button">账号池</button>
+  <button class="tab" data-tab="models" type="button">模型列表</button>
   <button class="tab" data-tab="logs" type="button">日志</button>
   <button class="tab" data-tab="config" type="button">配置</button>
   <button class="tab" data-tab="credentials" type="button">凭据</button>
@@ -42,7 +42,7 @@
   <h2>首次设置管理 Key</h2>
   <p id="setupHelp">服务器将生成一个 32 字符随机管理 Key，写入 config.json，并仅在本次操作完成后弹窗展示。请妥善保存。</p>
   <p class="hint">两种设置方式：① 在服务器本机（或 SSH 本地端口转发）打开本页，一键生成 32 字符随机 Key；
-    ② 直接在服务器上编辑 config.json，把 gateway.adminKey 设为随机字符串后重启网关。
+    ② 直接在服务器上编辑 config.json，把 gateway.adminKey 设为随机字符串，保存后约 1 秒生效。
     自动生成仅限本机，避免远程抢先初始化；设置完成后可从其他设备使用管理 Key 登录。</p>
   <button id="initializeAdmin" type="button">生成并保存管理 Key</button>
 </section>
@@ -63,11 +63,12 @@
   <section id="panel-accounts" class="panel">
     <div class="card">
       <div class="card-title">账号池</div>
+      <p class="hint">调度开关写入 models.accounts.all.blocklist 并立即生效。已有全局白名单时，首次操作会删除 all.allowlist，将当前账号池启停状态转为黑名单；之后新增账号默认开启。停用不删除凭据、不清除账本、不打断已有请求，开启后仍受模型专属规则限制。</p>
       <div class="table-wrap">
         <table id="accountsTable">
           <thead>
             <tr>
-              <th>#</th><th>凭据文件</th><th>账号</th><th>站点</th><th>状态</th>
+              <th>#</th><th>全局调度</th><th>凭据文件</th><th>账号</th><th>站点</th><th>状态</th>
               <th>Token 有效期</th><th>总额度</th><th>已用</th><th>剩余</th>
               <th>套餐</th><th>免费模型</th><th>模型冷却</th>
               <th>刷新令牌到期</th><th>上次续期</th><th>续期失败</th>
@@ -82,16 +83,17 @@
   <section id="panel-models" class="panel">
     <div class="card">
       <div class="card-title">
-        模型统计
+        模型列表
         <span class="filter">
           <label><input type="checkbox" id="onlyUsable"> 仅显示可用账号 &gt; 0</label>
         </span>
       </div>
+      <p class="hint" id="modelPolicyHint">模型开关写入 models.blocklist 并立即生效；停用模型仍保留在此列表，客户端模型目录会隐藏停用项。</p>
       <div class="table-wrap">
         <table id="modelsTable">
           <thead>
             <tr>
-              <th>模型</th><th>国内倍率</th><th>国际倍率</th><th>可用账号</th>
+              <th>启用</th><th>模型</th><th>国内倍率</th><th>国际倍率</th><th>可用账号</th>
               <th>请求</th><th>平均首字(5h)</th><th>平均总耗时(5h)</th><th>总Token(M)</th><th>末次状态</th>
             </tr>
           </thead>
@@ -102,6 +104,19 @@
   </section>
 
   <section id="panel-logs" class="panel">
+    <div class="card settings-card">
+      <div class="card-title">日志保留与清理</div>
+      <p class="hint">0 表示保留全部；7 表示保留今天及此前 6 天。保存会写入 config.json 并自动清理过期日志，删除不可撤销。只处理项目日志，不删除配置或凭据。</p>
+      <div class="settings-row">
+        <label for="logRetentionDays">日志保留天数</label>
+        <input id="logRetentionDays" type="number" min="0" max="36500" step="1" value="0">
+      </div>
+      <div class="actions">
+        <button id="saveLogSettings" type="button">保存保留天数</button>
+        <button id="cleanupLogs" type="button" class="ghost">立即清理过期日志</button>
+      </div>
+      <p id="logCleanupResult" class="hint action-result" role="status"></p>
+    </div>
     <div class="card">
       <div class="card-title">
         运行日志
@@ -123,9 +138,6 @@
     <div class="card">
       <div class="card-title">
         config.json（只读 · Key 已隐藏）
-        <span class="filter">
-          <label><input type="checkbox" id="maskHints" checked> 隐藏 systemPrompt 正文</label>
-        </span>
       </div>
       <pre class="logbox" id="configBox">加载中…</pre>
     </div>
@@ -133,13 +145,13 @@
 
   <section id="panel-credentials" class="panel">
     <div class="card">
-      <div class="card-title">凭据文件（只读 · 令牌脱敏）</div>
+      <div class="card-title">凭据文件</div>
       <p class="hint" id="credHint"></p>
       <div class="table-wrap">
         <table id="credentialsTable">
           <thead>
             <tr>
-              <th>凭据文件</th><th>站点</th><th>昵称</th><th>UID</th><th>认证域名</th>
+              <th>操作</th><th>凭据文件</th><th>站点</th><th>昵称</th><th>UID</th><th>认证域名</th>
               <th>Access Token</th><th>Refresh Token</th>
               <th>Token 到期</th><th>刷新令牌到期</th><th>上次续期</th>
             </tr>
@@ -148,11 +160,23 @@
         </table>
       </div>
     </div>
+    <div id="credentialEditor" class="card hidden">
+      <div class="card-title">编辑凭据 <span id="credentialPath" class="mono"></span></div>
+      <p class="hint">编辑器显示完整令牌，仅管理员可访问。请勿分享截图或正文。保存会更新原文件并应用凭据，不调用上游验证；后台已续期的文件会拒绝覆盖。离开本页会清空编辑内容。</p>
+      <label for="credentialContent" class="hint">凭据 JSON</label>
+      <textarea id="credentialContent" spellcheck="false" autocomplete="off" aria-describedby="credentialEditorStatus"></textarea>
+      <div class="actions">
+        <button id="saveCredential" type="button">保存凭据</button>
+        <button id="reloadCredential" type="button" class="ghost">重新加载</button>
+        <button id="cancelCredential" type="button" class="ghost">取消编辑</button>
+      </div>
+      <p id="credentialEditorStatus" class="hint action-result" role="status"></p>
+    </div>
   </section>
 
   <section id="panel-settings" class="panel">
     <div class="card settings-card">
-      <div class="card-title">模型 API 访问设置</div>
+      <div class="card-title">访问与端口设置</div>
       <p class="hint">这里只控制模型 API。管理 Key 始终需要验证，与本开关无关。</p>
       <div class="settings-row">
         <label for="apiKeyEnabled"><input id="apiKeyEnabled" type="checkbox"> 开启模型 API Key 校验</label>
@@ -167,7 +191,12 @@
       <div class="settings-ports">
         <div>API 监听端口：<strong id="apiPortValue">-</strong></div>
         <div>Web 监听端口：<strong id="webPortValue">-</strong></div>
-        <p class="hint">端口在 config.json 的 gateway.apiPort / gateway.webPort 中配置，修改后重启生效。默认 API 8317、Web 8316。</p>
+        <div class="port-inputs">
+          <div class="settings-row"><label for="configuredApiPort">配置 API 端口</label><input id="configuredApiPort" type="number" min="1" max="65535" step="1"></div>
+          <div class="settings-row"><label for="configuredWebPort">配置 Web 端口</label><input id="configuredWebPort" type="number" min="1" max="65535" step="1"></div>
+        </div>
+        <p id="portSettingsStatus" class="hint" role="status">保存等效于修改 config.json 的 gateway.apiPort / gateway.webPort，重启网关后改变监听；不会中断当前页面和流式请求。</p>
+        <button id="savePortSettings" type="button">保存端口配置</button>
       </div>
     </div>
   </section>
