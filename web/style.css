@@ -207,12 +207,17 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .port-inputs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
 .action-result { margin-top: 12px; margin-bottom: 0; }
-#credentialContent {
-  display: block; width: 100%; min-height: 300px; margin-top: 8px; box-sizing: border-box;
-  padding: 12px; resize: vertical; border: 1px solid var(--border); border-radius: 8px;
-  font-family: var(--mono); font-size: 13px; line-height: 1.6; background: var(--surface-muted); color: var(--text);
-}
+.task-description { white-space: normal; min-width: 180px; max-width: 280px; line-height: 1.6; }
 @media (max-width: 600px) {
   .port-inputs { grid-template-columns: 1fr; gap: 0; }
   .actions button { min-height: 44px; }
+  #tasksTable, #tasksTable tbody { display: block; }
+  #tasksTable thead { display: none; }
+  #tasksTable tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; padding: 16px 0; border-bottom: 1px solid var(--border); }
+  #tasksTable tr:last-child { border-bottom: 0; }
+  #tasksTable td { display: block; border: 0; padding: 0; white-space: normal; overflow-wrap: anywhere; min-width: 0; max-width: none; }
+  #tasksTable td::before { content: attr(data-label); display: block; margin-bottom: 4px; color: var(--text-muted); font-size: 11px; font-weight: 400; }
+  #tasksTable td:first-child { grid-column: 1 / -1; font-size: 14px; font-weight: 600; }
+  #tasksTable td:first-child::before { display: none; }
+  #tasksTable td:nth-child(3), #tasksTable td:nth-child(8) { grid-column: 1 / -1; }
 }

@@ -599,10 +599,12 @@ func saveModelsCache(source string, catalogs map[string][]catalogModel, probes m
 	return os.Rename(tmp, modelsCacheFile)
 }
 
-func persistModelsLocked(source string) {
-	if err := saveModelsCache(source, catalogModels, modelProbes); err != nil {
+func persistModelsLocked(source string) error {
+	err := saveModelsCache(source, catalogModels, modelProbes)
+	if err != nil {
 		log.Printf("[Models] 缓存写入失败: %v", err)
 	}
+	return err
 }
 
 func catalogSnapshot() (map[string][]catalogModel, string) {
@@ -783,7 +785,12 @@ func modelNeedsProbe(site, modelID string, requests int64) bool {
 // 同步
 // -----------------------------------------------------------------------------
 
-func refreshModelsOnce() {
+func refreshModelsOnce(schedule ...time.Time) {
+	next := time.Time{}
+	if len(schedule) > 0 {
+		next = schedule[0]
+	}
+	trace, started := startScheduledTask("model_catalog", next)
 	version, verErr := fetchNPMCatalogVersion()
 	if verErr != nil {
 		log.Printf("[Models] npm 版本查询失败（仅影响 npm 兜底来源）: %v", verErr)
@@ -833,6 +840,7 @@ func refreshModelsOnce() {
 	}
 
 	if len(fetched) == 0 {
+		logScheduledTask("model_catalog", "completed", "failed", trace, started, next, "两路目录都不可用，保留原状态")
 		log.Printf("[Models] 无任何可用目录数据，保留原状态；失败详情: %s", strings.Join(failures, " | "))
 		return
 	}
@@ -864,9 +872,14 @@ func refreshModelsOnce() {
 			}
 		}
 	}
-	persistModelsLocked(source)
+	cacheErr := persistModelsLocked(source)
 	modelsMu.Unlock()
 	requestModelsProbe()
+	status := "success"
+	if len(failures) > 0 || verErr != nil || cacheErr != nil {
+		status = "partial"
+	}
+	logScheduledTask("model_catalog", "completed", status, trace, started, next, fmt.Sprintf("可用目录=%d，来源失败=%d，npm版本查询失败=%t，缓存写入失败=%t", len(fetched), len(failures), verErr != nil, cacheErr != nil))
 }
 
 func requestModelsScan() {
@@ -891,13 +904,16 @@ func modelsRefreshLoop(interval time.Duration) {
 	refreshModelsOnce()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	next := time.Now().Add(interval)
+	logScheduledTask("model_catalog", "scheduled", "", newTraceID(), time.Time{}, next, "目录刷新完成后开始定时间隔")
 	for {
 		select {
-		case <-ticker.C:
-			refreshModelsOnce()
+		case tick := <-ticker.C:
+			next = tick.Add(interval)
+			refreshModelsOnce(next)
 		case <-modelsScanTrigger:
 			log.Printf("[Models] 账号池发生变化，立即刷新模型目录")
-			refreshModelsOnce()
+			refreshModelsOnce(next)
 		}
 	}
 }
@@ -907,11 +923,13 @@ func modelsRefreshLoop(interval time.Duration) {
 // 首轮在启动后很快执行；只要仍有待探测模型就用较短间隔追赶，收敛后回到长间隔。
 func modelPriceProbeLoop() {
 	if cfg.DisablePriceProbes {
+		logScheduledTask("price_probe", "disabled", "disabled", newTraceID(), time.Time{}, time.Time{}, "启动参数已禁止自动生成请求探测")
 		log.Printf("[ModelPrice] 阶段=自动探测调度 结果=已关闭 原因=指定-disable-price-probes 业务影响=不会自动请求模型，客户端请求和显式probe不受影响")
 		return
 	}
 	timer := time.NewTimer(modelPriceProbeStartDelay)
 	defer timer.Stop()
+	logScheduledTask("price_probe", "scheduled", "", newTraceID(), time.Time{}, time.Now().Add(modelPriceProbeStartDelay), "启动后20秒首轮；无候选模型时不生成请求")
 	for {
 		select {
 		case <-timer.C:
@@ -923,6 +941,7 @@ func modelPriceProbeLoop() {
 			next = modelPriceProbeCatchUp
 		}
 		timer.Reset(next)
+		logScheduledTask("price_probe", "scheduled", "", newTraceID(), time.Time{}, time.Now().Add(next), "按待探测情况2分钟或30分钟；同站点模型受12小时限制")
 	}
 }
 
@@ -964,13 +983,16 @@ func modelProbeBatchSize() int {
 }
 
 func modelPriceProbeOnce() {
+	trace, started := startScheduledTask("price_probe", time.Time{})
 	ids, _ := mergedModelIDs()
 	if len(ids) == 0 {
+		logScheduledTask("price_probe", "completed", "skipped", trace, started, time.Time{}, "目录为空，没有探测请求")
 		return
 	}
 	now := time.Now()
 	batch := modelProbeBatchSize()
 	done := 0
+	failed := 0
 	for _, site := range catalogSites {
 		if done >= batch {
 			break
@@ -1001,8 +1023,11 @@ func modelPriceProbeOnce() {
 				p.Verdict = verdict
 			}
 			modelProbes[probeKey(site, id)] = p
-			persistModelsLocked(dynamicSource)
+			cacheErr := persistModelsLocked(dynamicSource)
 			modelsMu.Unlock()
+			if verdict == "" || cacheErr != nil {
+				failed++
+			}
 			log.Printf("[ModelPrice] 站点=%s 账号=%s 模型=%s -> verdict=%s credit=%s tokens=%d (%s)",
 				site, acc.Path, id, p.Verdict, formatQuota(credit), tokens, detail)
 			done++
@@ -1011,6 +1036,15 @@ func modelPriceProbeOnce() {
 	if done > 0 {
 		writeStatusSnapshot()
 	}
+	status := "success"
+	if done == 0 {
+		status = "skipped"
+	} else if failed == done {
+		status = "failed"
+	} else if failed > 0 {
+		status = "partial"
+	}
+	logScheduledTask("price_probe", "completed", status, trace, started, time.Time{}, fmt.Sprintf("探测=%d，结论或缓存异常=%d", done, failed))
 }
 
 // pickProbeAccount 选择同站点账号用于价格探测。

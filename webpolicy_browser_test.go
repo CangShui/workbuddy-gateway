@@ -20,6 +20,8 @@ func TestPolicyBrowserFixture(t *testing.T) {
 	}
 	isolatePolicies(t)
 	cfg.Port, cfg.WebPort = 18317, 18316
+	cfg.ModelsRefresh, cfg.ReloadInterval, cfg.KeepaliveHours = 60, 5, []int{22}
+	cfg.DisablePriceProbes = true
 	writeRuntimeFixture(t, `{"gateway":{"apiPort":18317,"webPort":18316,"adminKey":"visual-test-admin"},"systemPrompt":{"force":"浏览器验收：此处直接显示 systemPrompt 正文。"},"models":{"allowlist":["hy3"],"accounts":{"all":{"allowlist":["workbuddy-cn-a.json"],"blocklist":[]}}}}`)
 	if err := loadRuntimeConfig(runtimeConfigFile); err != nil {
 		t.Fatal(err)
@@ -45,6 +47,22 @@ func TestPolicyBrowserFixture(t *testing.T) {
 	oldDay := time.Now().AddDate(0, 0, -30).Format("2006-01-02")
 	_ = os.WriteFile(filepath.Join(logDir, "gateway-"+oldDay+".log"), []byte("synthetic historical log\n"), 0600)
 	writeStatusSnapshot()
+	now := time.Now()
+	for _, fixture := range []struct {
+		id, status, detail string
+		next               time.Time
+	}{
+		{"quota_scan", "partial", "合成测试：一个账号查询超时", now.Add(5 * time.Minute)},
+		{"token_check", "success", "合成测试：两个账号检查正常", now.Add(5 * time.Minute)},
+		{"status_snapshot", "success", "合成测试：快照已写入", now.Add(3 * time.Second)},
+		{"model_catalog", "success", "合成测试：两站目录已同步", now.Add(time.Hour)},
+		{"daily_checkin", "success", "合成测试：签到成功", nextDailyCheckin(now)},
+		{"keepalive", "success", "合成测试：续期成功", nextKeepaliveTime(now, cfg.KeepaliveHours)},
+		{"keepalive_catchup", "skipped", "合成测试：近期已续期，不补跑", time.Time{}},
+	} {
+		logScheduledTask(fixture.id, "completed", fixture.status, newTraceID(), now.Add(-time.Minute), fixture.next, fixture.detail)
+	}
+	logScheduledTask("price_probe", "disabled", "disabled", newTraceID(), time.Time{}, time.Time{}, "合成测试：自动探测关闭")
 	listener, err := net.Listen("tcp", "127.0.0.1:18316")
 	if err != nil {
 		t.Fatal(err)

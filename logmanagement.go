@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -110,8 +111,35 @@ type logCleanupResult struct {
 	Files         []string `json:"files"`
 }
 
-func cleanupLogs(now time.Time, days int, trace string) (logCleanupResult, error) {
-	result := logCleanupResult{RetentionDays: days, Files: []string{}}
+func cleanupLogs(now time.Time, days int, trace string, schedule ...time.Time) (result logCleanupResult, resultErr error) {
+	next := time.Time{}
+	if len(schedule) > 0 {
+		next = schedule[0]
+	} else {
+		cleanupScheduleMu.Lock()
+		if !lastLogCleanup.time.IsZero() {
+			next = lastLogCleanup.time.Add(time.Hour)
+		}
+		cleanupScheduleMu.Unlock()
+	}
+	started := time.Now()
+	logScheduledTask("log_cleanup", "started", "running", trace, started, next, "")
+	result = logCleanupResult{RetentionDays: days, Files: []string{}}
+	defer func() {
+		status := "success"
+		if resultErr != nil {
+			status = "failed"
+		} else if days == 0 {
+			status = "skipped"
+		} else if result.Failed > 0 {
+			status = "partial"
+		}
+		detail := fmt.Sprintf("保留天数=%d，删除=%d，失败=%d，跳过正在写入=%d", days, result.Deleted, result.Failed, result.SkippedActive)
+		if resultErr != nil {
+			detail = safeDebugError(resultErr)
+		}
+		logScheduledTask("log_cleanup", "completed", status, trace, started, next, detail)
+	}()
 	if days < 0 || days > 36500 {
 		return result, gatewayValidationError("日志保留天数无效")
 	}
@@ -189,17 +217,21 @@ func cleanupLogs(now time.Time, days int, trace string) (logCleanupResult, error
 func scheduledLogCleanup(now time.Time) {
 	days := int(logRetentionDays.Load())
 	cleanupScheduleMu.Lock()
+	previousDays := lastLogCleanup.days
 	due := days > 0 && (lastLogCleanup.days != days || now.Sub(lastLogCleanup.time) >= time.Hour)
 	lastLogCleanup.days = days
 	if due {
 		lastLogCleanup.time = now
 	}
 	cleanupScheduleMu.Unlock()
+	if days == 0 && previousDays != 0 {
+		logScheduledTask("log_cleanup", "disabled", "disabled", newTraceID(), time.Time{}, time.Time{}, "保留天数已改为0，自动清理关闭")
+	}
 	if !due {
 		return
 	}
 	trace := newTraceID()
-	if _, err := cleanupLogs(now, days, trace); err != nil {
+	if _, err := cleanupLogs(now, days, trace, now.Add(time.Hour)); err != nil {
 		log.Printf("[日志清理] traceId=%s 阶段=自动任务 结果=失败 原因=%s 说明=保留现有日志，下个周期重试", trace, safeDebugError(err))
 	}
 }

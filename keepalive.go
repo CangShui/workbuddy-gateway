@@ -179,6 +179,8 @@ func isKeepaliveOverdue(acc *Account, now time.Time) bool {
 // 只走令牌刷新接口，不请求模型、不消耗额度。
 func keepaliveLoop() {
 	if len(cfg.KeepaliveHours) == 0 {
+		logScheduledTask("keepalive", "disabled", "disabled", newTraceID(), time.Time{}, time.Time{}, "未设置主动续期时刻")
+		logScheduledTask("keepalive_catchup", "disabled", "disabled", newTraceID(), time.Time{}, time.Time{}, "主动续期关闭，启动补跑不执行")
 		log.Printf("[续期保活] 阶段=启动 结果=已关闭 原因=未配置主动续期时刻 业务影响=仅在访问令牌临近过期时才刷新，长期空闲账号可能静默失效")
 		return
 	}
@@ -186,6 +188,8 @@ func keepaliveLoop() {
 		formatKeepaliveHours(cfg.KeepaliveHours))
 
 	go func() {
+		next := time.Now().Add(keepaliveCatchUpDelay)
+		logScheduledTask("keepalive_catchup", "scheduled", "", newTraceID(), time.Time{}, next, "启动后90秒，只检查久未续期账号")
 		time.Sleep(keepaliveCatchUpDelay)
 		now := time.Now()
 		accountMu.Lock()
@@ -200,6 +204,7 @@ func keepaliveLoop() {
 		}
 		accountMu.Unlock()
 		if overdue == 0 {
+			logScheduledTask("keepalive_catchup", "completed", "skipped", newTraceID(), now, time.Time{}, "全部账号近期已续期，无需补跑")
 			log.Printf("[续期保活] 阶段=启动补跑 结果=跳过 原因=全部账号均在 %v 内成功续期过", keepaliveOverdueAfter)
 			return
 		}
@@ -209,6 +214,7 @@ func keepaliveLoop() {
 
 	for {
 		next := nextKeepaliveTime(time.Now(), cfg.KeepaliveHours)
+		logScheduledTask("keepalive", "scheduled", "", newTraceID(), time.Time{}, next, "服务器本地时间；账号间隔1秒串行续期")
 		log.Printf("[续期保活] 阶段=等待下一次续期 时间=%s 距离=%s", next.Format("2006-01-02 15:04:05"), time.Until(next).Truncate(time.Second))
 		timer := time.NewTimer(time.Until(next))
 		<-timer.C
@@ -218,6 +224,12 @@ func keepaliveLoop() {
 
 // runKeepaliveOnce 串行刷新账号池；onlyOverdue 为真时只处理久未续期的账号。
 func runKeepaliveOnce(trigger string, onlyOverdue bool) {
+	task := "keepalive"
+	next := nextKeepaliveTime(time.Now(), cfg.KeepaliveHours)
+	if onlyOverdue {
+		task, next = "keepalive_catchup", time.Time{}
+	}
+	trace, started := startScheduledTask(task, next)
 	accountMu.Lock()
 	accs := append([]*Account(nil), accounts...)
 	accountMu.Unlock()
@@ -270,6 +282,15 @@ func runKeepaliveOnce(trigger string, onlyOverdue bool) {
 
 	log.Printf("[续期保活] 阶段=执行完成 触发方式=%s 成功=%d 失败=%d 跳过=%d 判定失效=%d 业务影响=成功的账号登录态已顺延，失败的账号保留原凭据等待下次重试",
 		trigger, refreshed, failed, skipped, disabled)
+	status := "success"
+	if failed > 0 && refreshed == 0 {
+		status = "failed"
+	} else if failed > 0 {
+		status = "partial"
+	} else if refreshed == 0 {
+		status = "skipped"
+	}
+	logScheduledTask(task, "completed", status, trace, started, next, fmt.Sprintf("触发=%s，成功=%d，失败=%d，跳过=%d，失效=%d", trigger, refreshed, failed, skipped, disabled))
 	if refreshed > 0 || disabled > 0 {
 		writeStatusSnapshot()
 	}

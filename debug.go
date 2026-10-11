@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -23,6 +24,45 @@ import (
 )
 
 const runtimeConfigFile = "config.json"
+
+// 只补充现有任务日志，不维护独立任务状态。管理页从 gateway 日志反向聚合这些记录。
+func logScheduledTask(task, phase, status, trace string, started, next time.Time, detail string) {
+	record := struct {
+		Task      string `json:"task"`
+		Phase     string `json:"phase"`
+		Status    string `json:"status,omitempty"`
+		Trace     string `json:"trace"`
+		PID       int    `json:"pid"`
+		At        int64  `json:"at"`
+		StartedAt int64  `json:"startedAt,omitempty"`
+		NextAt    int64  `json:"nextAt,omitempty"`
+		Detail    string `json:"detail,omitempty"`
+	}{Task: task, Phase: phase, Status: status, Trace: trace, PID: os.Getpid(), At: time.Now().UnixMilli(), Detail: detail}
+	if !started.IsZero() {
+		record.StartedAt = started.UnixMilli()
+	}
+	if !next.IsZero() {
+		record.NextAt = next.UnixMilli()
+	}
+	raw, _ := json.Marshal(record)
+	log.Printf("[定时任务] %s", raw)
+}
+
+func startScheduledTask(task string, next time.Time) (string, time.Time) {
+	trace, started := newTraceID(), time.Now()
+	logScheduledTask(task, "started", "running", trace, started, next, "")
+	return trace, started
+}
+
+// 高频本地检查每分钟记录最近一次执行，状态变化/实际变更立即记录，避免日志按秒膨胀。
+func logFrequentTask(task, status, detail string, started, next time.Time, last *time.Time, previous *string, changed bool) {
+	now := time.Now()
+	if last.IsZero() || now.Sub(*last) >= time.Minute || *previous != status || changed {
+		logScheduledTask(task, "completed", status, newTraceID(), started, next, detail)
+		*last = now
+	}
+	*previous = status
+}
 
 type runtimeFileConfig struct {
 	Gateway gatewayFileConfig `json:"gateway"`

@@ -176,14 +176,17 @@ func switchDebugLogging(enabled bool) error {
 type runtimeConfigWatcher struct {
 	failed    [32]byte
 	hasFailed bool
+	lastError error
 }
 
 func (watcher *runtimeConfigWatcher) reload() bool {
+	watcher.lastError = nil
 	runtimeConfigMu.Lock()
 	defer runtimeConfigMu.Unlock()
 	data, err := os.ReadFile(runtimeConfigFile)
 	sum := sha256.Sum256(data)
 	if err != nil {
+		watcher.lastError = err
 		sum = sha256.Sum256([]byte(err.Error()))
 	}
 	if err == nil && runtimeHasAppliedHash && runtimeAppliedHash == sum {
@@ -202,6 +205,7 @@ func (watcher *runtimeConfigWatcher) reload() bool {
 		if !watcher.hasFailed || watcher.failed != sum {
 			log.Printf("[配置热加载] traceId=%s 结果=拒绝 原因=%s 业务影响=配置未切换，保留上一份有效配置；请修正文件后再保存", trace, safeDebugError(err))
 		}
+		watcher.lastError = err
 		watcher.failed, watcher.hasFailed = sum, true
 		return false
 	}
@@ -213,12 +217,28 @@ func runtimeConfigLoop(ctx context.Context) {
 	watcher := runtimeConfigWatcher{}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	var lastLogged time.Time
+	var previousStatus string
+	logScheduledTask("config_reload", "scheduled", "", newTraceID(), time.Time{}, time.Now().Add(time.Second), "")
+	if logRetentionDays.Load() == 0 {
+		logScheduledTask("log_cleanup", "disabled", "disabled", newTraceID(), time.Time{}, time.Time{}, "保留天数为0，不自动清理")
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			watcher.reload()
+		case tick := <-ticker.C:
+			next := tick.Add(time.Second)
+			started := time.Now()
+			changed := watcher.reload()
+			status, detail := "success", "检查完成，配置没有变化"
+			if changed {
+				detail = "新配置已校验并应用"
+			}
+			if watcher.lastError != nil {
+				status, detail = "failed", safeDebugError(watcher.lastError)
+			}
+			logFrequentTask("config_reload", status, detail, started, next, &lastLogged, &previousStatus, changed)
 			scheduledLogCleanup(time.Now())
 		}
 	}

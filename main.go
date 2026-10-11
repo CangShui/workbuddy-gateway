@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	version = "1.14.0"
+	version = "1.14.1"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -1070,15 +1070,33 @@ func accountFingerprint(st os.FileInfo) string {
 //
 // 返回本次是否发生变更。调用方需自行处理 accountMu 之外的快照刷新。
 func reloadAccounts() bool {
+	changed, _ := reloadAccountsResult()
+	return changed
+}
+
+func reloadAccountsResult() (bool, error) {
 	accountMu.Lock()
 	defer accountMu.Unlock()
+	if cfg.AuthDir != "" || !cfg.AuthExplicit {
+		dir := cfg.AuthDir
+		if dir == "" {
+			dir = "."
+		}
+		if _, err := os.ReadDir(dir); err != nil {
+			return false, fmt.Errorf("凭据目录不可读取，账号池保持不变")
+		}
+	}
 
 	changed := false
+	var failures []error
 	seen := make(map[string]bool)
 
 	for _, p := range collectConfiguredAuthPaths() {
 		st, err := os.Stat(p)
 		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				failures = append(failures, fmt.Errorf("凭据文件无法读取"))
+			}
 			continue
 		}
 		seen[p] = true
@@ -1096,6 +1114,7 @@ func reloadAccounts() bool {
 			// 新凭据文件：加载并加入账号池（文件可能正在写入，失败则下轮重试）
 			sa, err := loadAccountFile(p)
 			if err != nil {
+				failures = append(failures, fmt.Errorf("新增凭据不可解析，等待下轮重试"))
 				log.Printf("[Reload] 凭据文件 %s 暂不可解析，下轮重试: %v", p, err)
 				continue
 			}
@@ -1117,6 +1136,7 @@ func reloadAccounts() bool {
 		// 内容变化：原地替换凭据（重新登录或手动更新）
 		sa, err := loadAccountFile(p)
 		if err != nil {
+			failures = append(failures, fmt.Errorf("已更新凭据不可解析，保留旧内容"))
 			// 不更新指纹，下一轮重试（正常写入窗口极短，几乎必在下轮成功）
 			log.Printf("[Reload] 凭据文件 %s 变更但暂不可解析，保留旧凭据: %v", p, err)
 			continue
@@ -1157,7 +1177,7 @@ func reloadAccounts() bool {
 	} else {
 		rrIndex = 0
 	}
-	return changed
+	return changed, errors.Join(failures...)
 }
 
 // accountReloaderLoop serve 后台凭据热加载协程：周期扫描凭据变化并原地收敛账号池。
@@ -1168,8 +1188,14 @@ func accountReloaderLoop() {
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		if reloadAccounts() {
+	var lastLogged time.Time
+	var previousStatus string
+	logScheduledTask("credential_reload", "scheduled", "", newTraceID(), time.Time{}, time.Now().Add(interval), "")
+	for tick := range ticker.C {
+		next := tick.Add(interval)
+		started := time.Now()
+		changed, err := reloadAccountsResult()
+		if changed {
 			writeStatusSnapshot() // 立即刷新 monitor 状态文件
 			requestQuotaScan()
 			requestCheckin()
@@ -1178,6 +1204,17 @@ func accountReloaderLoop() {
 			requestModelsScan()
 			requestModelsProbe()
 		}
+		status, detail := "success", "扫描完成，凭据没有变化"
+		if changed {
+			detail = "账号池变化已应用，相关刷新已通知"
+		}
+		if err != nil {
+			status, detail = "partial", safeDebugError(err)
+			if strings.HasPrefix(err.Error(), "凭据目录不可读取") {
+				status = "failed"
+			}
+		}
+		logFrequentTask("credential_reload", status, detail, started, next, &lastLogged, &previousStatus, changed)
 	}
 }
 
@@ -2100,12 +2137,18 @@ func lockAccountWithContext(ctx context.Context, mu *sync.Mutex) bool {
 	}
 }
 
-func refreshAllAccountQuotas(ctx context.Context, done chan<- struct{}) {
+func refreshAllAccountQuotas(ctx context.Context, done chan<- struct{}, schedule ...time.Time) {
 	defer close(done)
+	next := time.Time{}
+	if len(schedule) > 0 {
+		next = schedule[0]
+	}
+	trace, started := startScheduledTask("quota_scan", next)
 	accountMu.Lock()
 	accs := append([]*Account(nil), accounts...)
 	accountMu.Unlock()
 	log.Printf("[Quota] 开始批量更新额度，账号数=%d", len(accs))
+	processed, failed := 0, 0
 	for _, acc := range accs {
 		if err := ctx.Err(); err != nil {
 			log.Printf("[Quota] 本轮额度更新被取消，尚未扫描的账号将等待下一轮: %v", err)
@@ -2113,19 +2156,39 @@ func refreshAllAccountQuotas(ctx context.Context, done chan<- struct{}) {
 		}
 		accountCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		err := refreshAccountQuota(accountCtx, acc)
+		processed++
 		cancel()
 		if err != nil {
+			failed++
 			log.Printf("[Quota] 账号 %s 本轮额度更新未完成: %v", acc.Path, err)
+		} else {
+			accountMu.Lock()
+			if acc != nil && !acc.Disabled && acc.PlanStale {
+				failed++
+			}
+			accountMu.Unlock()
 		}
 	}
-	writeStatusSnapshot()
+	snapshotErr := writeStatusSnapshot()
 	log.Printf("[Quota] 本轮额度更新完成，状态快照已写入")
+	status := "success"
+	if ctx.Err() != nil {
+		status = "cancelled"
+	} else if len(accs) == 0 {
+		status = "skipped"
+	} else if failed == len(accs) {
+		status = "failed"
+	} else if failed > 0 || snapshotErr != nil {
+		status = "partial"
+	}
+	logScheduledTask("quota_scan", "completed", status, trace, started, next, fmt.Sprintf("账号=%d，已检查=%d，额度/套餐异常=%d，快照失败=%t", len(accs), processed, failed, snapshotErr != nil))
 }
 
 func backgroundQuotaRefresher() {
 	const interval = 300 * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	next := time.Now().Add(interval)
 	var cancel context.CancelFunc
 	var done chan struct{}
 	start := func() {
@@ -2140,12 +2203,13 @@ func backgroundQuotaRefresher() {
 		ctx, nextCancel := context.WithCancel(context.Background())
 		cancel = nextCancel
 		done = make(chan struct{})
-		go refreshAllAccountQuotas(ctx, done)
+		go refreshAllAccountQuotas(ctx, done, next)
 	}
 	start()
 	for {
 		select {
-		case <-ticker.C:
+		case tick := <-ticker.C:
+			next = tick.Add(interval)
 			start()
 		case <-quotaScanTrigger:
 			log.Printf("[Quota] 凭据池发生变化，立即触发一轮额度扫描")
@@ -2229,6 +2293,8 @@ func checkinAllAccounts(ctx context.Context) {
 		return
 	}
 	defer dailyCheckinMu.Unlock()
+	next := nextDailyCheckin(time.Now())
+	trace, started := startScheduledTask("daily_checkin", next)
 
 	accountMu.Lock()
 	accs := append([]*Account(nil), accounts...)
@@ -2254,6 +2320,17 @@ func checkinAllAccounts(ctx context.Context) {
 		}
 	}
 	log.Printf("[Checkin] 本轮签到完成，总数=%d，成功=%d，今日已签=%d，失败=%d，跳过=%d", len(accs), ok, already, failed, skipped)
+	status := "success"
+	if ctx.Err() != nil {
+		status = "cancelled"
+	} else if failed > 0 && ok+already == 0 {
+		status = "failed"
+	} else if failed > 0 {
+		status = "partial"
+	} else if ok+already == 0 {
+		status = "skipped"
+	}
+	logScheduledTask("daily_checkin", "completed", status, trace, started, next, fmt.Sprintf("成功=%d，今日已签=%d，失败=%d，跳过=%d", ok, already, failed, skipped))
 	requestQuotaScan()
 }
 
@@ -2278,6 +2355,7 @@ func backgroundDailyCheckin() {
 	go checkinAllAccounts(context.Background())
 	for {
 		next := nextDailyCheckin(time.Now())
+		logScheduledTask("daily_checkin", "scheduled", "", newTraceID(), time.Time{}, next, "固定北京时间09:00；账号池变化可能提前触发")
 		log.Printf("[Checkin] 下一次定时签到时间=%s", next.Format("2006-01-02 15:04:05 MST"))
 		timer := time.NewTimer(time.Until(next))
 		select {
@@ -2469,7 +2547,7 @@ type statusSnapshot struct {
 
 // writeStatusSnapshot 将账号池实时状态（含冷却/失效）原子写入状态快照文件。
 // serve 后台周期调用；monitor 命令前台读取展示。
-func writeStatusSnapshot() {
+func writeStatusSnapshot() error {
 	statusSnapshotWriteMu.Lock()
 	defer statusSnapshotWriteMu.Unlock()
 	accountMu.Lock()
@@ -2577,14 +2655,14 @@ func writeStatusSnapshot() {
 
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
 	// 原子写：先写临时文件再改名，避免 monitor 读到半截内容
 	tmp := statusSnapshotFile + ".tmp"
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return
+		return err
 	}
-	_ = os.Rename(tmp, statusSnapshotFile)
+	return os.Rename(tmp, statusSnapshotFile)
 }
 
 func displayWidth(s string) int {
@@ -2713,11 +2791,22 @@ func renderAccountTable(accs []accountSnapshot) string {
 
 // statusSnapshotLoop serve 后台每 3 秒刷新一次状态快照。
 func statusSnapshotLoop() {
-	writeStatusSnapshot()
+	var lastLogged time.Time
+	var previousStatus string
+	write := func(next time.Time) {
+		started := time.Now()
+		err := writeStatusSnapshot()
+		status, detail := "success", "账号与模型快照已写入"
+		if err != nil {
+			status, detail = "failed", safeDebugError(err)
+		}
+		logFrequentTask("status_snapshot", status, detail, started, next, &lastLogged, &previousStatus, err != nil)
+	}
+	write(time.Now().Add(3 * time.Second))
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		writeStatusSnapshot()
+	for tick := range ticker.C {
+		write(tick.Add(3 * time.Second))
 	}
 }
 
@@ -2988,6 +3077,8 @@ func runServe() {
 	go backgroundDailyCheckin()
 	if cfg.ModelsRefresh > 0 {
 		go modelsRefreshLoop(time.Duration(cfg.ModelsRefresh) * time.Minute)
+	} else {
+		logScheduledTask("model_catalog", "disabled", "disabled", newTraceID(), time.Time{}, time.Time{}, "模型目录自动刷新已关闭")
 	}
 	// 价格探测独立于目录刷新：即使关闭目录刷新，也仍可基于缓存探测价格。
 	go modelPriceProbeLoop()
@@ -2998,6 +3089,8 @@ func runServe() {
 	// 启动凭据热加载协程（新增/更新/删除凭据文件免重启生效）
 	if cfg.ReloadInterval > 0 {
 		go accountReloaderLoop()
+	} else {
+		logScheduledTask("credential_reload", "disabled", "disabled", newTraceID(), time.Time{}, time.Time{}, "凭据自动扫描已关闭")
 	}
 
 	listenAddr := servers[0].Addr
@@ -3125,16 +3218,30 @@ func printAPIAuthBanner(w io.Writer) {
 func backgroundTokenRefresher() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
+	logScheduledTask("token_check", "scheduled", "", newTraceID(), time.Time{}, time.Now().Add(5*time.Minute), "")
+	for tick := range ticker.C {
+		next := tick.Add(5 * time.Minute)
+		trace, started := startScheduledTask("token_check", next)
 		accountMu.Lock()
 		accs := make([]*Account, len(accounts))
 		copy(accs, accounts)
 		accountMu.Unlock()
+		failed := 0
 		for _, acc := range accs {
 			if err := ensureValidTokenFor(acc); err != nil {
+				failed++
 				log.Printf("[BackgroundAuth] 账号 %s 自动检查/续期令牌异常: %v", acc.Path, err)
 			}
 		}
+		status := "success"
+		if len(accs) == 0 {
+			status = "skipped"
+		} else if failed == len(accs) {
+			status = "failed"
+		} else if failed > 0 {
+			status = "partial"
+		}
+		logScheduledTask("token_check", "completed", status, trace, started, next, fmt.Sprintf("检查账号=%d，异常=%d；仅临近过期时续期", len(accs), failed))
 	}
 }
 

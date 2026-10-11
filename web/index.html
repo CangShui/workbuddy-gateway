@@ -32,7 +32,7 @@
   <button class="tab" data-tab="models" type="button">模型列表</button>
   <button class="tab" data-tab="logs" type="button">日志</button>
   <button class="tab" data-tab="config" type="button">配置</button>
-  <button class="tab" data-tab="credentials" type="button">凭据</button>
+  <button class="tab" data-tab="tasks" type="button">定时任务</button>
   <button class="tab" data-tab="settings" type="button">访问设置</button>
 </nav>
 
@@ -143,34 +143,15 @@
     </div>
   </section>
 
-  <section id="panel-credentials" class="panel">
+  <section id="panel-tasks" class="panel">
     <div class="card">
-      <div class="card-title">凭据文件</div>
-      <p class="hint" id="credHint"></p>
-      <div class="table-wrap">
-        <table id="credentialsTable">
-          <thead>
-            <tr>
-              <th>操作</th><th>凭据文件</th><th>站点</th><th>昵称</th><th>UID</th><th>认证域名</th>
-              <th>Access Token</th><th>Refresh Token</th>
-              <th>Token 到期</th><th>刷新令牌到期</th><th>上次续期</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </div>
-    <div id="credentialEditor" class="card hidden">
-      <div class="card-title">编辑凭据 <span id="credentialPath" class="mono"></span></div>
-      <p class="hint">编辑器显示完整令牌，仅管理员可访问。请勿分享截图或正文。保存会更新原文件并应用凭据，不调用上游验证；后台已续期的文件会拒绝覆盖。离开本页会清空编辑内容。</p>
-      <label for="credentialContent" class="hint">凭据 JSON</label>
-      <textarea id="credentialContent" spellcheck="false" autocomplete="off" aria-describedby="credentialEditorStatus"></textarea>
-      <div class="actions">
-        <button id="saveCredential" type="button">保存凭据</button>
-        <button id="reloadCredential" type="button" class="ghost">重新加载</button>
-        <button id="cancelCredential" type="button" class="ghost">取消编辑</button>
-      </div>
-      <p id="credentialEditorStatus" class="hint action-result" role="status"></p>
+      <div class="card-title">定时任务时间 <span class="badge">只读 · 后端日志</span></div>
+      <p class="hint">不修改任务，也不触发执行。上次执行与结果来自当前服务进程日志；下次时间为定时计划，事件触发可能提前。高频检查每60秒汇总最近一次执行，状态变化即时记录。</p>
+      <p id="tasksInfo" class="hint" role="status">加载任务日志…</p>
+      <div class="table-wrap"><table id="tasksTable">
+        <thead><tr><th>任务</th><th>启用</th><th>执行周期</th><th>上次执行记录</th><th>上次完成</th><th>执行结果</th><th>下次预计执行</th><th>日志说明</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
     </div>
   </section>
 

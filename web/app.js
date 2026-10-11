@@ -13,12 +13,10 @@
     settings: null,
     togglePending: false,
     policyVersion: 0,
-    credentialPath: "",
-    credentialRevision: "",
-    credentialLoadVersion: 0,
     logSettings: null,
     logSettingsVersion: 0,
-    settingsLoadVersion: 0
+    settingsLoadVersion: 0,
+    tasksLastPoll: 0
   };
 
   function $(id) { return document.getElementById(id); }
@@ -87,14 +85,14 @@
   }
 
   function lockDashboard() {
-    clearCredentialEditor();
+    state.tasksLastPoll = 0;
     $("tabs").classList.add("hidden");
     $("dashboard").classList.add("hidden");
     state.lastStatus = null;
-    ["meta", "summaryCards", "siteSummary", "gatewayInfo", "logBox", "configBox"].forEach(function (id) {
+    ["meta", "summaryCards", "siteSummary", "gatewayInfo", "logBox", "configBox", "tasksInfo"].forEach(function (id) {
       $(id).textContent = "";
     });
-    ["accountsTable", "modelsTable", "credentialsTable"].forEach(function (id) {
+    ["accountsTable", "modelsTable", "tasksTable"].forEach(function (id) {
       $(id).querySelector("tbody").innerHTML = "";
     });
   }
@@ -369,96 +367,22 @@
     });
   }
 
-  // ---- 渲染：凭据 --------------------------------------------------------
-  function loadCredentials() {
-    return api("/admin/api/credentials").then(function (data) {
-      $("credHint").textContent = data.hint || "";
-      var tb = $("credentialsTable").querySelector("tbody");
-      var list = data.files || [];
-      if (!list.length) {
-        tb.innerHTML = '<tr><td colspan="11" class="empty">未发现凭据文件</td></tr>';
-        return;
-      }
-      tb.innerHTML = list.map(function (c) {
-        var site = c.edition === "intl" ? "国际站" : "国内站";
-        if (!c.exists) {
-          return "<tr><td>-</td><td class='mono'>" + esc(c.path) + "</td><td colspan='9' class='empty'>文件不存在</td></tr>";
-        }
-        if (c.error) {
-          return "<tr><td>" + credentialEditButton(c.path) + "</td><td class='mono'>" + esc(c.path) + "</td><td colspan='9' class='empty'>" + esc(c.error) + "</td></tr>";
-        }
-        return "<tr>" +
-          "<td>" + credentialEditButton(c.path) + "</td>" +
-          "<td class='mono'>" + esc(c.path) + "</td>" +
-          "<td>" + esc(site) + "</td>" +
-          "<td>" + esc(c.nickname || "-") + "</td>" +
-          "<td class='mono'>" + esc(c.uid || "-") + "</td>" +
-          "<td>" + esc(c.domain || "-") + "</td>" +
-          "<td class='mono'>" + esc(c.accessTokenMasked || "-") + "</td>" +
-          "<td class='mono'>" + esc(c.refreshTokenMasked || "-") + "</td>" +
-          "<td>" + esc(fmtTime(c.expiresAt)) + "</td>" +
-          "<td>" + esc(fmtTime(c.refreshExpiresAt)) + "</td>" +
-          "<td>" + esc(fmtTime(c.lastRefreshTime)) + "</td>" +
-          "</tr>";
-      }).join("");
-    }).catch(function () {
-      // 保留上次内容；错误由常驻提示区展示。
-    });
-  }
-
-  function credentialEditButton(path) {
-    return '<button type="button" class="edit-credential" data-path="' + esc(path) +
-      '" aria-label="' + esc("编辑凭据 " + path) + '">编辑</button>';
-  }
-
-  function clearCredentialEditor() {
-    state.credentialLoadVersion++;
-    state.credentialPath = "";
-    state.credentialRevision = "";
-    $("credentialContent").value = "";
-    $("credentialPath").textContent = "";
-    $("credentialEditorStatus").textContent = "";
-    $("credentialEditor").classList.add("hidden");
-  }
-
-  function editCredential(path) {
-    clearCredentialEditor();
-    var version = state.credentialLoadVersion;
-    return api("/admin/api/credential-edit?file=" + encodeURIComponent(path)).then(function (data) {
-      if (version !== state.credentialLoadVersion || state.activeTab !== "credentials") return;
-      state.credentialPath = data.path;
-      state.credentialRevision = data.revision;
-      $("credentialPath").textContent = data.path;
-      $("credentialContent").value = data.content;
-      $("credentialEditor").classList.remove("hidden");
-      $("credentialContent").focus({preventScroll: true});
-      $("credentialEditor").scrollIntoView({block: "start"});
-    }).catch(function () {});
-  }
-
-  function saveCredential() {
-    var content = $("credentialContent").value;
-    if (!state.credentialPath) return;
-    try {
-      var parsed = JSON.parse(content);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
-    } catch (e) {
-      $("credentialEditorStatus").textContent = "凭据必须是有效 JSON 对象，尚未保存。";
-      reportUIEvent("credential_validation_failed", "/admin/api/credential-edit", 0, traceID());
-      return;
-    }
-    var path = state.credentialPath;
-    var version = state.credentialLoadVersion;
-    $("saveCredential").disabled = true;
-    return api("/admin/api/credential-edit", {method: "POST",
-      body: {path: path, revision: state.credentialRevision, content: content}}).then(function (data) {
-      if (version !== state.credentialLoadVersion) return;
-      state.credentialRevision = data.revision;
-      $("credentialEditorStatus").textContent = "凭据已保存并应用，模型账号规则保留。同一账号保留账本；UID 或站点改变时重置对应运行状态。";
-      loadCredentials();
-    }).catch(function () {
-      if (version === state.credentialLoadVersion) $("credentialEditorStatus").textContent = "保存失败，编辑内容已保留；若文件已续期，请重新加载后再编辑。";
-    }).then(function () { $("saveCredential").disabled = false; });
+  function renderTasks(data) {
+    var labels = {success: "成功", failed: "失败", partial: "部分失败", cancelled: "已取消",
+      skipped: "跳过", running: "执行中", disabled: "未启用", unknown: "无执行记录"};
+    var classes = {success: "ok", failed: "danger", partial: "warn", cancelled: "warn", running: "warn"};
+    $("tasksInfo").textContent = "服务器日志时区：" + (data.timezone || "-") + "（表内时间按浏览器时区显示） · 刷新 " + fmtTime(data.generatedAt) +
+      (data.truncated ? " · 日志扫描达到预算，缺失记录不代表未执行。" : " · 执行记录以日志为准。");
+    $("tasksTable").querySelector("tbody").innerHTML = (data.tasks || []).map(function (task) {
+      var next = task.nextRunAt ? fmtTime(task.nextRunAt) + (task.nextEstimated ? "（推算）" : "") :
+        (!task.enabled ? "未启用" : task.oneShot && task.lastFinishedAt ? "本次启动已完成" : "等待调度日志");
+      return "<tr><td data-label='任务'>" + esc(task.name) + "</td><td data-label='启用'>" + (task.enabled ? "开启" : "关闭") +
+        "</td><td data-label='执行周期' class='task-description'>" + esc(task.schedule) + "</td><td data-label='上次执行记录'>" + esc(fmtTime(task.lastRunAt)) +
+        "</td><td data-label='上次完成'>" + esc(fmtTime(task.lastFinishedAt)) + "</td><td data-label='执行结果'><span class='badge " +
+        (classes[task.status] || "") + "'>" + esc(labels[task.status] || "无执行记录") +
+        "</span></td><td data-label='下次预计执行'>" + esc(next) + "</td><td data-label='日志说明' class='task-description'>" + esc(task.detail || "当前服务尚无该任务日志，或日志已清理") +
+        (task.logFile ? "<br><span class='mono'>" + esc(task.logFile) + "</span>" : "") + "</td></tr>";
+    }).join("");
   }
 
   function loadLogSettings() {
@@ -513,6 +437,8 @@
   // ---- 路由与轮询 --------------------------------------------------------
   function refreshActive() {
     if (!state.apiKey || state.refreshPending || state.togglePending) return Promise.resolve();
+    if (state.activeTab === "tasks" && Date.now() - state.tasksLastPoll < 15000) return Promise.resolve();
+    if (state.activeTab === "tasks") state.tasksLastPoll = Date.now();
     state.refreshPending = true;
     var policyVersion = state.policyVersion;
     var onErr = function () {
@@ -531,6 +457,8 @@
       }).catch(onErr);
     } else if (state.activeTab === "logs") {
       pending = loadLogs(false);
+    } else if (state.activeTab === "tasks") {
+      pending = api("/admin/api/tasks").then(renderTasks).catch(onErr);
     }
     return pending.then(function () {
       state.refreshPending = false;
@@ -539,7 +467,7 @@
   }
 
   function setTab(name) {
-    if (name !== "credentials") clearCredentialEditor();
+    if (name === "tasks") state.tasksLastPoll = 0;
     state.activeTab = name;
     Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (t) {
       t.classList.toggle("active", t.getAttribute("data-tab") === name);
@@ -549,7 +477,6 @@
     });
     if (name === "logs") { loadLogs(true); loadLogSettings(); }
     else if (name === "config") loadConfig();
-    else if (name === "credentials") loadCredentials();
     else if (name === "settings") loadSettings();
     else refreshActive();
   }
@@ -618,7 +545,6 @@
 
   // 管理 Key 仅保存在当前标签页会话，验证成功后才保存。
   function saveKey() {
-    clearCredentialEditor();
     var key = $("apiKey").value.trim();
     if (!key) { showAlert("请输入管理 Key。"); return Promise.resolve(); }
     state.apiKey = key;
@@ -702,16 +628,6 @@
     $("savePortSettings").addEventListener("click", savePortSettings);
     $("saveLogSettings").addEventListener("click", saveLogSettings);
     $("cleanupLogs").addEventListener("click", cleanupExpiredLogs);
-    $("credentialsTable").addEventListener("click", function (event) {
-      var button = event.target.closest("button.edit-credential");
-      if (button) editCredential(button.getAttribute("data-path"));
-    });
-    $("saveCredential").addEventListener("click", saveCredential);
-    $("cancelCredential").addEventListener("click", clearCredentialEditor);
-    $("reloadCredential").addEventListener("click", function () {
-      if (state.credentialPath && window.confirm("重新加载会丢弃当前未保存的编辑。是否继续？")) editCredential(state.credentialPath);
-    });
-    window.addEventListener("pagehide", clearCredentialEditor);
     $("apiKey").addEventListener("keydown", function (e) { if (e.key === "Enter") saveKey(); });
     Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (t) {
       t.addEventListener("click", function () { setTab(t.getAttribute("data-tab")); });
