@@ -1018,7 +1018,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 
 ## 从源码构建
 
-需要 Go 1.20+：
+需要 `go.mod` 声明的 **Go 1.26.5 或更新工具链**：
 
 ```bash
 git clone https://github.com/CangShui/workbuddy-gateway.git
@@ -1034,6 +1034,32 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o workbuddy-gateway .
 GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-linux-amd64 .
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/workbuddy-gateway-windows-amd64.exe .
 ```
+
+PowerShell 一键构建：
+
+```powershell
+.\build.ps1                         # 检查并构建全部 9 个目标
+.\build.ps1 -Only windows           # Windows x86、x64、ARM64
+.\build.ps1 -Only linux             # Linux x86、x64、ARMv7、ARM64
+.\build.ps1 -Only linux -Architecture arm -ArmVersion 6
+```
+
+| 系统 | 架构 | 产物 |
+|---|---|---|
+| Windows | x86 32 位 / `386`（需要 SSE2） | `workbuddy-gateway-windows-386.exe` |
+| Windows | x86-64 / `amd64` | `workbuddy-gateway-windows-amd64.exe` |
+| Windows | ARM64 | `workbuddy-gateway-windows-arm64.exe` |
+| Linux | x86 32 位 / `386`（需要 SSE2） | `workbuddy-gateway-linux-386` |
+| Linux | x86-64 / `amd64` | `workbuddy-gateway-linux-amd64` |
+| Linux | ARM 32 位（默认 ARMv7） | `workbuddy-gateway-linux-armv7` |
+| Linux | ARM64 | `workbuddy-gateway-linux-arm64` |
+| macOS | x86-64 / `amd64` | `workbuddy-gateway-darwin-amd64` |
+| macOS | ARM64 | `workbuddy-gateway-darwin-arm64` |
+
+- **Windows ARM32 不受当前 Go 工具链支持**，不能用 ARM64 文件替代。Linux ARM32 可用 `-ArmVersion 5/6/7` 选择，文件名与最低 ARM 版本一致。
+- 默认先运行 `go vet`、`go test`；不受调用者遗留的 `GOOS` / `GOARCH` 影响。各目标使用 `CGO_ENABLED=0`，x64 基线为 `GOAMD64=v1`、ARM64 基线为 `GOARM64=v8.0`。成功或失败后恢复原构建环境和工作目录。
+- 默认输出到 `dist/`，同时生成 `SHA256SUMS`、`build-manifest.json` 与空密钥的 `config.example.json`；校验和覆盖二进制、清单与示例配置。
+- `-OutputDir` 必须是项目内的独立子目录；`-Clean` 仅清理已知构建文件，不递归删除目录、配置凭据或其他文件。构建日志写入 `logs/build-YYYY-MM-DD.jsonl`。
 
 ---
 
