@@ -614,7 +614,7 @@ workbuddy-gateway monitor -interval 2 -lines 20
 
 ## webui（网页控制台）
 
-默认关闭。显式 `-webui` 后在 `gateway.webPort`（默认 `8316`）提供独立网页控制台，用于在浏览器管理账号池开关、模型列表开关，查看日志、`config.json` 与凭据文件（令牌脱敏），并在「访问设置」页切换模型 API Key 校验。它与模型 API 端口分离，未启用时两个端口都不监听。
+默认关闭。显式 `-webui` 后在 `gateway.webPort`（默认 `8316`）提供独立网页控制台，用于管理账号池开关、模型列表开关，查看和清理日志、预览及编辑 `config.json`、查看定时任务记录，并在「访问设置」页切换模型 API Key 校验或编辑端口。网页不展示凭据页面。它与模型 API 端口分离，未启用时管理端口不监听。
 
 ```bash
 # 只有显式 -webui 才开启网页控制台；模型 API 仍监听 8317
@@ -642,7 +642,7 @@ systemctl restart workbuddy-gateway
 | 入口 | `GET /ui/`（独立管理端口，静态外壳不含任何数据） |
 | 数据接口 | `GET /admin/api/status`、`/admin/api/models`、`/admin/api/logs`、`/admin/api/config`、`/admin/api/tasks`，**一律需要 `Authorization: Bearer <adminKey>`** |
 | 写入接口 | `POST /admin/api/setup`（仅本机首次生成管理 Key）、`POST /admin/api/settings`（模型 API 鉴权与端口）、`POST /admin/api/account-toggle` / `model-toggle`（账号/模型开关）、`POST /admin/api/credential-edit`（凭据 JSON）、`POST /admin/api/log-settings` / `log-cleanup`（保留设置与过期清理） |
-| 页面 | 总览（含国内站 / 国际站数量与已停用账号）、账号池（全局调度开关）、模型列表（启停开关，含停用模型）、日志（保留天数与清理）、配置（只读 · Key 已隐藏，systemPrompt 正文直接展示）、定时任务（只读日志视图）、访问设置（鉴权与端口编辑）。网页不再提供凭据列表或编辑器 |
+| 页面 | 总览（含国内站 / 国际站数量与已停用账号）、账号池（全局调度开关）、模型列表（启停开关，含停用模型）、日志（保留天数与清理）、配置（Key 脱敏预览；确认警告后可编辑完整配置，systemPrompt 正文直接展示）、定时任务（只读日志视图）、访问设置（鉴权与端口编辑）。网页不再提供凭据列表或编辑器 |
 | 数据来源 | 复用 `serve` 的状态快照、完整模型目录、`logs/` 日志与本地配置/凭据文件；开关受控写入配置并应用原有调度过滤 |
 | 定时任务 | 周期、启用状态、最近执行、完成时间、执行结果、下次预计执行与日志说明；仅展示、不触发任务或修改调度 |
 
@@ -653,6 +653,9 @@ systemctl restart workbuddy-gateway
 - 配置检查、凭据扫描、状态快照这三项高频任务，每 60 秒记录最近一次执行，实际变化/状态变化即时记录。任务页每 15 秒读取日志；周期性下次时间可按日志中的定时锚点推算，并标记“推算”，事件触发可能提前。一次性任务完成后不再安排下一次；过期且无法推算的计划等待新日志，不伪造执行结果。
 - 网页凭据页和编辑器已移除，不再自动读取或展示完整凭据。原 `/admin/api/credentials` 与 `/admin/api/credential-edit` 后端接口暂保留兼容，仍受独立管理鉴权、同源、文件范围和版本冲突保护，网页不再调用。
 - 「访问设置」可编辑 `gateway.apiPort` / `gateway.webPort`，保存调用原来的 `POST /admin/api/settings`。配置端口与实际监听端口分别显示，修改后**需重启网关**，不会直接中断当前页面或流式请求；显式 `-port` 仍优先于配置。
+- 「配置」页点击「编辑配置」后先展示风险警告，确认后通过 `GET /admin/api/config-edit?acknowledged=1` 加载真实原文（包含 Key）；仅通过可信网络、HTTPS 或 SSH 转发使用。编辑器不把正文保存到浏览器存储，离开配置页、退出编辑或会话失效时清除原文，未保存修改需确认丢弃。
+- 「校验并保存」通过 `POST /admin/api/config-edit` 提交 `content`、读取时的 SHA-256 `revision` 和 `acknowledged: true`。配置最大 1 MiB，必须是符合既有字段及类型规则的单个 JSON 对象；拒绝将 `[REDACTED]` 当作 Key。读取后被其他网页操作或服务器修改过的配置返回 `409`，不覆盖新版本；网页保留输入供核对，重新加载前提示丢弃未保存修改。
+- 保存完整配置等效于直接修改服务器文件：可热配置立即生效，监听端口保持不变直到重启；日志保留规则可能触发不可撤销的删除。管理 Key 改变后退出旧会话、要求重新登录；清空管理 Key 需额外确认并提交 `confirmAdminKeyRemoval: true`，之后需在服务器本机重新设置。配置写入或热应用失败会尽力恢复旧文件，日志只记录阶段、结果和长度，不记录正文或 Key。
 - 「日志」页通过 `GET/POST /admin/api/log-settings` 读写 `logs.retentionDays`，通过 `POST /admin/api/log-cleanup`（空 JSON 对象）清理过期日志，返回删除数量、回收字节、正在写入跳过数量与失败数量。
 - 所有新接口均需要独立管理 Key，并复用同源校验和 TraceID 落盘审计；模型 API Key 不能编辑凭据、修改端口或清理日志。
 
@@ -1022,7 +1025,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 
 - `workbuddy*.json` 包含真实访问凭据（Access Token / Refresh Token），**严禁提交到 Git 或公开分享**；本仓库 `.gitignore` 已排除。
 - 网关默认只监听 `127.0.0.1`。需要局域网 / 公网访问时改用 `-addr 0.0.0.0`，并在 `config.json` 中开启模型 API Key 校验（`gateway.apiKeyEnabled`），或置于反向代理之后。
-- `config.json` 中的 `gateway.adminKey` 与 `gateway.apiKey` 按要求明文保存，请限制该文件权限；网页配置页只显示脱敏后的内容。
+- `config.json` 中的 `gateway.adminKey` 与 `gateway.apiKey` 按要求明文保存，请限制该文件权限；网页配置预览隐藏 Key，管理员明确确认编辑警告后才在编辑器显示真实 Key。不要分享编辑器截图或在公共设备上编辑，完整配置只保留在当前页面内存中，不进入审计日志。
 - `/admin/probe` 仅接受回环来源调用。
 - 不再需要某账号授权时，删除对应凭据文件并在 CodeBuddy 控制台撤销授权。
 

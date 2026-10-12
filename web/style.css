@@ -207,10 +207,27 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .port-inputs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
 .action-result { margin-top: 12px; margin-bottom: 0; }
+.config-warning { padding: 16px; margin-bottom: 16px; border-left: 3px solid var(--warn); background: var(--surface-muted); border-radius: 8px; }
+.config-warning h2 { font-size: 15px; margin: 0 0 8px; }
+.config-warning ul { padding-left: 20px; margin: 0; }
+.config-warning li + li { margin-top: 8px; }
+.config-warning .actions { margin-top: 16px; }
+.config-sensitive { color: var(--warn); font-size: 12px; margin: 0 0 12px; }
+.config-editor {
+  display: block; width: 100%; min-height: 320px; height: 52vh; margin-top: 8px; padding: 12px;
+  resize: vertical; overflow: auto; tab-size: 2; font-family: var(--mono); font-size: 13px; line-height: 1.6;
+  color: var(--text); background: var(--surface-muted); border: 1px solid var(--border); border-radius: 8px;
+}
+.config-editor:focus-visible, #panel-config button:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+#configEditorStatus { min-height: 20px; overflow-wrap: anywhere; }
+.config-warning code { overflow-wrap: anywhere; }
 .task-description { white-space: normal; min-width: 180px; max-width: 280px; line-height: 1.6; }
 @media (max-width: 600px) {
   .port-inputs { grid-template-columns: 1fr; gap: 0; }
   .actions button { min-height: 44px; }
+  #editConfig { min-height: 44px; }
+  .config-warning { padding: 12px; }
+  .config-warning .actions, #configEditorPanel .actions { display: grid; grid-template-columns: 1fr; }
   #tasksTable, #tasksTable tbody { display: block; }
   #tasksTable thead { display: none; }
   #tasksTable tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; padding: 16px 0; border-bottom: 1px solid var(--border); }

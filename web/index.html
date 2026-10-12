@@ -137,9 +137,36 @@
   <section id="panel-config" class="panel">
     <div class="card">
       <div class="card-title">
-        config.json（只读 · Key 已隐藏）
+        <span id="configTitle">config.json（预览 · Key 已隐藏）</span>
+        <button id="editConfig" type="button">编辑配置</button>
+      </div>
+      <p class="hint">保存等效于直接修改服务器 config.json。预览始终隐藏 Key；确认编辑警告后才加载含真实 Key 的原文。</p>
+      <div id="configWarning" class="config-warning hidden" role="region" aria-labelledby="configWarningTitle">
+        <h2 id="configWarningTitle">编辑前请确认风险</h2>
+        <ul>
+          <li>这是整份服务器配置，不是副本。编辑器会显示真实管理 Key 和 API Key，请勿分享截图或在公共设备上编辑；仅通过可信网络、HTTPS 或 SSH 转发访问，建议先自行备份。</li>
+          <li>保存后，密钥、模型/账号规则、提示词等立即生效。端口修改需重启服务；API 端口仍可能受启动参数 <code>-port</code> 覆盖。</li>
+          <li>修改管理 Key 会要求重新登录；清空它将使管理登录不可用，需在服务器本机重新设置。</li>
+          <li>改变日志保留天数可能触发过期日志删除，删除不可撤销。错误的配置会被拒绝，不写入文件。</li>
+        </ul>
+        <div class="actions">
+          <button id="acknowledgeConfigEdit" type="button">我已了解风险，加载并编辑</button>
+          <button id="cancelConfigWarning" class="ghost" type="button">返回预览</button>
+        </div>
       </div>
       <pre class="logbox" id="configBox">加载中…</pre>
+      <div id="configEditorPanel" class="hidden">
+        <p class="config-sensitive">编辑中 · 包含真实 Key，仅保留在当前页面内存中。离开配置页或退出编辑会清除原文。</p>
+        <label for="configEditor" class="hint">完整配置 JSON</label>
+        <textarea id="configEditor" class="config-editor" spellcheck="false" autocomplete="off" autocapitalize="off" aria-describedby="configEditorStatus"></textarea>
+        <p id="configEditorStatus" class="hint action-result" role="status" aria-live="polite"></p>
+        <div class="actions">
+          <button id="saveConfig" type="button">校验并保存</button>
+          <button id="reloadConfigEditor" class="ghost" type="button">重新加载</button>
+          <button id="cancelConfigEdit" class="ghost" type="button">退出编辑</button>
+        </div>
+      </div>
+      <p id="configResult" class="hint action-result" role="status" aria-live="polite"></p>
     </div>
   </section>
 

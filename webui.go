@@ -57,6 +57,7 @@ func registerWebUIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/models", handleWebUIModels)
 	mux.HandleFunc("/admin/api/logs", handleWebUILogs)
 	mux.HandleFunc("/admin/api/config", handleWebUIConfig)
+	mux.HandleFunc("/admin/api/config-edit", handleWebUIConfigEdit)
 	mux.HandleFunc("/admin/api/credentials", handleWebUICredentials)
 	mux.HandleFunc("/admin/api/setup", handleWebUISetup)
 	mux.HandleFunc("/admin/api/settings", handleWebUISettings)

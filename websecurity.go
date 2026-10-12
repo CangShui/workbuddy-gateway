@@ -210,13 +210,15 @@ func handleWebUIClientEvent(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "无效的前端审计事件")
 		return
 	}
-	allowed := map[string]bool{"request_completed": true, "request_failed": true, "settings_validation_failed": true, "credential_validation_failed": true, "log_validation_failed": true}
+	allowed := map[string]bool{"request_completed": true, "request_failed": true, "settings_validation_failed": true, "credential_validation_failed": true, "log_validation_failed": true,
+		"config_edit_warning": true, "config_edit_acknowledged": true, "config_edit_cancelled": true, "config_validation_failed": true}
 	routes := map[string]bool{
 		"/admin/api/status": true, "/admin/api/models": true, "/admin/api/logs": true,
 		"/admin/api/config": true, "/admin/api/credentials": true, "/admin/api/settings": true,
 		"/admin/api/account-toggle": true, "/admin/api/model-toggle": true,
 		"/admin/api/credential-edit": true, "/admin/api/log-settings": true, "/admin/api/log-cleanup": true,
-		"/admin/api/tasks": true,
+		"/admin/api/tasks":       true,
+		"/admin/api/config-edit": true,
 	}
 	if !allowed[input.Event] || !routes[input.Route] || input.Status < 0 || input.Status > 599 {
 		writeJSONError(w, http.StatusBadRequest, "不接受未定义的前端审计事件")

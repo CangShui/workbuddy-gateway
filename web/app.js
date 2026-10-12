@@ -16,7 +16,13 @@
     logSettings: null,
     logSettingsVersion: 0,
     settingsLoadVersion: 0,
-    tasksLastPoll: 0
+    tasksLastPoll: 0,
+    configMode: "preview",
+    configPending: false,
+    configVersion: 0,
+    configPreviewVersion: 0,
+    configRevision: "",
+    configOriginal: ""
   };
 
   function $(id) { return document.getElementById(id); }
@@ -85,6 +91,7 @@
   }
 
   function lockDashboard() {
+    resetConfigEditor();
     state.tasksLastPoll = 0;
     $("tabs").classList.add("hidden");
     $("dashboard").classList.add("hidden");
@@ -99,7 +106,7 @@
 
   function api(path, options) {
     options = options || {};
-    var trace = traceID();
+    var trace = options.trace || traceID();
     var keyAtStart = state.apiKey;
     var headers = {"X-Trace-ID": trace};
     if (state.apiKey) headers["Authorization"] = "Bearer " + state.apiKey;
@@ -125,8 +132,12 @@
       }
       if (!resp.ok) {
         setConn("请求失败 (" + resp.status + ")", "danger");
-        showAlert("HTTP " + resp.status + "：" + (result.data.error || "请求失败") + "；已有数据保留，未更新为零。");
-        throw new Error("HTTP " + resp.status);
+        showAlert("HTTP " + resp.status + "：" + (result.data.error || "请求失败") +
+          (path.split("?")[0] === "/admin/api/config-edit" ? "；操作未完成，已有编辑输入保留。" : "；已有数据保留，未更新为零。"));
+        var failure = new Error("HTTP " + resp.status);
+        failure.status = resp.status;
+        failure.detail = result.data.error || "请求失败";
+        throw failure;
       }
       hideAlert();
       setConn("已连接 · " + nowText(), "ok");
@@ -358,12 +369,162 @@
 
   // ---- 渲染：配置 --------------------------------------------------------
   function loadConfig() {
+    var version = ++state.configPreviewVersion;
     return api("/admin/api/config").then(function (data) {
+      if (version !== state.configPreviewVersion) return;
       var box = $("configBox");
       if (!data.exists) { box.textContent = "未找到 " + (data.path || "config.json"); return; }
       box.textContent = data.content;
     }).catch(function () {
       // 保留上次内容。
+    });
+  }
+
+  function configDirty() {
+    return state.configMode === "edit" && $("configEditor").value !== state.configOriginal;
+  }
+
+  function setConfigBusy(busy) {
+    state.configPending = busy;
+    ["editConfig", "acknowledgeConfigEdit", "saveConfig", "reloadConfigEditor"].forEach(function (id) {
+      $(id).disabled = busy;
+    });
+    $("configEditor").readOnly = busy;
+    $("saveConfig").textContent = busy && state.configMode === "edit" ? "处理中…" : "校验并保存";
+  }
+
+  function resetConfigEditor() {
+    state.configVersion++;
+    state.configMode = "preview";
+    state.configRevision = "";
+    state.configOriginal = "";
+    $("configEditor").value = "";
+    $("configEditorStatus").textContent = "";
+    $("configWarning").classList.add("hidden");
+    $("configEditorPanel").classList.add("hidden");
+    $("configBox").classList.remove("hidden");
+    $("editConfig").classList.remove("hidden");
+    $("configTitle").textContent = "config.json（预览 · Key 已隐藏）";
+    $("cancelConfigEdit").disabled = false;
+    setConfigBusy(false);
+  }
+
+  function showConfigWarning() {
+    if (state.configPending || state.configMode !== "preview") return;
+    hideAlert();
+    state.configMode = "warning";
+    $("configResult").textContent = "";
+    $("editConfig").classList.add("hidden");
+    $("configWarning").classList.remove("hidden");
+    reportUIEvent("config_edit_warning", "/admin/api/config-edit", 0, traceID());
+    $("acknowledgeConfigEdit").focus();
+  }
+
+  function exitConfigEdit() {
+    if (state.configPending && state.configMode === "edit") return false;
+    if (configDirty() && !window.confirm("有未保存的配置修改。退出会丢弃这些修改，是否继续？")) return false;
+    reportUIEvent("config_edit_cancelled", "/admin/api/config-edit", 0, traceID());
+    resetConfigEditor();
+    hideAlert();
+    return true;
+  }
+
+  function loadConfigEditor() {
+    if (state.configPending || state.configMode === "preview") return Promise.resolve();
+    if (configDirty() && !window.confirm("重新加载会丢弃未保存的修改，是否继续？")) return Promise.resolve();
+    var version = ++state.configVersion;
+    var trace = traceID();
+    setConfigBusy(true);
+    reportUIEvent("config_edit_acknowledged", "/admin/api/config-edit", 0, trace);
+    $("configEditorStatus").textContent = "正在加载服务器配置…";
+    $("configResult").textContent = "正在加载服务器配置…";
+    return api("/admin/api/config-edit?acknowledged=1", {trace: trace}).then(function (data) {
+      if (version !== state.configVersion) return;
+      state.configRevision = data.revision;
+      state.configOriginal = data.content;
+      state.configMode = "edit";
+      $("configEditor").value = data.content;
+      $("configWarning").classList.add("hidden");
+      $("configBox").classList.add("hidden");
+      $("configEditorPanel").classList.remove("hidden");
+      $("editConfig").classList.add("hidden");
+      $("configTitle").textContent = "config.json（编辑 · 包含真实 Key）";
+      $("configEditorStatus").textContent = "已加载原文。保存前会校验配置和版本；其他页面或服务器修改过配置时将拒绝覆盖。";
+      $("configResult").textContent = "";
+    }).catch(function (err) {
+      if (version !== state.configVersion) return;
+      var message = "加载失败：" + (err.detail || err.message) + "。已有输入保留。";
+      $("configEditorStatus").textContent = message;
+      $("configResult").textContent = message;
+    }).then(function () {
+      if (version !== state.configVersion) return;
+      setConfigBusy(false);
+      if (state.configMode === "edit") $("configEditor").focus();
+    });
+  }
+
+  function saveConfigEditor() {
+    if (state.configPending || state.configMode !== "edit") return Promise.resolve();
+    var content = $("configEditor").value;
+    var trace = traceID();
+    var parsed;
+    try {
+      parsed = JSON.parse(content);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("必须是单个 JSON 对象");
+      if (new TextEncoder().encode(content).length > 1048576) throw new Error("超过 1 MiB");
+    } catch (_) {
+      $("configEditorStatus").textContent = "配置未保存：请输入不超过 1 MiB 的完整 JSON 对象，请检查引号、逗号和括号。";
+      reportUIEvent("config_validation_failed", "/admin/api/config-edit", 400, trace);
+      return Promise.resolve();
+    }
+    var nextAdminKey = parsed.gateway && parsed.gateway.adminKey || "";
+    var adminKeyChanged = nextAdminKey !== state.apiKey;
+    var removal = !nextAdminKey;
+    if (removal && !window.confirm("你正在清空管理 Key（或删除 gateway.adminKey）。保存后管理登录将不可用，需要在服务器本机重新设置。确认清空？")) {
+      reportUIEvent("config_edit_cancelled", "/admin/api/config-edit", 0, trace);
+      return Promise.resolve();
+    }
+    if (!window.confirm("确认将整份配置写入服务器 config.json？\n密钥、规则和提示词等立即生效，端口修改需重启。日志保留规则可能触发不可撤销的删除。" +
+        (adminKeyChanged ? "\n管理 Key 已修改，保存后需要重新登录，请先妥善保存新 Key。" : ""))) {
+      reportUIEvent("config_edit_cancelled", "/admin/api/config-edit", 0, trace);
+      return Promise.resolve();
+    }
+    var version = state.configVersion;
+    setConfigBusy(true);
+    $("cancelConfigEdit").disabled = true;
+    $("configEditorStatus").textContent = "正在校验并保存…";
+    return api("/admin/api/config-edit", {method: "POST", trace: trace,
+      body: {content: content, revision: state.configRevision, acknowledged: true, confirmAdminKeyRemoval: removal}
+    }).then(function (data) {
+      if (version !== state.configVersion) return;
+      var message = "配置已保存，热配置已生效。" +
+        (data.settings && data.settings.restartRequired ? " 监听端口变更需重启服务。" : " 当前监听端口未改变。") +
+        (data.settings && data.settings.apiPortOverridden ? " API 端口受 -port 启动参数覆盖。" : "");
+      resetConfigEditor();
+      $("configResult").textContent = message;
+      if (data.adminKeyChanged) {
+        state.apiKey = "";
+        sessionStorage.removeItem(KEY_STORAGE);
+        $("apiKey").value = "";
+        lockDashboard();
+        showAlert(message + (data.adminKeyCleared ? " 管理 Key 已清空，请在服务器本机重新设置。" : " 管理 Key 已修改，请使用新 Key 重新登录。"), true);
+        setConn("需要重新设置管理 Key 或登录", "");
+      } else {
+        state.settingsLoadVersion++;
+        state.logSettingsVersion++;
+        state.policyVersion++;
+        loadConfig();
+        loadSettings();
+      }
+    }).catch(function (err) {
+      if (version !== state.configVersion) return;
+      $("configEditorStatus").textContent = err.status === 409 ?
+        "版本冲突：服务器配置已变化。修改未写入，当前输入保留。请先核对修改，再重新加载最新配置。" :
+        "保存未完成：" + (err.detail || err.message) + "。当前输入保留，请检查后重试。";
+    }).then(function () {
+      if (version !== state.configVersion) return;
+      $("cancelConfigEdit").disabled = false;
+      setConfigBusy(false);
     });
   }
 
@@ -467,6 +628,7 @@
   }
 
   function setTab(name) {
+    if (name !== "config" && state.configMode !== "preview" && !exitConfigEdit()) return;
     if (name === "tasks") state.tasksLastPoll = 0;
     state.activeTab = name;
     Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (t) {
@@ -545,6 +707,7 @@
 
   // 管理 Key 仅保存在当前标签页会话，验证成功后才保存。
   function saveKey() {
+    if (state.configMode !== "preview" && !exitConfigEdit()) return Promise.resolve();
     var key = $("apiKey").value.trim();
     if (!key) { showAlert("请输入管理 Key。"); return Promise.resolve(); }
     state.apiKey = key;
@@ -619,6 +782,8 @@
     initTheme();
     $("saveKey").addEventListener("click", saveKey);
     $("logout").addEventListener("click", function () {
+      if (state.configMode !== "preview" && !exitConfigEdit()) return;
+      resetConfigEditor();
       sessionStorage.removeItem(KEY_STORAGE);
       state.apiKey = "";
       window.location.reload();
@@ -626,6 +791,20 @@
     $("initializeAdmin").addEventListener("click", initializeAdmin);
     $("saveAPISettings").addEventListener("click", saveAPISettings);
     $("savePortSettings").addEventListener("click", savePortSettings);
+    $("editConfig").addEventListener("click", showConfigWarning);
+    $("acknowledgeConfigEdit").addEventListener("click", loadConfigEditor);
+    $("cancelConfigWarning").addEventListener("click", exitConfigEdit);
+    $("cancelConfigEdit").addEventListener("click", exitConfigEdit);
+    $("reloadConfigEditor").addEventListener("click", loadConfigEditor);
+    $("saveConfig").addEventListener("click", saveConfigEditor);
+    $("configEditor").addEventListener("input", function () {
+      $("configEditorStatus").textContent = configDirty() ? "有未保存的修改。离开配置页会提示确认；不会自动保存。" : "内容未修改。";
+    });
+    window.addEventListener("beforeunload", function (event) {
+      if (!configDirty() && !state.configPending) return;
+      event.preventDefault();
+      event.returnValue = "";
+    });
     $("saveLogSettings").addEventListener("click", saveLogSettings);
     $("cleanupLogs").addEventListener("click", cleanupExpiredLogs);
     $("apiKey").addEventListener("keydown", function (e) { if (e.key === "Enter") saveKey(); });
