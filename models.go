@@ -922,14 +922,22 @@ func modelsRefreshLoop(interval time.Duration) {
 // modelPriceProbeLoop 周期性执行价格探测。
 // 首轮在启动后很快执行；只要仍有待探测模型就用较短间隔追赶，收敛后回到长间隔。
 func modelPriceProbeLoop() {
-	if cfg.DisablePriceProbes {
-		logScheduledTask("price_probe", "disabled", "disabled", newTraceID(), time.Time{}, time.Time{}, "启动参数已禁止自动生成请求探测")
-		log.Printf("[ModelPrice] 阶段=自动探测调度 结果=已关闭 原因=指定-disable-price-probes 业务影响=不会自动请求模型，客户端请求和显式probe不受影响")
+	trace := newTraceID()
+	if !cfg.automaticPriceProbesAllowed() {
+		reason := "默认关闭，未显式指定-allow-price-probes=true"
+		if cfg.DisablePriceProbes {
+			reason = "兼容旧参数-disable-price-probes=true，禁用优先"
+		}
+		logScheduledTask("price_probe", "disabled", "disabled", trace, time.Time{}, time.Time{}, reason+"；不会自动请求模型，不消耗后台价格探测积分")
+		log.Printf("[ModelPrice] traceId=%s 阶段=自动探测调度 allowPriceProbes=%t legacyDisablePriceProbes=%t 结果=已关闭 原因=%s 业务影响=不会自动请求模型，客户端请求、目录刷新和显式probe不受影响",
+			trace, cfg.AllowPriceProbes, cfg.DisablePriceProbes, reason)
 		return
 	}
+	log.Printf("[ModelPrice] traceId=%s 阶段=自动探测调度 allowPriceProbes=%t legacyDisablePriceProbes=%t 结果=已开启 原因=显式指定-allow-price-probes 费用警告=将发起真实模型生成请求，可能消耗积分；没有累计积分预算限制",
+		trace, cfg.AllowPriceProbes, cfg.DisablePriceProbes)
 	timer := time.NewTimer(modelPriceProbeStartDelay)
 	defer timer.Stop()
-	logScheduledTask("price_probe", "scheduled", "", newTraceID(), time.Time{}, time.Now().Add(modelPriceProbeStartDelay), "启动后20秒首轮；无候选模型时不生成请求")
+	logScheduledTask("price_probe", "scheduled", "", trace, time.Time{}, time.Now().Add(modelPriceProbeStartDelay), "显式开启，真实请求可能消耗积分；启动后20秒首轮；无候选模型时不生成请求")
 	for {
 		select {
 		case <-timer.C:

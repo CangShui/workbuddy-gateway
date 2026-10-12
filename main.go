@@ -374,7 +374,8 @@ type Config struct {
 	JournalService     string // monitor 附加展示的 systemd 服务名（journalctl -u）
 	LogLines           int    // monitor 展示的最近日志行数
 	ModelsRefresh      int    // 官方模型目录刷新间隔（分钟），0 关闭
-	DisablePriceProbes bool   // 禁止后台价格探测，不影响客户端请求及显式 probe 命令
+	AllowPriceProbes   bool   // 仅显式开启后台价格探测；真实生成请求可能消耗积分
+	DisablePriceProbes bool   // 旧禁用参数兼容，优先于 AllowPriceProbes；不影响客户端请求及显式 probe 命令
 	KeepaliveHours     []int  // 主动续期时刻（本地小时），空表示关闭；到点主动刷新全部账号
 	ProbeModels        string // probe 专用：逗号分隔的模型列表
 	ProbeLimit         int    // probe 专用：未显式指定模型时的取用数量
@@ -480,6 +481,18 @@ var (
 // 主入口与命令行控制
 // -----------------------------------------------------------------------------
 
+func registerAutomaticPriceProbeFlags(fs *flag.FlagSet, target *Config) {
+	fs.BoolVar(&target.AllowPriceProbes, "allow-price-probes", false, "允许后台自动价格探测（默认关闭；真实生成请求可能消耗积分）")
+	// 兼容旧 systemd / 启动脚本，但不再出现在主要用法说明中。
+	// 即使传入 -disable-price-probes=false，也不能绕过显式开启的要求。
+	fs.BoolVar(&target.DisablePriceProbes, "disable-price-probes", false, "")
+}
+
+func (c Config) automaticPriceProbesAllowed() bool {
+	// 两个参数同时出现时，禁用优先，且不依赖命令行参数的排列顺序。
+	return c.AllowPriceProbes && !c.DisablePriceProbes
+}
+
 func main() {
 	if len(os.Args) > 1 {
 		first := os.Args[1]
@@ -524,7 +537,7 @@ func main() {
 	fs.StringVar(&cfg.JournalService, "journal", "", "monitor 附加跟随的 systemd 服务名（Linux 下用 journalctl -u <服务> -f 跟随）")
 	fs.IntVar(&cfg.LogLines, "lines", 15, "monitor 每次刷新展示的最近日志行数")
 	fs.IntVar(&cfg.ModelsRefresh, "models-refresh", 60, "模型目录刷新间隔（分钟），0 关闭（实时接口 + npm 合并）")
-	fs.BoolVar(&cfg.DisablePriceProbes, "disable-price-probes", false, "禁止后台自动价格探测，不影响正常模型请求")
+	registerAutomaticPriceProbeFlags(fs, &cfg)
 	keepaliveHours := hourList{22}
 	fs.Var(&keepaliveHours, "keepalive-hours", "主动续期时刻（本地小时，逗号分隔，默认 22）；留空关闭")
 	fs.StringVar(&cfg.ProbeModels, "models", "", "probe 专用：逗号分隔的待探测模型（默认取目录前几个）")
@@ -646,8 +659,9 @@ func printHelp() {
   -models-refresh <min>
                     模型目录刷新间隔（默认 60 分钟，0 关闭）
                     （目录来源：实时接口 + npm 静态包，合并去重）
-  -disable-price-probes
-                    关闭后台自动价格探测，避免主动生成模型请求；
+  -allow-price-probes
+                    开启后台自动价格探测（默认关闭）；
+                    会发起真实模型生成请求，可能消耗积分，请确认后开启；
                     不影响客户端请求、目录刷新及显式 probe 命令
   -keepalive-hours <h,h,...>
                     主动续期时刻（本地小时，逗号分隔，默认 22）
