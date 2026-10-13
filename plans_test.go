@@ -302,6 +302,148 @@ func TestQuotaRefreshSeparatesQuotaAndPlanFailures(t *testing.T) {
 	}
 }
 
+func TestEnterpriseQuotaUsesAllocatedUsageNotPersonalPackages(t *testing.T) {
+	oldOrigin, oldClient := profileCN.Origin, cfg.HttpClient
+	accountMu.Lock()
+	oldAccounts := accounts
+	accountMu.Unlock()
+	var audit bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&audit)
+	t.Cleanup(func() {
+		profileCN.Origin, cfg.HttpClient = oldOrigin, oldClient
+		log.SetOutput(oldWriter)
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	})
+
+	mode := "allocated"
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path != "/v2/billing/meter/get-enterprise-user-usage" {
+			t.Errorf("enterprise account must not use personal quota API, got %s %s", r.Method, r.URL.Path)
+			http.Error(w, "personal package endpoint", http.StatusBadRequest)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer private-enterprise-token" ||
+			r.Header.Get("X-Enterprise-Id") != "ent-1" ||
+			r.Header.Get("X-Tenant-Id") != "ent-1" ||
+			r.Header.Get("X-User-Id") != "user-ent" ||
+			r.Header.Get("X-Domain") != "ent.example" ||
+			r.Header.Get("X-Trace-ID") == "" {
+			t.Errorf("enterprise billing headers missing: %#v", r.Header)
+		}
+		switch mode {
+		case "allocated":
+			_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"credit":812.45,"limitNum":2000,"cycleEndTime":"2099-10-26 23:59:59"}}`))
+		case "snake":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"used_num":1.25,"limit_num":"5"}}`))
+		case "unlimited":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"credit":12.5,"limitNum":-1}}`))
+		case "empty-allocation":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"credit":10,"limitNum":10}}`))
+		case "bad":
+			_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+		default:
+			t.Errorf("unknown mode %s", mode)
+		}
+	}))
+	defer server.Close()
+	profileCN.Origin, cfg.HttpClient = server.URL, server.Client()
+
+	acc := &Account{
+		Path: "enterprise.json",
+		Auth: &StoredAuth{
+			Edition: "cn",
+			Auth:    StoredTokens{AccessToken: "private-enterprise-token", Domain: "ent.example"},
+			Account: StoredAccount{UID: " user-ent ", EnterpriseID: " ent-1 "},
+		},
+		QuotaKnown: true, QuotaExhausted: true, QuotaRemaining: 0,
+		ModelStates: map[string]*modelRuntimeState{
+			"glm-5.3-flash": {CostClass: modelCostPaid, QuotaBlocked: true, LastReason: "14018 credits exhausted"},
+		},
+	}
+	accountMu.Lock()
+	accounts = []*Account{acc}
+	accountMu.Unlock()
+
+	if err := refreshAccountQuota(context.Background(), acc); err != nil {
+		t.Fatal(err)
+	}
+	if acc.PlanLabel != planEnterprise || acc.PlanStale || acc.QuotaExhausted || acc.QuotaUnlimited {
+		t.Fatalf("enterprise plan/quota flags wrong: %+v", acc)
+	}
+	if formatQuota(acc.QuotaTotal) != "2000" || formatQuota(acc.QuotaUsed) != "812.45" || formatQuota(acc.QuotaRemaining) != "1187.55" {
+		t.Fatalf("allocated quota mapped wrong: total=%v used=%v remaining=%v", acc.QuotaTotal, acc.QuotaUsed, acc.QuotaRemaining)
+	}
+	if acc.ModelStates["glm-5.3-flash"].QuotaBlocked {
+		t.Fatal("positive enterprise allocation must clear the false quota block")
+	}
+	picked, _, err := nextAccountForModel("glm-5.3-flash", nil)
+	if err != nil || picked != acc {
+		t.Fatalf("paid model should be schedulable, picked=%v err=%v", picked, err)
+	}
+	if len(paths) != 1 || paths[0] != "/v2/billing/meter/get-enterprise-user-usage" {
+		t.Fatalf("paths=%v", paths)
+	}
+
+	mode = "snake"
+	if err := refreshAccountQuota(context.Background(), acc); err != nil {
+		t.Fatal(err)
+	}
+	if formatQuota(acc.QuotaRemaining) != "3.75" || acc.QuotaExhausted {
+		t.Fatalf("snake_case quota wrong: remaining=%v exhausted=%v", acc.QuotaRemaining, acc.QuotaExhausted)
+	}
+
+	mode = "unlimited"
+	acc.QuotaExhausted = true
+	acc.ModelStates["glm-5.3-flash"].QuotaBlocked = true
+	if err := refreshAccountQuota(context.Background(), acc); err != nil {
+		t.Fatal(err)
+	}
+	if !acc.QuotaUnlimited || acc.QuotaExhausted || acc.ModelStates["glm-5.3-flash"].QuotaBlocked {
+		t.Fatal("unlimited enterprise allocation must not block paid models")
+	}
+	table := renderAccountTable([]accountSnapshot{{
+		Path: acc.Path, QuotaKnown: true, QuotaUnlimited: true, QuotaUsed: acc.QuotaUsed, PlanLabel: planEnterprise,
+	}})
+	if !strings.Contains(table, "不限") || !strings.Contains(table, planEnterprise) || strings.Contains(table, "付费耗尽") {
+		t.Fatalf("unlimited display wrong:\n%s", table)
+	}
+	if _, _, err := nextAccountForModel("glm-5.3-flash", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	mode = "empty-allocation"
+	if err := refreshAccountQuota(context.Background(), acc); err != nil {
+		t.Fatal(err)
+	}
+	if !acc.QuotaExhausted || acc.QuotaUnlimited || acc.QuotaRemaining != 0 {
+		t.Fatalf("used-up allocation should exhaust: %+v", acc)
+	}
+	if _, _, err := nextAccountForModel("glm-5.3-flash", nil); err == nil || !strings.Contains(err.Error(), "额度阻断=1") {
+		t.Fatalf("used-up enterprise allocation should block paid model, err=%v", err)
+	}
+
+	remainingBefore := acc.QuotaRemaining
+	mode = "bad"
+	if err := refreshAccountQuota(context.Background(), acc); err == nil || acc.QuotaRemaining != remainingBefore || !acc.PlanStale {
+		t.Fatal("unparseable enterprise usage must keep the previous quota")
+	}
+	for _, secret := range []string{"private-enterprise-token"} {
+		if strings.Contains(audit.String(), secret) {
+			t.Fatal("token leaked into audit")
+		}
+	}
+	for _, marker := range []string{"traceId=", "企业分配额度", "limitNum", "credit", "get-user-resource"} {
+		if !strings.Contains(audit.String(), marker) {
+			t.Fatalf("missing audit marker %s", marker)
+		}
+	}
+}
+
 func TestPlanTableShowsFutureNameAndStaleMarker(t *testing.T) {
 	out := renderAccountTable([]accountSnapshot{{Path: "test.json", QuotaKnown: true, PlanLabel: "Business Ultra 2027", PlanStale: true}})
 	if !strings.Contains(out, "Business Ultra 2027*") || !strings.Contains(out, "权益查询失败") {

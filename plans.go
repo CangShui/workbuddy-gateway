@@ -16,6 +16,10 @@ import (
 
 const planUnknown = "待确认"
 
+// planEnterprise 只表示「这是企业成员分配额度」，不是个人套餐编码。
+// 企业号查不到个人资源包，不能把查不到误写成免费或试用。
+const planEnterprise = "企业版"
+
 // 这些编码只用于旧套餐的短名称，不用于请求过滤。新编码仍会被查询，
 // 并优先显示上游 PackageName，避免官网增加套餐后悄悄退回“免费”。
 var legacyPlanNames = map[string]string{

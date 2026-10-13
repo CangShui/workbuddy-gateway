@@ -191,9 +191,12 @@ func saveEditedCredential(ctx context.Context, target, revision, content, trace 
 		acc = &Account{Path: target}
 		accounts = append(accounts, acc)
 	}
-	identityChanged := acc.Auth != nil && (acc.Auth.Account.UID != auth.Account.UID || acc.Profile().Key != profileForEdition(auth.Edition).Key)
+	identityChanged := acc.Auth != nil && (acc.Auth.Account.UID != auth.Account.UID ||
+		acc.Profile().Key != profileForEdition(auth.Edition).Key ||
+		strings.TrimSpace(acc.Auth.Account.EnterpriseID) != strings.TrimSpace(auth.Account.EnterpriseID))
 	if identityChanged {
 		acc.QuotaKnown, acc.QuotaExhausted, acc.IsPaidUser = false, false, false
+		acc.QuotaUnlimited = false
 		acc.QuotaTotal, acc.QuotaUsed, acc.QuotaRemaining = 0, 0, 0
 		acc.PlanLabel, acc.PlanCheckedAt, acc.PlanStale = "", 0, true
 		acc.ModelStates = nil
