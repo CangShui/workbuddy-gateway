@@ -12,9 +12,11 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -68,6 +70,7 @@ func registerWebUIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/log-settings", handleWebUILogSettings)
 	mux.HandleFunc("/admin/api/log-cleanup", handleWebUILogCleanup)
 	mux.HandleFunc("/admin/api/tasks", handleWebUITasks)
+	mux.HandleFunc("/admin/api/rate-detail", handleWebUIRateDetail)
 }
 
 // 只读日志视图：无额外调度器、任务状态文件或内存任务登记表。
@@ -268,6 +271,359 @@ func readTaskEvents() ([]scheduledTaskEvent, int64, bool, error) {
 		}
 	}
 	return events, scanned, truncated, nil
+}
+
+// -----------------------------------------------------------------------------
+// 倍率来源（只读日志视图）
+//
+// 与定时任务页同源：不新增调度器、状态文件或账本，全部从现有普通日志解析。
+// 日志里没有任何记录的模型，页面直接显示「没有日志」，不猜测来源。
+// -----------------------------------------------------------------------------
+
+type rateLogRecord struct {
+	Site      string `json:"site"`
+	Model     string `json:"model"`
+	Source    string `json:"source"`
+	Explain   string `json:"explain"`
+	UpdatedAt int64  `json:"updatedAt"`
+	Value     string `json:"value"`
+	Detail    string `json:"detail"`
+	Unknown   bool   `json:"unknown"`
+	Priority  int    `json:"priority"`
+	LogFile   string `json:"logFile"`
+	LogLine   string `json:"logLine"`
+}
+
+// 优先级与 modelDisplayMultiplier 的取值顺序一致，保证「感叹号」解释的是控制台真正显示的那个值。
+const (
+	ratePriorityLearnedFree = 1
+	ratePriorityProbeFree   = 2
+	ratePriorityProbePaid   = 3
+	ratePriorityPromoStale  = 4
+	ratePriorityOfficial    = 6
+	// 正常请求实测「收费」不参与取值（页面仍展示官方倍率），仅作为佐证列出。
+	ratePriorityLearnedPaid = 7
+)
+
+var (
+	rateOfficialRe   = regexp.MustCompile(`\[Models\] 官方倍率 站点=(\S+) 模型=(\S+) 原始credits="([^"]*)" 生效倍率=(\S+) 有倍率=(\S+) 促销="([^"]*)" 促销截止="([^"]*)" 促销已过期=(\S+) 来源=(\S+) 刷新时间=(\S+)`)
+	rateProbeCacheRe = regexp.MustCompile(`\[ModelPrice\] 载入缓存结论 站点=(\S+) 模型=(\S+) 判定=(\S+) credit=(\S+) tokens=(\d+) 探测时间=(\S+) 说明=(.*?) 来源=缓存文件`)
+	rateProbeLiveRe  = regexp.MustCompile(`\[ModelPrice\] 站点=(\S+) 账号=(\S+) 模型=(\S+) -> verdict=(\S+) credit=(\S+) tokens=(\d+) \((.*)\)\s*$`)
+	rateLearnedRe    = regexp.MustCompile(`\[ModelCost\] requestId=\d+ 账号 (\S+) 站点=(\S+) 模型 (\S+) 实测 usage\.credit=(\S+?)，已学习为(免费|收费)模型`)
+	rateProbeModeRe  = regexp.MustCompile(`\[ModelPrice\] .*阶段=自动探测调度 .*结果=(已关闭|已开启)`)
+)
+
+const rateLogReadBudget int64 = 16 << 20
+
+// rateMaxOtherRecords 是「其他记录」最多列出的条数，避免同一结论重复刷屏。
+const rateMaxOtherRecords = 4
+
+func logLineTime(line string) int64 {
+	if len(line) < 19 {
+		return 0
+	}
+	if at, err := time.ParseInLocation("2006/01/02 15:04:05", line[:19], time.Local); err == nil {
+		return at.Unix()
+	}
+	return 0
+}
+
+func probeValue(verdict string) (string, bool, int) {
+	switch verdict {
+	case "free":
+		return "0.00x", false, ratePriorityProbeFree
+	case "paid":
+		return "收费(倍率未知)", true, ratePriorityProbePaid
+	default:
+		return "-", true, ratePriorityProbePaid
+	}
+}
+
+func parseRateLine(line, file string) (rateLogRecord, bool) {
+	// 先用三次子串判断挡掉绝大多数无关日志：脱敏正则和时间解析都很贵，
+	// 不能对每一行都做，否则大日志下接口会超过调用方超时。
+	if !strings.Contains(line, "[Models] 官方倍率") &&
+		!strings.Contains(line, "[ModelPrice]") &&
+		!strings.Contains(line, "[ModelCost]") {
+		return rateLogRecord{}, false
+	}
+	at := logLineTime(line)
+	if at == 0 {
+		return rateLogRecord{}, false
+	}
+	base := rateLogRecord{UpdatedAt: at, LogFile: file}
+	if m := rateOfficialRe.FindStringSubmatch(line); m != nil {
+		record := base
+		record.LogLine = redactSensitiveText(line)
+		record.Site, record.Model = m[1], m[2]
+		record.Source = "官方目录（" + m[9] + "）"
+		expired := m[8] == "true"
+		switch {
+		case m[5] != "true":
+			record.Value, record.Unknown, record.Priority = "-", true, ratePriorityOfficial
+			record.Detail = "官方目录未给出有效倍率，原始 credits=" + m[3]
+			record.Explain = "官方接口没有给出有效倍率"
+		case expired:
+			record.Value, record.Unknown, record.Priority = "-", true, ratePriorityPromoStale
+			record.Detail = "官方促销已过期，原始 credits=" + m[3] + "、促销=" + m[6] + "、截止=" + m[7] + "，该数值不可信"
+			record.Explain = "官方促销已于 " + m[7] + " 结束，接口仍返回 " + m[4] + "x，该数值不可信"
+		default:
+			record.Value, record.Priority = m[4]+"x", ratePriorityOfficial
+			record.Detail = "官方目录原始 credits=" + m[3]
+			record.Explain = "官方接口给出的目录倍率"
+			if m[6] != "" {
+				record.Detail += "、促销=" + m[6] + "、截止=" + m[7]
+				record.Explain = "官方促销 " + m[6] + " 折算后的倍率"
+			}
+		}
+		return record, true
+	}
+	if m := rateProbeCacheRe.FindStringSubmatch(line); m != nil {
+		record := base
+		record.LogLine = redactSensitiveText(line)
+		record.Site, record.Model = m[1], m[2]
+		record.Source = "价格探测（缓存结论）"
+		record.Value, record.Unknown, record.Priority = probeValue(m[3])
+		record.Detail = "判定=" + m[3] + " credit=" + m[4] + " tokens=" + m[5] + " 探测时间=" + m[6] + " " + m[7]
+		record.Explain = "上次真实探测结论：收费（尚未复测）"
+		if m[3] == "free" {
+			record.Explain = "上次真实探测结论：免费（尚未复测）"
+		}
+		return record, true
+	}
+	if m := rateProbeLiveRe.FindStringSubmatch(line); m != nil {
+		record := base
+		record.LogLine = redactSensitiveText(line)
+		record.Site, record.Model = m[1], m[3]
+		record.Source = "价格探测（本机实测）"
+		record.Value, record.Unknown, record.Priority = probeValue(m[4])
+		record.Detail = "账号=" + m[2] + " 判定=" + m[4] + " credit=" + m[5] + " tokens=" + m[6] + " " + m[7]
+		record.Explain = "网关发起真实请求实测：收费（官方未给出有效倍率）"
+		if m[4] == "free" {
+			record.Explain = "网关发起真实请求实测：免费"
+		}
+		return record, true
+	}
+	if m := rateLearnedRe.FindStringSubmatch(line); m != nil {
+		record := base
+		record.LogLine = redactSensitiveText(line)
+		record.Site, record.Model = m[2], m[3]
+		record.Source = "正常请求实测"
+		record.Detail = "账号=" + m[1] + " usage.credit=" + m[4] + " 判定=" + m[5]
+		if m[5] == "免费" {
+			record.Value, record.Priority = "0.00x", ratePriorityLearnedFree
+			record.Explain = "正常客户端请求返回 credit=0，判定免费"
+		} else {
+			record.Value, record.Priority = "实测收费", ratePriorityLearnedPaid
+			record.Explain = "正常客户端请求实测收费，仅作佐证，不改变上方官方倍率"
+		}
+		return record, true
+	}
+	return rateLogRecord{}, false
+}
+
+type rateLogScan struct {
+	Records          []rateLogRecord
+	AutoProbeEnabled bool
+	AutoProbeKnown   bool
+	Scanned          int64
+	Truncated        bool
+}
+
+// readRateEvents 从现有普通日志尾部解析倍率来源记录；不读调试日志、不改动任何文件。
+func readRateEvents() (rateLogScan, error) {
+	var scan rateLogScan
+	entries, err := os.ReadDir(logDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return scan, nil
+	}
+	if err != nil {
+		return scan, err
+	}
+	var names []string
+	for _, entry := range entries {
+		if entry.Type().IsRegular() && strings.HasPrefix(entry.Name(), "gateway-") && logFilePattern.MatchString(entry.Name()) {
+			names = append(names, entry.Name())
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	root, err := os.OpenRoot(logDir)
+	if err != nil {
+		return scan, err
+	}
+	defer root.Close()
+	for index, name := range names {
+		budget := rateLogReadBudget - scan.Scanned
+		if budget <= 0 {
+			scan.Truncated = true
+			break
+		}
+		f, err := root.Open(name)
+		if err != nil {
+			scan.Truncated = true
+			return scan, err
+		}
+		st, err := f.Stat()
+		if err != nil || !st.Mode().IsRegular() {
+			f.Close()
+			scan.Truncated = true
+			return scan, errors.New("倍率日志不是可读普通文件")
+		}
+		size := min(st.Size(), budget)
+		data := make([]byte, int(size))
+		start := st.Size() - size
+		count, readErr := f.ReadAt(data, start)
+		f.Close()
+		if readErr != nil && readErr != io.EOF {
+			scan.Truncated = true
+			return scan, readErr
+		}
+		if int64(count) != size {
+			scan.Truncated = true
+			return scan, errors.New("倍率日志读取期间被截断，请重试")
+		}
+		scan.Scanned += size
+		if start > 0 {
+			scan.Truncated = true
+			if end := bytes.IndexByte(data, '\n'); end >= 0 {
+				data = data[end+1:]
+			} else {
+				data = nil
+			}
+		}
+		for _, raw := range bytes.Split(data, []byte{'\n'}) {
+			if len(raw) == 0 {
+				continue
+			}
+			line := string(raw)
+			// 探测调度状态：用于告诉用户「未知」时怎么刷新，同样取自普通日志。
+			if !scan.AutoProbeKnown && strings.Contains(line, "阶段=自动探测调度") {
+				if m := rateProbeModeRe.FindStringSubmatch(line); m != nil {
+					scan.AutoProbeEnabled, scan.AutoProbeKnown = m[1] == "已开启", true
+				}
+			}
+			if record, ok := parseRateLine(line, name); ok {
+				scan.Records = append(scan.Records, record)
+			}
+		}
+		if scan.Scanned >= rateLogReadBudget && index < len(names)-1 {
+			scan.Truncated = true
+		}
+	}
+	return scan, nil
+}
+
+func aggregateRateDetails(records []rateLogRecord) map[string]map[string]any {
+	grouped := map[string][]rateLogRecord{}
+	for _, record := range records {
+		key := record.Site + "|" + normalizeModelName(record.Model)
+		grouped[key] = append(grouped[key], record)
+	}
+	out := make(map[string]map[string]any, len(grouped))
+	for key, list := range grouped {
+		sort.SliceStable(list, func(i, j int) bool { return list[i].UpdatedAt > list[j].UpdatedAt })
+		bestIndex := 0
+		for i, record := range list {
+			if i == 0 {
+				continue
+			}
+			if record.Priority < list[bestIndex].Priority ||
+				record.Priority == list[bestIndex].Priority && record.UpdatedAt > list[bestIndex].UpdatedAt {
+				bestIndex = i
+			}
+		}
+		best := list[bestIndex]
+		// 「其他记录」按来源+解释去重（多次重启会写出内容相同的记录），
+		// 并且只保留最新的若干条，避免把同一句话重复堆给用户。
+		others := make([]rateLogRecord, 0, len(list)-1)
+		seenOthers := map[string]bool{}
+		// 先把胜出记录的签名登记为已见，避免同一结论的旧记录又出现在「其他记录」里。
+		seenOthers[best.Source+"|"+best.Explain+"|"+best.Value] = true
+		for i, record := range list {
+			if i != bestIndex {
+				signature := record.Source + "|" + record.Explain + "|" + record.Value
+				if seenOthers[signature] {
+					continue
+				}
+				seenOthers[signature] = true
+				others = append(others, record)
+			}
+		}
+		if len(others) > rateMaxOtherRecords {
+			others = others[:rateMaxOtherRecords]
+		}
+		out[key] = map[string]any{
+			"site": best.Site, "model": best.Model, "source": best.Source,
+			"updatedAt": best.UpdatedAt, "value": best.Value, "detail": best.Detail,
+			"explain": best.Explain,
+			"unknown": best.Unknown, "priority": best.Priority,
+			"logFile": best.LogFile, "logLine": best.LogLine,
+			"hasLog": true, "records": list, "others": others,
+		}
+	}
+	return out
+}
+
+// 短暂缓存扫描结果：点击「感叹号」时按需拉取，避免每次点击都重扫日志。
+var rateDetailCache struct {
+	sync.Mutex
+	at      time.Time
+	payload map[string]any
+}
+
+const rateDetailCacheTTL = 20 * time.Second
+
+func handleWebUIRateDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "只读数据，仅支持 GET")
+		return
+	}
+	rateDetailCache.Lock()
+	if rateDetailCache.payload != nil && time.Since(rateDetailCache.at) < rateDetailCacheTTL {
+		payload := rateDetailCache.payload
+		rateDetailCache.Unlock()
+		log.Printf("[管理倍率来源] traceId=%s 结果=命中缓存 说明=仅读现有普通日志，不修改配置、不触发探测", debugTraceID(r))
+		writeAdminData(w, r, payload)
+		return
+	}
+	rateDetailCache.Unlock()
+	scan, err := readRateEvents()
+	if err != nil {
+		log.Printf("[管理倍率来源] traceId=%s 结果=读取失败 原因=%s 说明=页面显示没有日志，不伪造来源", debugTraceID(r), safeDebugError(err))
+		writeJSONError(w, http.StatusServiceUnavailable, "日志暂不可读，请稍后重试")
+		return
+	}
+	now := time.Now()
+	rates := aggregateRateDetails(scan.Records)
+	refreshHint := rateRefreshHint(scan.AutoProbeEnabled)
+	for _, entry := range rates {
+		if entry["unknown"] == true {
+			entry["refreshHint"] = refreshHint
+		}
+	}
+	payload := map[string]any{
+		"generatedAt": now.Unix(), "timezone": now.Format("MST -07:00"),
+		"rates": rates, "recordCount": len(scan.Records),
+		"readBytes": scan.Scanned, "readBudgetBytes": rateLogReadBudget, "truncated": scan.Truncated,
+		"autoProbeEnabled": scan.AutoProbeEnabled, "autoProbeKnown": scan.AutoProbeKnown,
+		"refreshHint": refreshHint,
+		"noLogHint":   "普通日志中没有该模型的记录。用该站点的账号请求一次这个模型，就会产生新的倍率记录。",
+		"source":      "gateway 普通日志",
+		"note":        "倍率来源与更新时间全部取自普通日志；日志中没有记录的模型显示「没有日志」。目录倍率在首次或变化时记录，探测与实测结论在产生时记录；原始日志默认折叠。",
+	}
+	rateDetailCache.Lock()
+	rateDetailCache.payload, rateDetailCache.at = payload, now
+	rateDetailCache.Unlock()
+	log.Printf("[管理倍率来源] traceId=%s 结果=读取成功 记录=%d 站点模型=%d 扫描字节=%d 截断=%t 自动探测已开启=%t 说明=仅读现有普通日志，不触发探测或目录刷新", debugTraceID(r), len(scan.Records), len(rates), scan.Scanned, scan.Truncated, scan.AutoProbeEnabled)
+	writeAdminData(w, r, payload)
+}
+
+// rateRefreshHint 说明「未知」时怎样让倍率更新；探测开关状态同样取自普通日志。
+func rateRefreshHint(autoProbeEnabled bool) string {
+	if autoProbeEnabled {
+		return "后台自动探测已开启，会在下一轮自动复测；也可以让该站点的账号请求一次这个模型，立即按 usage.credit 重新判定。"
+	}
+	return "后台自动探测已关闭。用该站点的账号请求一次这个模型，网关会按返回的 usage.credit 自动重新判定并写入日志。"
 }
 
 func handleWebUITasks(w http.ResponseWriter, r *http.Request) {

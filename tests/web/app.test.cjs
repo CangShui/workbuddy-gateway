@@ -23,7 +23,8 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
   function element(id) {
     if (!elements.has(id)) {
       const node = {innerHTML: "", textContent: "", className: "", value: "", checked: false, disabled: false,
-            querySelector() { return this; }, addEventListener() {}, focus() {}};
+            querySelector() { return this; }, querySelectorAll() { return []; },
+            addEventListener() {}, focus() {}};
       node.classList = {
         add(name) { node.className += " " + name; },
         remove(name) { node.className = node.className.split(/\s+/).filter(v => v !== name).join(" "); },
@@ -61,7 +62,8 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
     state, api, renderAccounts, renderModels, renderStatus, refreshActive,
     saveKey, saveAPISettings, initializeAdmin, discoverSetup,
     showConfigWarning, loadConfigEditor, saveConfigEditor, exitConfigEdit, setTab, lockDashboard,
-    initListFilters, changeListFilter, reportRestoredListFilters
+    initListFilters, changeListFilter, reportRestoredListFilters,
+    rateCell, rateKey, rateDetailHTML, ensureRateDetails, toggleRateDetail, restoreRateDetails
   };})();`);
   vm.createContext(context);
   vm.runInContext(source, context);
@@ -83,6 +85,21 @@ test("已知零值显示0，未知额度仍显示横线", () => {
   f.review.renderModels({models: [{id: "fixture-model"}]});
   assert.equal(cells(f.element("modelsTable").innerHTML)[4], "0");
   audit("零值展示通过", {unknown_quota_preserved: true});
+});
+
+test("企业不限量显示不限，已用保留小数；未知和有限额度不混淆", () => {
+  const f = fixture();
+  f.review.renderAccounts([{path: "enterprise.json", state: "active", quotaKnown: true,
+    quotaUnlimited: true, quotaTotal: -1, quotaUsed: 12.5, quotaRemaining: -1, planLabel: "企业版"}]);
+  let row = cells(f.element("accountsTable").innerHTML);
+  assert.equal(row[7], "不限");
+  assert.equal(row[8], "12.5");
+  assert.equal(row[9], "不限");
+  assert.equal(row[10], "企业版");
+  f.review.renderAccounts([{path: "enterprise.json", state: "active", quotaKnown: false, quotaUnlimited: true}]);
+  row = cells(f.element("accountsTable").innerHTML);
+  for (const i of [7, 8, 9]) assert.equal(row[i], "-");
+  audit("企业额度展示通过", {unlimited_distinct_from_unknown: true, fractional_used_preserved: true});
 });
 
 test("快照503保留上次内容，不生成零账号", async () => {
@@ -480,4 +497,170 @@ test("网页静态文案移除旧品牌，技术鉴权Header保持兼容", () =>
   const script = fs.readFileSync(path.join(projectRoot, "web", "app.js"), "utf8");
   assert.match(script, /X-Workbuddy-Admin/);
   audit("去品牌文案与协议兼容通过");
+});
+
+function rateFixture(payload) {
+  const calls = [];
+  const f = fixture(async (route, options) => {
+    calls.push({route, options});
+    if (route === "/admin/api/client-events") return response(204, {});
+    if (route === "/admin/api/rate-detail") return response(200, payload);
+    return response(200, {});
+  });
+  f.review.state.apiKey = "synthetic-admin-key";
+  return {...f, calls};
+}
+
+function fakeRateButton(site, model) {
+  const details = {open: false, handler: null,
+    addEventListener(type, fn) { if (type === "toggle") this.handler = fn; }};
+  const panel = {innerHTML: "", className: "rate-detail hidden",
+    querySelector(sel) { return sel === "details.rate-raw" ? details : null; },
+    classList: {add(n) { this.owner.className += " " + n; }, remove(n) {
+      this.owner.className = this.owner.className.split(/\s+/).filter(v => v !== n).join(" ");
+    }, owner: null}};
+  panel.classList.owner = panel;
+  const cell = {querySelector: sel => sel === ".rate-detail" ? panel : null};
+  const button = {
+    attrs: {"data-rate-site": site, "data-rate-model": model, "aria-expanded": "false"},
+    getAttribute(name) { return this.attrs[name] === undefined ? null : this.attrs[name]; },
+    setAttribute(name, value) { this.attrs[name] = value; },
+    closest(sel) { return sel === "td" ? cell : (sel === "button.rate-info" ? this : null); },
+  };
+  return {button, panel, details};
+}
+
+test("倍率单元格在数值后渲染感叹号按钮，模型名带引号也不会破坏属性", () => {
+  const f = rateFixture({rates: {}});
+  const html = f.review.rateCell("intl", "hy4-preview", "收费(倍率未知)");
+  assert.match(html, /class='rate-value'>收费\(倍率未知\)</);
+  assert.match(html, /class='rate-info'/);
+  assert.match(html, /data-rate-site='intl'/);
+  assert.match(html, /data-rate-model='hy4-preview'/);
+  assert.match(html, /aria-expanded='false'/);
+  assert.match(html, /class='rate-detail hidden'/);
+  assert.equal(f.review.rateKey("intl", "  HY4-Preview "), "intl|hy4-preview");
+  f.review.renderModels({models: [{id: "hy4-preview", cnMultiplier: "0.29x", intlMultiplier: "收费(倍率未知)"}]});
+  const table = f.element("modelsTable").innerHTML;
+  assert.equal((table.match(/class='rate-info'/g) || []).length, 2);
+  assert(table.includes("0.29x") && table.includes("收费(倍率未知)"));
+  audit("倍率感叹号渲染通过");
+});
+
+test("已知倍率用白话解释，未知额外给出如何刷新，原始日志默认折叠", () => {
+  const f = rateFixture({rates: {}});
+  const rawLine = "2026/10/13 10:59:36 [Models] 官方倍率 站点=cn 模型=hy3 生效倍率=0.29 说明=很长的一整行原始日志";
+  const known = f.review.rateDetailHTML({rates: {"cn|hy3": {
+    site: "cn", model: "hy3", source: "官方目录（实时接口）", updatedAt: 1791860376,
+    value: "0.29x", explain: "官方接口给出的目录倍率", unknown: false, hasLog: true,
+    records: [{source: "官方目录（实时接口）", updatedAt: 1791860376, value: "0.29x",
+      explain: "官方接口给出的目录倍率", logLine: rawLine}],
+  }}}, "cn", "hy3");
+  assert.match(known, /来源：官方目录（实时接口）/);
+  assert.match(known, /更新时间：/);
+  assert.match(known, /官方接口给出的目录倍率/);
+  assert(!known.includes("如何刷新"), "已知倍率不需要刷新指引");
+  assert.match(known, /原始日志（1 条，默认折叠）/);
+  const rawAt = known.indexOf("<code>");
+  const detailsAt = known.indexOf("<details");
+  const detailsEnd = known.indexOf("</details>");
+  assert(detailsAt >= 0 && rawAt > detailsAt && rawAt < detailsEnd, "原始日志必须放在折叠块里");
+  const unknown = f.review.rateDetailHTML({rates: {"intl|hy4-preview": {
+    site: "intl", model: "hy4-preview", source: "价格探测（缓存结论）", updatedAt: 1791860376,
+    value: "收费(倍率未知)", explain: "上次真实探测结论：收费（尚未复测）",
+    refreshHint: "后台自动探测已关闭。用该站点的账号请求一次这个模型，网关会按返回的 usage.credit 自动重新判定并写入日志。",
+    unknown: true, hasLog: true,
+    records: [{source: "价格探测（缓存结论）", updatedAt: 1791860376, value: "收费(倍率未知)",
+      explain: "上次真实探测结论：收费（尚未复测）", logLine: rawLine}],
+    others: [{source: "官方目录（实时接口）", updatedAt: 1791860370, explain: "官方促销已于 2026-09-08 结束，接口仍返回 0.00x，该数值不可信"}],
+  }}}, "intl", "hy4-preview");
+  assert(!unknown.includes("状态：未知"), "已实测过的结论不应标注为未知");
+  assert.match(unknown, /上次真实探测结论：收费（尚未复测）/);
+  assert.match(unknown, /如何刷新：/);
+  assert.match(unknown, /请求一次这个模型/);
+  assert.match(unknown, /其他记录/);
+  assert.match(unknown, /官方促销已于 2026-09-08 结束/);
+  const missing = f.review.rateDetailHTML({rates: {}, noLogHint: "普通日志中没有该模型的记录。用该站点的账号请求一次这个模型，就会产生新的倍率记录。"}, "intl", "not-logged-model");
+  assert.match(missing, /没有日志/);
+  assert.match(missing, /请求一次这个模型/);
+  assert(!missing.includes("来源："));
+  audit("倍率白话解释与刷新指引通过");
+});
+
+test("点击感叹号按需拉取日志详情并复用缓存，失败不伪造来源", async () => {
+  const payload = {rates: {"cn|hy3": {site: "cn", model: "hy3", source: "官方目录（实时接口）",
+    updatedAt: 1791860376, value: "0.29x", unknown: false, hasLog: true, records: []}}};
+  const f = rateFixture(payload);
+  const first = fakeRateButton("cn", "hy3");
+  f.review.toggleRateDetail({target: first.button});
+  assert.equal(first.button.getAttribute("aria-expanded"), "true");
+  assert.equal(f.review.state.openRateKeys["cn|hy3"], true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(first.panel.innerHTML, /来源：官方目录/);
+  assert.equal(f.calls.filter(c => c.route === "/admin/api/rate-detail").length, 1);
+  // 第二次展开同一页面的另一个倍率不应重复请求日志。
+  const second = fakeRateButton("intl", "hy4-preview");
+  f.review.toggleRateDetail({target: second.button});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.calls.filter(c => c.route === "/admin/api/rate-detail").length, 1);
+  assert.match(second.panel.innerHTML, /没有日志/);
+  // 再次点击折叠，并清除展开状态。
+  f.review.toggleRateDetail({target: first.button});
+  assert.equal(first.button.getAttribute("aria-expanded"), "false");
+  assert.equal(f.review.state.openRateKeys["cn|hy3"], undefined);
+  assert.equal(first.panel.innerHTML, "");
+  audit("倍率详情按需拉取与缓存通过", {rate_detail_requests: 1});
+});
+
+test("轮询重建表格后，已展开的倍率详情自动恢复", async () => {
+  const payload = {rates: {"cn|hy3": {site: "cn", model: "hy3", source: "官方目录（实时接口）",
+    updatedAt: 1791860376, value: "0.29x", unknown: false, hasLog: true, records: []}}};
+  const f = rateFixture(payload);
+  f.review.state.openRateKeys["cn|hy3"] = true;
+  f.review.ensureRateDetails();
+  await new Promise(resolve => setImmediate(resolve));
+  const buttons = [];
+  const table = {querySelectorAll: () => buttons};
+  const cell = {querySelector: sel => sel === ".rate-detail" ? panel : null};
+  const panel = {innerHTML: "", className: "rate-detail hidden",
+    querySelector: () => null,
+    classList: {add(n) { this.owner.className += " " + n; }, remove(n) {
+      this.owner.className = this.owner.className.split(/\s+/).filter(v => v !== n).join(" ");
+    }, owner: null}};
+  panel.classList.owner = panel;
+  const button = {
+    attrs: {"data-rate-site": "cn", "data-rate-model": "hy3", "aria-expanded": "false"},
+    getAttribute(name) { return this.attrs[name]; },
+    setAttribute(name, value) { this.attrs[name] = value; },
+    closest(sel) { return sel === "td" ? cell : null; },
+  };
+  buttons.push(button);
+  f.review.restoreRateDetails(table);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(button.getAttribute("aria-expanded"), "true");
+  assert.match(panel.innerHTML, /来源：官方目录/);
+  audit("轮询后详情恢复通过");
+});
+
+test("展开原始日志后，轮询刷新不会把它自动折叠", async () => {
+  const rawLine = "2026/10/13 15:28:00 [Models] 官方倍率 站点=cn 模型=hy3 生效倍率=0.29";
+  const payload = {rates: {"cn|hy3": {site: "cn", model: "hy3", source: "官方目录（实时接口）",
+    updatedAt: 1791860376, value: "0.29x", explain: "官方接口给出的目录倍率", unknown: false, hasLog: true,
+    records: [{source: "官方目录（实时接口）", updatedAt: 1791860376, value: "0.29x",
+      explain: "官方接口给出的目录倍率", logLine: rawLine}]}}};
+  const f = rateFixture(payload);
+  const {button, details} = fakeRateButton("cn", "hy3");
+  f.review.toggleRateDetail({target: button});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(typeof details.handler, "function", "渲染后必须绑定 toggle 监听");
+  details.open = true;
+  details.handler();
+  assert.equal(f.review.state.openRawLogs["cn|hy3"], true);
+  // 轮询会重建整张表格，重建后的 HTML 必须保持展开。
+  assert.match(f.review.rateDetailHTML(payload, "cn", "hy3"), /<details class='rate-raw' open>/);
+  details.open = false;
+  details.handler();
+  assert.equal(f.review.state.openRawLogs["cn|hy3"], undefined);
+  assert(!/<details class='rate-raw' open>/.test(f.review.rateDetailHTML(payload, "cn", "hy3")));
+  audit("原始日志展开状态在轮询后保持通过");
 });

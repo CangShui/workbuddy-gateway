@@ -153,6 +153,35 @@ main { padding: 16px 20px 40px; }
 .kv-v { font-weight: 500; text-align: right; }
 
 .table-wrap { overflow-x: auto; }
+.rate-cell { white-space: normal; min-width: 130px; }
+.rate-line { display: flex; align-items: center; gap: 6px; }
+.rate-value { white-space: nowrap; }
+.rate-info {
+  flex: none; width: 18px; height: 18px; padding: 0; line-height: 1; font-size: 11px; font-weight: 700;
+  border-radius: 50%; color: var(--text-muted); background: var(--surface-muted); border: 1px solid var(--border);
+}
+.rate-info:hover, .rate-info:focus-visible { color: var(--brand); border-color: var(--brand); outline: none; }
+.rate-info[aria-expanded="true"] { color: var(--surface); background: var(--brand); border-color: var(--brand); }
+.rate-detail {
+  margin-top: 8px; padding: 10px 12px; border-left: 2px solid var(--brand); background: var(--surface-muted);
+  border-radius: 6px; white-space: normal; overflow-wrap: anywhere; font-size: 12px; line-height: 1.6;
+  min-width: 240px;
+}
+.rate-meta { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; color: var(--text); }
+.rate-explain { margin: 0 0 6px; }
+.rate-refresh { margin: 6px 0 0; padding: 8px 10px; border-radius: 6px; background: var(--brand-soft); }
+.rate-refresh strong { color: var(--brand); }
+.rate-none { margin: 0 0 6px; font-weight: 600; color: var(--warn); }
+.rate-logs-title { margin-top: 6px; font-weight: 600; color: var(--text-muted); }
+.rate-others ul, .rate-raw ul { margin: 4px 0 0; padding-left: 16px; }
+.rate-others li + li { margin-top: 4px; }
+.rate-raw { margin-top: 8px; }
+.rate-raw summary { cursor: pointer; color: var(--text-muted); }
+.rate-raw li + li { margin-top: 6px; }
+.rate-raw code {
+  display: block; margin-top: 2px; padding: 6px 8px; border-radius: 6px; background: var(--surface);
+  border: 1px solid var(--border); font-family: var(--mono); font-size: 11px; white-space: pre-wrap;
+}
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 th { color: var(--text-muted); font-weight: 500; background: var(--surface-muted); position: sticky; top: 0; }

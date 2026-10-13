@@ -221,6 +221,7 @@ func handleWebUIClientEvent(w http.ResponseWriter, r *http.Request) {
 		"/admin/api/credential-edit": true, "/admin/api/log-settings": true, "/admin/api/log-cleanup": true,
 		"/admin/api/tasks":       true,
 		"/admin/api/config-edit": true,
+		"/admin/api/rate-detail": true,
 	}
 	if !allowed[input.Event] || !routes[input.Route] || input.Status < 0 || input.Status > 599 {
 		writeJSONError(w, http.StatusBadRequest, "不接受未定义的前端审计事件")

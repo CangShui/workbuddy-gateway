@@ -29,7 +29,12 @@
     configVersion: 0,
     configPreviewVersion: 0,
     configRevision: "",
-    configOriginal: ""
+    configOriginal: "",
+    rateDetails: null,
+    rateDetailsAt: 0,
+    rateDetailsPending: null,
+    openRateKeys: {},
+    openRawLogs: {}
   };
 
   function $(id) { return document.getElementById(id); }
@@ -106,6 +111,11 @@
     $("dashboard").classList.add("hidden");
     state.lastStatus = null;
     state.lastModels = null;
+    state.rateDetails = null;
+    state.rateDetailsAt = 0;
+    state.rateDetailsPending = null;
+    state.openRateKeys = {};
+    state.openRawLogs = {};
     ["meta", "summaryCards", "siteSummary", "gatewayInfo", "logBox", "configBox", "tasksInfo"].forEach(function (id) {
       $(id).textContent = "";
     });
@@ -320,9 +330,9 @@
         "<td>" + esc(site) + "</td>" +
         "<td><span class='badge " + cls + "'>" + esc(st) + "</span></td>" +
         "<td>" + esc(fmtTime(a.tokenExpiresAt)) + "</td>" +
-        "<td>" + esc(a.quotaKnown ? count(a.quotaTotal) : "-") + "</td>" +
-        "<td>" + esc(a.quotaKnown ? count(a.quotaUsed) : "-") + "</td>" +
-        "<td>" + esc(a.quotaKnown ? count(a.quotaRemaining) : "-") + "</td>" +
+        "<td>" + esc(quotaAmount(a, "total")) + "</td>" +
+        "<td>" + esc(quotaAmount(a, "used")) + "</td>" +
+        "<td>" + esc(quotaAmount(a, "remaining")) + "</td>" +
         "<td>" + esc((a.planLabel || "-") + (a.planStale ? "（待刷新）" : "")) + "</td>" +
         "<td>" + esc(count(a.freeModels)) + "</td>" +
         "<td>" + esc(count(a.modelCooldowns)) + "</td>" +
@@ -332,6 +342,13 @@
         "</tr>";
     }).join("");
     restorePolicyFocus(tb, focusTarget);
+  }
+
+  function quotaAmount(account, kind) {
+    if (!account.quotaKnown) return "-";
+    if (account.quotaUnlimited && (kind === "total" || kind === "remaining")) return "不限";
+    var value = kind === "total" ? account.quotaTotal : (kind === "used" ? account.quotaUsed : account.quotaRemaining);
+    return count(value);
   }
 
   // ---- 渲染：模型 --------------------------------------------------------
@@ -403,8 +420,8 @@
       return "<tr>" +
         "<td>" + policySwitch("model", m.id, m.enabled !== false, m.policyReason) + "</td>" +
         "<td class='mono'>" + esc(m.id) + "</td>" +
-        "<td>" + esc(m.cnMultiplier || "-") + "</td>" +
-        "<td>" + esc(m.intlMultiplier || "-") + "</td>" +
+        rateCell("cn", m.id, m.cnMultiplier) +
+        rateCell("intl", m.id, m.intlMultiplier) +
         "<td>" + esc(count(m.availableAccounts)) + "</td>" +
         "<td>" + esc(count(m.requests)) + "</td>" +
         "<td>" + esc(fmtMs(m.avgTtftMs, m.hasTtft)) + "</td>" +
@@ -414,7 +431,125 @@
         "</tr>";
     }).join("");
     restorePolicyFocus(tb, focusTarget);
+    restoreRateDetails(tb);
     if (data.stale) showAlert("模型统计快照过旧，当前展示的是上次数据。");
+  }
+
+  // ---- 倍率来源：全部取自普通日志，没有记录就显示「没有日志」 -------------------
+  function rateKey(site, model) {
+    return site + "|" + String(model || "").trim().toLowerCase();
+  }
+
+  function rateCell(site, model, text) {
+    var label = site === "cn" ? "国内" : "国际";
+    return "<td class='rate-cell'><div class='rate-line'><span class='rate-value'>" + esc(text || "-") +
+      "</span><button type='button' class='rate-info' data-rate-site='" + esc(site) +
+      "' data-rate-model='" + esc(model) + "' aria-expanded='false' aria-label='查看" + label +
+      "倍率数据来源与更新时间'>!</button></div>" +
+      "<div class='rate-detail hidden' role='region' aria-label='" + label + "倍率来源详情'></div></td>";
+  }
+
+  function ensureRateDetails() {
+    if (state.rateDetails && Date.now() - state.rateDetailsAt < 60000) return Promise.resolve(state.rateDetails);
+    if (state.rateDetailsPending) return state.rateDetailsPending;
+    state.rateDetailsPending = api("/admin/api/rate-detail").then(function (data) {
+      state.rateDetails = data;
+      state.rateDetailsAt = Date.now();
+      state.rateDetailsPending = null;
+      return data;
+    }).catch(function (err) {
+      state.rateDetailsPending = null;
+      throw err;
+    });
+    return state.rateDetailsPending;
+  }
+
+  function rateDetailHTML(payload, site, model) {
+    var info = payload && payload.rates ? payload.rates[rateKey(site, model)] : null;
+    if (!info || !info.hasLog) {
+      return "<p class='rate-none'>没有日志</p><p class='hint'>" +
+        esc(payload && payload.noLogHint || "普通日志中没有该模型的倍率记录。") + "</p>";
+    }
+    // 不再标注「状态：未知」：该结论是实测过的，写「未知」会让人误以为从未检测。
+    var meta = "<div class='rate-meta'><span>来源：" + esc(info.source) + "</span>" +
+      "<span>更新时间：" + esc(fmtTime(info.updatedAt)) + "</span></div>";
+    var html = meta;
+    if (info.explain) html += "<p class='rate-explain'>" + esc(info.explain) + "</p>";
+    if (info.unknown && info.refreshHint) {
+      html += "<p class='rate-refresh'><strong>如何刷新：</strong>" + esc(info.refreshHint) + "</p>";
+    }
+    var others = info.others || [];
+    if (others.length) {
+      html += "<div class='rate-others'><div class='rate-logs-title'>其他记录</div><ul>" +
+        others.map(function (record) {
+          return "<li>" + esc(record.source) + " · " + esc(fmtTime(record.updatedAt)) + " · " +
+            esc(record.explain || record.value || "") + "</li>";
+        }).join("") + "</ul></div>";
+    }
+    var raw = (info.records || []).filter(function (record) { return record.logLine; });
+    if (raw.length) {
+      // 轮询会重建表格，展开状态必须自己记住，否则每次刷新都会被自动折叠。
+      var rawOpen = state.openRawLogs[rateKey(site, model)] === true;
+      html += "<details class='rate-raw'" + (rawOpen ? " open" : "") +
+        "><summary>原始日志（" + raw.length + " 条，默认折叠）</summary><ul>" +
+        raw.map(function (record) { return "<li><code>" + esc(record.logLine) + "</code></li>"; }).join("") +
+        "</ul></details>";
+    }
+    return html;
+  }
+
+  function fillRateDetail(button, panel) {
+    var site = button.getAttribute("data-rate-site");
+    var model = button.getAttribute("data-rate-model");
+    panel.classList.remove("hidden");
+    button.setAttribute("aria-expanded", "true");
+    panel.innerHTML = "<p class='hint'>读取日志中…</p>";
+    ensureRateDetails().then(function (payload) {
+      panel.innerHTML = rateDetailHTML(payload, site, model);
+      // details 的 toggle 事件不冒泡，只能在渲染后逐个绑定，用于记住展开状态。
+      var details = panel.querySelector("details.rate-raw");
+      if (details) {
+        details.addEventListener("toggle", function () {
+          var key = rateKey(site, model);
+          if (details.open) {
+            state.openRawLogs[key] = true;
+          } else {
+            delete state.openRawLogs[key];
+          }
+        });
+      }
+    }).catch(function () {
+      panel.innerHTML = "<p class='hint'>日志读取失败，请稍后重试；没有数据时不猜测来源。</p>";
+    });
+  }
+
+  function toggleRateDetail(event) {
+    var button = event.target.closest("button.rate-info");
+    if (!button) return;
+    var cell = button.closest("td");
+    var panel = cell ? cell.querySelector(".rate-detail") : null;
+    if (!panel) return;
+    var key = rateKey(button.getAttribute("data-rate-site"), button.getAttribute("data-rate-model"));
+    if (button.getAttribute("aria-expanded") === "true") {
+      button.setAttribute("aria-expanded", "false");
+      panel.classList.add("hidden");
+      panel.innerHTML = "";
+      delete state.openRateKeys[key];
+      return;
+    }
+    state.openRateKeys[key] = true;
+    fillRateDetail(button, panel);
+  }
+
+  // 轮询会重建表格，已展开的详情按 key 恢复，避免每次刷新都折叠。
+  function restoreRateDetails(table) {
+    Array.prototype.forEach.call(table.querySelectorAll("button.rate-info"), function (button) {
+      var key = rateKey(button.getAttribute("data-rate-site"), button.getAttribute("data-rate-model"));
+      if (!state.openRateKeys[key]) return;
+      var cell = button.closest("td");
+      var panel = cell ? cell.querySelector(".rate-detail") : null;
+      if (panel) fillRateDetail(button, panel);
+    });
   }
 
   // ---- 渲染：日志 --------------------------------------------------------
@@ -889,6 +1024,7 @@
     });
     $("accountsTable").addEventListener("click", togglePolicy);
     $("modelsTable").addEventListener("click", togglePolicy);
+    $("modelsTable").addEventListener("click", toggleRateDetail);
     $("logFile").addEventListener("change", function () { loadLogs(false); });
     $("logLines").addEventListener("change", function () { loadLogs(false); });
 

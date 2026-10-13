@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -63,6 +64,14 @@ func TestPolicyBrowserFixture(t *testing.T) {
 		logScheduledTask(fixture.id, "completed", fixture.status, newTraceID(), now.Add(-time.Minute), fixture.next, fixture.detail)
 	}
 	logScheduledTask("price_probe", "disabled", "disabled", newTraceID(), time.Time{}, time.Time{}, "合成测试：自动探测关闭")
+	// 合成倍率来源日志：用于验证「感叹号」在有日志/未知/无日志三种情况下的展示。
+	log.Printf("[Models] 官方倍率 站点=cn 模型=hy3 原始credits=\"x0.29\" 生效倍率=0.29 有倍率=true 促销=\"\" 促销截止=\"\" 促销已过期=false 来源=实时接口 刷新时间=%s",
+		now.Format("2006-01-02T15:04:05"))
+	log.Printf("[Models] 官方倍率 站点=intl 模型=deepseek-v4.1-flash 原始credits=\"x0.00\" 生效倍率=0.00 有倍率=true 促销=\"Free now\" 促销截止=\"2026-09-08T00:00:00+08:00\" 促销已过期=true 来源=实时接口 刷新时间=%s",
+		now.Format("2006-01-02T15:04:05"))
+	log.Printf("[ModelPrice] 载入缓存结论 站点=intl 模型=deepseek-v4.1-flash 判定=paid credit=0.05 tokens=385 探测时间=2026-10-02T00:23:40 说明=usage.credit>0 收费 来源=缓存文件（非本轮新探测）")
+	log.Printf("[ModelPrice] traceId=%s 阶段=自动探测调度 allowPriceProbes=false legacyDisablePriceProbes=true 结果=已关闭 原因=兼容旧参数-disable-price-probes=true 业务影响=不会自动请求模型", newTraceID())
+	log.Printf("[ModelCost] requestId=3472 账号 workbuddy-cn-a.json 站点=cn 模型 hy3 实测 usage.credit=0.29，已学习为收费模型")
 	listener, err := net.Listen("tcp", "127.0.0.1:18316")
 	if err != nil {
 		t.Fatal(err)
