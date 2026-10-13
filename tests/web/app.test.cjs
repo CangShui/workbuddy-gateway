@@ -4,17 +4,22 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const {randomUUID} = require("node:crypto");
 
-const logPath = path.join(__dirname, "..", "logs", "webui-frontend-tests-dev-" + new Date().toISOString().slice(0, 10) + ".jsonl");
+const projectRoot = path.resolve(__dirname, "../..");
+const testDate = new Date().toLocaleDateString("sv-SE", {timeZone: "Asia/Shanghai"});
+const testTrace = "webui-tests-" + randomUUID();
+const logPath = path.join(projectRoot, "logs", "webui-frontend-tests-dev-" + testDate + ".jsonl");
 function audit(event, fields = {}) {
   fs.mkdirSync(path.dirname(logPath), {recursive: true});
-  fs.appendFileSync(logPath, JSON.stringify({traceId: "webui-config-tests-20261007", event, ...fields}) + "\n");
+  fs.appendFileSync(logPath, JSON.stringify({traceId: testTrace, event, ...fields}) + "\n");
 }
 function response(status, body) {
   return {status, ok: status >= 200 && status < 300, json: async () => body};
 }
-function fixture(fetchImpl = async () => response(200, {})) {
+function fixture(fetchImpl = async () => response(200, {}), cookies = new Map()) {
   const elements = new Map(), session = new Map(), local = new Map(), alerts = [];
+  const cookieWrites = [];
   function element(id) {
     if (!elements.has(id)) {
       const node = {innerHTML: "", textContent: "", className: "", value: "", checked: false, disabled: false,
@@ -22,7 +27,12 @@ function fixture(fetchImpl = async () => response(200, {})) {
       node.classList = {
         add(name) { node.className += " " + name; },
         remove(name) { node.className = node.className.split(/\s+/).filter(v => v !== name).join(" "); },
-        toggle() {},
+        toggle(name, force) {
+          const present = node.className.split(/\s+/).includes(name);
+          const enabled = force === undefined ? !present : force;
+          if (enabled && !present) this.add(name);
+          if (!enabled && present) this.remove(name);
+        },
         contains(name) { return node.className.split(/\s+/).includes(name); },
       };
       elements.set(id, node);
@@ -33,18 +43,30 @@ function fixture(fetchImpl = async () => response(200, {})) {
   const context = {
     document: {readyState: "loading", addEventListener() {}, getElementById: element, querySelectorAll: () => []},
     sessionStorage: storage(session), localStorage: storage(local),
-    window: {alert: message => alerts.push(message), confirm: () => true, addEventListener() {}, location: {reload() {}}},
+    window: {alert: message => alerts.push(message), confirm: () => true, addEventListener() {}, location: {protocol: "http:", reload() {}}},
     TextEncoder, fetch: fetchImpl, setInterval: () => 1,
   };
-  let source = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  Object.defineProperty(context.document, "cookie", {
+    configurable: true,
+    get() { return [...cookies].map(([name, value]) => name + "=" + value).join("; "); },
+    set(value) {
+      cookieWrites.push(value);
+      const pair = value.split(";")[0];
+      const at = pair.indexOf("=");
+      cookies.set(pair.slice(0, at), pair.slice(at + 1));
+    },
+  });
+  let source = fs.readFileSync(path.join(projectRoot, "web", "app.js"), "utf8");
   source = source.replace(/\}\)\(\);\s*$/, `globalThis.review = {
     state, api, renderAccounts, renderModels, renderStatus, refreshActive,
     saveKey, saveAPISettings, initializeAdmin, discoverSetup,
-    showConfigWarning, loadConfigEditor, saveConfigEditor, exitConfigEdit, setTab, lockDashboard
+    showConfigWarning, loadConfigEditor, saveConfigEditor, exitConfigEdit, setTab, lockDashboard,
+    initListFilters, changeListFilter, reportRestoredListFilters
   };})();`);
   vm.createContext(context);
   vm.runInContext(source, context);
-  return {review: context.review, element, session, local, alerts, window: context.window};
+  return {review: context.review, element, session, local, alerts, window: context.window,
+    document: context.document, cookies, cookieWrites};
 }
 function cells(html) {
   return [...html.matchAll(/<td(?: [^>]*)?>(.*?)<\/td>/g)].map(m => m[1]);
@@ -296,4 +318,166 @@ test("清空管理Key需要额外确认，取消不发起保存", async () => {
   assert.equal(f.calls.filter(c => c.route === "/admin/api/config-edit" && c.options.method === "POST").length, 0);
   assert.equal(f.element("configEditor").value, "{}");
   audit("管理Key清空额外确认通过");
+});
+
+test("账号池筛选只保留可用且已开启调度的账号，取消后恢复全部", () => {
+  const f = fixture();
+  f.review.initListFilters();
+  const accounts = [
+    {path: "active.json", state: "active", schedulingEnabled: true},
+    {path: "paused.json", state: "active", schedulingEnabled: false},
+    {path: "cooldown.json", state: "cooldown", schedulingEnabled: true},
+    {path: "expired.json", state: "expired"},
+    {path: "disabled.json", state: "disabled"},
+    {path: "exhausted.json", state: "paid_exhausted"},
+  ];
+  f.review.renderStatus({gateway: {}, accounts});
+  assert(f.element("accountsTable").innerHTML.includes("paused.json"));
+  f.element("onlyUsableAccounts").checked = true;
+  f.review.changeListFilter("accounts");
+  let html = f.element("accountsTable").innerHTML;
+  assert(html.includes("active.json"));
+  for (const name of ["paused", "cooldown", "expired", "disabled", "exhausted"]) assert(!html.includes(name + ".json"));
+  assert.equal(f.review.state.lastStatus.accounts.length, 6);
+  f.element("onlyUsableAccounts").checked = false;
+  f.review.changeListFilter("accounts");
+  assert(f.element("accountsTable").innerHTML.includes("paused.json"));
+  assert.equal(accounts.length, 6);
+  audit("账号筛选通过", {snapshot_mutated: false});
+});
+
+test("模型筛选要求已启用且有可用账号，空结果解释筛选条件", () => {
+  const f = fixture();
+  f.review.initListFilters();
+  const data = {models: [
+    {id: "available", enabled: true, availableAccounts: 2},
+    {id: "no-accounts", enabled: true, availableAccounts: 0},
+    {id: "disabled-model", enabled: false, availableAccounts: 2},
+  ]};
+  f.review.renderModels(data);
+  f.element("onlyUsable").checked = true;
+  f.review.changeListFilter("models");
+  assert(f.element("modelsTable").innerHTML.includes("available"));
+  assert(!f.element("modelsTable").innerHTML.includes("no-accounts"));
+  assert(!f.element("modelsTable").innerHTML.includes("disabled-model"));
+  f.review.renderModels({models: [{id: "unavailable", availableAccounts: 0}]});
+  assert.match(f.element("modelsTable").innerHTML, /取消勾选可查看全部模型/);
+  f.review.renderAccounts([{path: "paused.json", state: "active", schedulingEnabled: false}]);
+  f.element("onlyUsableAccounts").checked = true;
+  f.review.renderAccounts([{path: "paused.json", state: "active", schedulingEnabled: false}]);
+  assert.match(f.element("accountsTable").innerHTML, /取消勾选可查看全部账号/);
+  audit("模型筛选与空结果通过");
+});
+
+test("两个Cookie分别记住状态，刷新及重新登录不丢失，无凭据入Cookie", async () => {
+  const jar = new Map();
+  const f = fixture(async () => response(204, {}), jar);
+  f.review.initListFilters();
+  f.review.state.apiKey = "synthetic-private-admin-key";
+  f.element("onlyUsableAccounts").checked = true;
+  f.review.changeListFilter("accounts");
+  f.element("onlyUsable").checked = false;
+  f.review.changeListFilter("models");
+  assert.equal(jar.get("gateway_accounts_only_usable"), "1");
+  assert.equal(jar.get("gateway_models_only_usable"), "0");
+  assert.equal(jar.size, 2);
+  for (const value of f.cookieWrites) {
+    assert.match(value, /Path=\/ui; Max-Age=31536000; SameSite=Lax/);
+    assert(!value.includes("synthetic-private-admin-key"));
+  }
+  f.review.lockDashboard();
+  assert.equal(jar.get("gateway_accounts_only_usable"), "1");
+  const reloaded = fixture(undefined, jar);
+  reloaded.review.initListFilters();
+  assert.equal(reloaded.element("onlyUsableAccounts").checked, true);
+  assert.equal(reloaded.element("onlyUsable").checked, false);
+  reloaded.element("onlyUsable").checked = true;
+  reloaded.review.changeListFilter("models");
+  reloaded.element("onlyUsableAccounts").checked = false;
+  reloaded.review.changeListFilter("accounts");
+  const secondReload = fixture(undefined, jar);
+  secondReload.review.initListFilters();
+  assert.equal(secondReload.element("onlyUsableAccounts").checked, false);
+  assert.equal(secondReload.element("onlyUsable").checked, true);
+  assert.equal(secondReload.local.size, 0);
+  audit("Cookie独立记忆与刷新恢复通过", {secret_cookie: false, saved_to_localStorage: false});
+});
+
+test("缺失或非法Cookie默认显示全部，HTTPS添加Secure属性", () => {
+  const f = fixture(undefined, new Map([
+    ["gateway_accounts_only_usable", "true"],
+    ["gateway_models_only_usable", "invalid"],
+  ]));
+  f.review.initListFilters();
+  assert.equal(f.element("onlyUsableAccounts").checked, false);
+  assert.equal(f.element("onlyUsable").checked, false);
+  f.window.location.protocol = "https:";
+  f.element("onlyUsable").checked = true;
+  f.review.changeListFilter("models");
+  assert.match(f.cookieWrites[0], /; Secure$/);
+  audit("非法Cookie回落与HTTPS属性通过");
+});
+
+test("Cookie被禁用仍立即筛选，并提示刷新无法记住；审计沿用同一TraceID", () => {
+  const calls = [];
+  const f = fixture(async (route, options) => {
+    calls.push({route, options});
+    return response(204, {});
+  });
+  Object.defineProperty(f.document, "cookie", {
+    get() { throw new Error("cookie blocked"); },
+    set() { throw new Error("cookie blocked"); },
+  });
+  f.review.initListFilters();
+  f.review.state.apiKey = "synthetic-private-admin-key";
+  f.review.renderStatus({gateway: {}, accounts: [
+    {path: "available.json", state: "active"},
+    {path: "paused.json", state: "active", schedulingEnabled: false},
+  ]});
+  f.element("onlyUsableAccounts").checked = true;
+  f.review.changeListFilter("accounts");
+  assert(!f.element("accountsTable").innerHTML.includes("paused.json"));
+  assert.match(f.element("accountFilterStatus").textContent, /浏览器未允许保存 Cookie/);
+  assert(!f.element("accountFilterStatus").classList.contains("hidden"));
+  assert.equal(calls.length, 2);
+  const records = calls.map(c => JSON.parse(c.options.body));
+  assert.deepEqual(records.map(r => r.event), ["list_filter_changed", "list_filter_cookie_failed"]);
+  assert(records.every(r => r.enabled === true && r.route === "/admin/api/status"));
+  assert.equal(calls[0].options.headers["X-Trace-ID"], calls[1].options.headers["X-Trace-ID"]);
+  assert(calls.every(c => !c.options.body.includes("synthetic-private-admin-key")));
+  audit("Cookie禁用回落与审计通过");
+});
+
+test("请求进行中切换筛选也会按最新勾选状态渲染，不额外获取数据", async () => {
+  let release;
+  const calls = [];
+  const f = fixture((route, options) => {
+    calls.push({route, options});
+    if (route === "/admin/api/client-events") return Promise.resolve(response(204, {}));
+    return new Promise(resolve => { release = resolve; });
+  });
+  f.review.initListFilters();
+  f.review.state.apiKey = "synthetic-admin-key";
+  f.review.state.activeTab = "models";
+  const pending = f.review.refreshActive();
+  f.element("onlyUsable").checked = true;
+  f.review.changeListFilter("models");
+  release(response(200, {models: [{id: "available", availableAccounts: 2}, {id: "empty", availableAccounts: 0}]}));
+  await pending;
+  assert(f.element("modelsTable").innerHTML.includes("available"));
+  assert(!f.element("modelsTable").innerHTML.includes("empty"));
+  assert.equal(calls.filter(c => c.route === "/admin/api/models").length, 1);
+  audit("在途请求按最新筛选渲染通过", {additional_data_requests: 0});
+});
+
+test("网页静态文案移除旧品牌，技术鉴权Header保持兼容", () => {
+  const html = fs.readFileSync(path.join(projectRoot, "web", "index.html"), "utf8");
+  assert(!/workbuddy/i.test(html));
+  assert.match(html, /<title>本地网关 · 网页控制台<\/title>/);
+  assert.match(html, /id="onlyUsableAccounts"/);
+  assert.match(html, /只显示可用账号/);
+  assert.match(html, /只显示可用模型/);
+  const script = fs.readFileSync(path.join(projectRoot, "web", "app.js"), "utf8");
+  assert.match(script, /X-Workbuddy-Admin/);
+  audit("去品牌文案与协议兼容通过");
 });

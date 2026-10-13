@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,77 @@ import (
 	"testing"
 	"time"
 )
+
+func TestListFilterAuditIsAuthenticatedBooleanOnlyAndDoesNotChangePolicies(t *testing.T) {
+	isolateAdminFeatures(t)
+	handler := newWebUIHandler()
+	before, err := os.ReadFile(runtimeConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []string{"list_filter_changed", "list_filter_restored", "list_filter_cookie_failed"} {
+		for _, route := range []string{"/admin/api/status", "/admin/api/models"} {
+			for _, enabled := range []bool{false, true} {
+				raw, _ := json.Marshal(map[string]any{"event": event, "route": route, "status": 0, "enabled": enabled})
+				w := adminRequest(handler, "POST", "/admin/api/client-events", "feature-admin-key", string(raw))
+				if w.Code != http.StatusNoContent {
+					t.Fatalf("valid list filter event rejected: event=%s route=%s code=%d", event, route, w.Code)
+				}
+			}
+		}
+	}
+	for _, body := range []string{
+		`{"event":"list_filter_changed","route":"/admin/api/status","status":0}`,
+		`{"event":"list_filter_changed","route":"/admin/api/status","status":0,"enabled":"true"}`,
+		`{"event":"list_filter_changed","route":"/admin/api/config-edit","status":0,"enabled":true}`,
+		`{"event":"request_completed","route":"/admin/api/status","status":200,"enabled":true}`,
+		`{"event":"list_filter_changed","route":"/admin/api/models","status":0,"enabled":true,"cookie":"private"}`,
+	} {
+		w := adminRequest(handler, "POST", "/admin/api/client-events", "feature-admin-key", body)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("unsafe list filter event accepted: HTTP=%d", w.Code)
+		}
+	}
+	body := `{"event":"list_filter_changed","route":"/admin/api/models","status":0,"enabled":true}`
+	for _, key := range []string{"", "feature-api-key"} {
+		if w := adminRequest(handler, "POST", "/admin/api/client-events", key, body); w.Code != http.StatusUnauthorized {
+			t.Fatal("filter audit endpoint bypassed management authentication")
+		}
+	}
+	// Cookie 不是登录凭据，甚至不能代替 Authorization 管理请求头。
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/status", nil)
+	req.Header.Set("Cookie", "gateway_accounts_only_usable=1; gateway_models_only_usable=1")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatal("display preference Cookie bypassed management authentication")
+	}
+	after, err := os.ReadFile(runtimeConfigFile)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("display preference audit changed production policies")
+	}
+	logData, err := os.ReadFile(filepath.Join(logDir, "gateway-"+time.Now().Format("2006-01-02")+".log"))
+	if err != nil || !bytes.Contains(logData, []byte("[管理前端筛选]")) ||
+		!bytes.Contains(logData, []byte("只显示可用=true")) || !bytes.Contains(logData, []byte("只显示可用=false")) {
+		t.Fatal("display preference changes were not logged")
+	}
+}
+
+func TestWebUIBrandNeutralLabelsAndBothListFilters(t *testing.T) {
+	html, err := webFS.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(string(html)), "workbuddy") {
+		t.Fatal("web console static copy still contains the old brand")
+	}
+	for _, text := range []string{"<title>本地网关 · 网页控制台</title>", `id="onlyUsableAccounts"`, `id="onlyUsable"`,
+		"只显示可用账号", "只显示可用模型"} {
+		if !bytes.Contains(html, []byte(text)) {
+			t.Errorf("web console missing list control or neutral copy: %s", text)
+		}
+	}
+}
 
 // setWebUI 临时启用/关闭管理台并在用例结束后还原，避免污染其他测试。
 func setWebUI(t *testing.T, enabled bool, apiKey string) {

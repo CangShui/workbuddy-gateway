@@ -3,11 +3,18 @@
 
   var KEY_STORAGE = "wb_gateway_admin_key";
   var POLL_MS = 3000;
+  var LIST_FILTERS = [
+    {kind: "accounts", id: "onlyUsableAccounts", cookie: "gateway_accounts_only_usable",
+      route: "/admin/api/status", statusID: "accountFilterStatus"},
+    {kind: "models", id: "onlyUsable", cookie: "gateway_models_only_usable",
+      route: "/admin/api/models", statusID: "modelFilterStatus"}
+  ];
 
   var state = {
     apiKey: sessionStorage.getItem(KEY_STORAGE) || "",
     activeTab: "overview",
     lastStatus: null,
+    lastModels: null,
     timer: null,
     refreshPending: false,
     settings: null,
@@ -80,13 +87,15 @@
     return "web-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
   }
 
-  function reportUIEvent(event, path, status, trace) {
+  function reportUIEvent(event, path, status, trace, enabled) {
     if (!state.apiKey || path === "/admin/api/setup") return;
+    var record = {event: event, route: path.split("?")[0], status: status};
+    if (typeof enabled === "boolean") record.enabled = enabled;
     fetch("/admin/api/client-events", {
       method: "POST",
       headers: {"Authorization": "Bearer " + state.apiKey, "Content-Type": "application/json",
         "X-Workbuddy-Admin": "1", "X-Trace-ID": trace},
-      body: JSON.stringify({event: event, route: path.split("?")[0], status: status})
+      body: JSON.stringify(record)
     }).catch(function () { /* 原请求失败仍由服务端审计记录，不递归发送失败事件。 */ });
   }
 
@@ -96,6 +105,7 @@
     $("tabs").classList.add("hidden");
     $("dashboard").classList.add("hidden");
     state.lastStatus = null;
+    state.lastModels = null;
     ["meta", "summaryCards", "siteSummary", "gatewayInfo", "logBox", "configBox", "tasksInfo"].forEach(function (id) {
       $(id).textContent = "";
     });
@@ -225,11 +235,73 @@
     quota_exhausted: "warn", expired: "warn", disabled: "danger"
   };
 
+  // Cookie 仅保存两个显示偏好，不包含管理 Key、凭据、配置或账号信息。
+  function readListFilterCookie(name) {
+    try {
+      var cookies = String(document.cookie || "").split(";");
+      for (var i = 0; i < cookies.length; i++) {
+        var pair = cookies[i].trim();
+        if (pair.indexOf(name + "=") !== 0) continue;
+        var value = pair.slice(name.length + 1);
+        return value === "1" ? true : value === "0" ? false : null;
+      }
+    } catch (_) { /* Cookie 被禁用时回落到显示全部，不影响管理登录。 */ }
+    return null;
+  }
+
+  function writeListFilterCookie(name, enabled) {
+    try {
+      document.cookie = name + "=" + (enabled ? "1" : "0") +
+        "; Path=/ui; Max-Age=31536000; SameSite=Lax" +
+        (window.location.protocol === "https:" ? "; Secure" : "");
+      return readListFilterCookie(name) === enabled;
+    } catch (_) { return false; }
+  }
+
+  function initListFilters() {
+    LIST_FILTERS.forEach(function (filter) {
+      $(filter.id).checked = readListFilterCookie(filter.cookie) === true;
+      $(filter.id).addEventListener("change", function () { changeListFilter(filter.kind); });
+    });
+  }
+
+  function reportRestoredListFilters() {
+    LIST_FILTERS.forEach(function (filter) {
+      reportUIEvent("list_filter_restored", filter.route, 0, traceID(), $(filter.id).checked);
+    });
+  }
+
+  function changeListFilter(kind) {
+    var filter = LIST_FILTERS.find(function (item) { return item.kind === kind; });
+    if (!filter) return;
+    var trace = traceID();
+    var enabled = $(filter.id).checked;
+    var remembered = writeListFilterCookie(filter.cookie, enabled);
+    var hint = $(filter.statusID);
+    hint.textContent = remembered ? "" : "本次筛选已应用，但浏览器未允许保存 Cookie，刷新后可能无法记住状态。";
+    hint.classList.toggle("hidden", remembered);
+    reportUIEvent("list_filter_changed", filter.route, 0, trace, enabled);
+    if (!remembered) reportUIEvent("list_filter_cookie_failed", filter.route, 0, trace, enabled);
+    // 筛选立即作用于已加载的数据；刷新中的响应也按当前勾选状态渲染。
+    if (kind === "accounts") {
+      if (state.lastStatus) renderAccounts(state.lastStatus.accounts || []);
+    } else if (state.lastModels) {
+      renderModels(state.lastModels);
+    }
+  }
+
   function renderAccounts(list) {
+    var onlyUsable = $("onlyUsableAccounts").checked;
+    if (onlyUsable) {
+      list = list.filter(function (account) {
+        return account.state === "active" && account.schedulingEnabled !== false;
+      });
+    }
     var tb = $("accountsTable").querySelector("tbody");
     var focusTarget = focusedPolicyTarget(tb);
     if (!list.length) {
-      tb.innerHTML = '<tr><td colspan="16" class="empty">暂无账号数据（服务是否已写入状态快照？）</td></tr>';
+      tb.innerHTML = '<tr><td colspan="16" class="empty">' +
+        (onlyUsable ? "没有符合条件的可用账号，取消勾选可查看全部账号。" : "暂无账号数据（服务是否已写入状态快照？）") + '</td></tr>';
       return;
     }
     tb.innerHTML = list.map(function (a, i) {
@@ -311,18 +383,20 @@
   }
 
   function renderModels(data) {
+    state.lastModels = data;
     var list = data.models || [];
     var onlyUsable = $("onlyUsable").checked;
     if (onlyUsable) {
-      list = list.filter(function (m) { return (m.availableAccounts || 0) > 0; });
+      list = list.filter(function (m) { return m.enabled !== false && (m.availableAccounts || 0) > 0; });
     }
     var tb = $("modelsTable").querySelector("tbody");
     var focusTarget = focusedPolicyTarget(tb);
     $("modelPolicyHint").textContent = data.policyMode === "allowlist" ?
       "当前使用模型白名单，开关反映白名单规则。首次修改开关会删除 models.allowlist，将当前模型列表的启停状态转为 models.blocklist；以后新增模型默认开启。" :
-      "模型开关写入 models.blocklist 并立即生效；停用模型仍保留在此列表，客户端模型目录会隐藏停用项。";
+      "模型开关写入 models.blocklist 并立即生效；停用模型保留统计记录，取消筛选可查看全部模型，客户端模型目录会隐藏停用项。";
     if (!list.length) {
-      tb.innerHTML = '<tr><td colspan="10" class="empty">暂无模型数据</td></tr>';
+      tb.innerHTML = '<tr><td colspan="10" class="empty">' +
+        (onlyUsable ? "没有符合条件的可用模型，取消勾选可查看全部模型。" : "暂无模型数据") + '</td></tr>';
       return;
     }
     tb.innerHTML = list.map(function (m) {
@@ -714,6 +788,7 @@
     setConn("校验中…", "");
     return api("/admin/api/settings").then(function (data) {
       sessionStorage.setItem(KEY_STORAGE, key);
+      reportRestoredListFilters();
       renderSettings(data);
       $("tabs").classList.remove("hidden");
       $("dashboard").classList.remove("hidden");
@@ -778,6 +853,7 @@
   function init() {
     // 清理旧版同源页面遗留的模型 API Key，不把它误当成管理 Key。
     localStorage.removeItem("wb_gateway_api_key");
+    initListFilters();
     $("apiKey").value = state.apiKey;
     initTheme();
     $("saveKey").addEventListener("click", saveKey);
@@ -811,7 +887,6 @@
     Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (t) {
       t.addEventListener("click", function () { setTab(t.getAttribute("data-tab")); });
     });
-    $("onlyUsable").addEventListener("change", refreshActive);
     $("accountsTable").addEventListener("click", togglePolicy);
     $("modelsTable").addEventListener("click", togglePolicy);
     $("logFile").addEventListener("change", function () { loadLogs(false); });

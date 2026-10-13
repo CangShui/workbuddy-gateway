@@ -3,14 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>WorkBuddy 本地网关 · 网页控制台</title>
+<title>本地网关 · 网页控制台</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header class="topbar">
   <div class="brand">
     <span class="dot"></span>
-    <h1>WorkBuddy 本地网关</h1>
+    <h1>本地网关</h1>
     <span class="tag">网页控制台</span>
   </div>
   <div class="topbar-right">
@@ -62,8 +62,14 @@
 
   <section id="panel-accounts" class="panel">
     <div class="card">
-      <div class="card-title">账号池</div>
+      <div class="card-title">
+        账号池
+        <span class="filter">
+          <label title="只显示状态为可用且全局调度开启的账号"><input type="checkbox" id="onlyUsableAccounts"> 只显示可用账号</label>
+        </span>
+      </div>
       <p class="hint">调度开关写入 models.accounts.all.blocklist 并立即生效。已有全局白名单时，首次操作会删除 all.allowlist，将当前账号池启停状态转为黑名单；之后新增账号默认开启。停用不删除凭据、不清除账本、不打断已有请求，开启后仍受模型专属规则限制。</p>
+      <p id="accountFilterStatus" class="hint hidden" role="status"></p>
       <div class="table-wrap">
         <table id="accountsTable">
           <thead>
@@ -85,10 +91,11 @@
       <div class="card-title">
         模型列表
         <span class="filter">
-          <label><input type="checkbox" id="onlyUsable"> 仅显示可用账号 &gt; 0</label>
+          <label title="只显示已启用且可用账号数大于 0 的模型"><input type="checkbox" id="onlyUsable"> 只显示可用模型</label>
         </span>
       </div>
       <p class="hint" id="modelPolicyHint">模型开关写入 models.blocklist 并立即生效；停用模型仍保留在此列表，客户端模型目录会隐藏停用项。</p>
+      <p id="modelFilterStatus" class="hint hidden" role="status"></p>
       <div class="table-wrap">
         <table id="modelsTable">
           <thead>

@@ -3,9 +3,12 @@
     构建脚本回归测试：使用模拟 Go 命令验证目标矩阵、失败处理、环境恢复与清理边界。
 .DESCRIPTION
     此测试不替代真实交叉编译。文件仅写入项目 .codex-tmp/ 与 logs/，不清理用户目录。
+    从 tests/build/ 推导项目根目录，允许从任意工作目录调用。
+.EXAMPLE
+    .\tests\build\build_script.test.ps1
 #>
 $ErrorActionPreference = 'Stop'
-$projectRoot = $PSScriptRoot
+$projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $testRoot = Join-Path $projectRoot ('.codex-tmp/build-script-tests-' + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($testRoot) | Out-Null
 $scriptPath = Join-Path $projectRoot 'build.ps1'

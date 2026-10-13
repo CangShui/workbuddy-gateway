@@ -138,6 +138,9 @@ main { padding: 16px 20px 40px; }
   display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
 }
 .filter { font-size: 12px; font-weight: 400; color: var(--text-muted); display: flex; align-items: center; gap: 10px; }
+.filter label { display: inline-flex; align-items: center; gap: 6px; min-height: 24px; cursor: pointer; }
+.filter input[type="checkbox"] { margin: 0; }
+@media (max-width: 600px), (pointer: coarse) { .filter label { min-height: 44px; } }
 .filter select {
   padding: 4px 8px; border: 1px solid var(--border); border-radius: 8px;
   background: var(--surface-muted); color: var(--text); font: inherit; font-size: 12px;

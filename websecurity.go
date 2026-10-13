@@ -202,16 +202,18 @@ func handleWebUIClientEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Event  string `json:"event"`
-		Route  string `json:"route"`
-		Status int    `json:"status"`
+		Event   string `json:"event"`
+		Route   string `json:"route"`
+		Status  int    `json:"status"`
+		Enabled *bool  `json:"enabled,omitempty"`
 	}
 	if err := decodeAdminJSON(w, r, &input); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "无效的前端审计事件")
 		return
 	}
 	allowed := map[string]bool{"request_completed": true, "request_failed": true, "settings_validation_failed": true, "credential_validation_failed": true, "log_validation_failed": true,
-		"config_edit_warning": true, "config_edit_acknowledged": true, "config_edit_cancelled": true, "config_validation_failed": true}
+		"config_edit_warning": true, "config_edit_acknowledged": true, "config_edit_cancelled": true, "config_validation_failed": true,
+		"list_filter_changed": true, "list_filter_restored": true, "list_filter_cookie_failed": true}
 	routes := map[string]bool{
 		"/admin/api/status": true, "/admin/api/models": true, "/admin/api/logs": true,
 		"/admin/api/config": true, "/admin/api/credentials": true, "/admin/api/settings": true,
@@ -222,6 +224,19 @@ func handleWebUIClientEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	if !allowed[input.Event] || !routes[input.Route] || input.Status < 0 || input.Status > 599 {
 		writeJSONError(w, http.StatusBadRequest, "不接受未定义的前端审计事件")
+		return
+	}
+	filterEvent := strings.HasPrefix(input.Event, "list_filter_")
+	if filterEvent && (input.Enabled == nil || input.Route != "/admin/api/status" && input.Route != "/admin/api/models") ||
+		!filterEvent && input.Enabled != nil {
+		log.Printf("[管理前端] traceId=%s 阶段=筛选偏好校验 结果=拒绝 状态码=400 说明=只接受账号或模型列表的布尔筛选状态，不接受任意内容", debugTraceID(r))
+		writeJSONError(w, http.StatusBadRequest, "筛选审计必须提供对应列表的布尔状态")
+		return
+	}
+	if filterEvent {
+		log.Printf("[管理前端筛选] traceId=%s 事件=%s 列表=%s 只显示可用=%t 状态码=%d 说明=仅改变网页显示偏好，不修改配置、调度规则或历史统计，不记录Cookie正文和Key",
+			debugTraceID(r), input.Event, input.Route, *input.Enabled, input.Status)
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	log.Printf("[管理前端] traceId=%s 事件=%s 接口=%s 状态码=%d 说明=前端请求或参数校验结果已落盘，不含Key与业务正文",
