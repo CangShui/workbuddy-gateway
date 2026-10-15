@@ -23,7 +23,7 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
   function element(id) {
     if (!elements.has(id)) {
       const node = {innerHTML: "", textContent: "", className: "", value: "", checked: false, disabled: false,
-            querySelector() { return this; }, querySelectorAll() { return []; },
+            style: {}, querySelector() { return this; }, querySelectorAll() { return []; },
             addEventListener() {}, focus() {}};
       node.classList = {
         add(name) { node.className += " " + name; },
@@ -60,10 +60,12 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
   let source = fs.readFileSync(path.join(projectRoot, "web", "app.js"), "utf8");
   source = source.replace(/\}\)\(\);\s*$/, `globalThis.review = {
     state, api, renderAccounts, renderModels, renderStatus, refreshActive,
+    renderPoolHealth, renderAccountAlerts, loadAccountAlerts, lockDashboard,
     saveKey, saveAPISettings, initializeAdmin, discoverSetup,
     showConfigWarning, loadConfigEditor, saveConfigEditor, exitConfigEdit, setTab, lockDashboard,
     initListFilters, changeListFilter, reportRestoredListFilters,
     rateCell, rateKey, rateDetailHTML, ensureRateDetails, toggleRateDetail, restoreRateDetails
+    , renderStats, loadStats, changeStatsFilter, statsLineChart, statsDuration, statsNumber, statsCredit
   };})();`);
   vm.createContext(context);
   vm.runInContext(source, context);
@@ -73,6 +75,65 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
 function cells(html) {
   return [...html.matchAll(/<td(?: [^>]*)?>(.*?)<\/td>/g)].map(m => m[1]);
 }
+
+test("运行状态只展示健康度，无账号和过旧快照不能显示100%", () => {
+  const f = fixture();
+  f.review.renderPoolHealth({health: {percent: 100, state: "healthy"}});
+  assert.equal(f.element("poolHealth").textContent, "100%");
+  assert.equal(f.element("poolHealthBar").style.width, "100%");
+  f.review.renderPoolHealth({health: {percent: 66.6, state: "degraded"}});
+  assert.equal(f.element("poolHealth").textContent, "66.6%");
+  assert.match(f.element("poolHealthStatus").textContent, /部分受限/);
+  f.review.renderPoolHealth({health: {percent: null, state: "empty"}});
+  assert.equal(f.element("poolHealth").textContent, "—");
+  assert.match(f.element("poolHealthStatus").textContent, /未加载账号/);
+  f.review.renderPoolHealth({stale: true, health: {percent: 100, state: "healthy"}});
+  assert.equal(f.element("poolHealth").textContent, "—");
+  assert.equal(f.element("poolHealthBar").style.width, "0%");
+  const html = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
+  assert(!html.includes('id="summaryCards"'));
+  assert(!html.includes('id="siteSummary"'));
+  assert(html.includes('id="accountsTable"'), "账号池详细状态不能删掉");
+  audit("账号池健康度通过", {unknown_not_100: true, count_cards_removed: true});
+});
+
+test("账号日志告警分级、脱敏文本转义、已恢复记录剔除和登录退出清理", () => {
+  const f = fixture();
+  const alerts = [
+    {account: "expired.json", state: "expired", severity: "important", label: "账号过期", message: "请检查续期", at: 1791980000, logFile: "gateway-2026-10-14.log"},
+    {account: "dead<script>.json", state: "disabled", severity: "urgent", label: "账号失效", message: '<img src=x onerror="alert(1)">', at: 1791980001, logFile: "gateway.log"},
+    {account: "paused.json", state: "paused", severity: "notice", label: "账号停用", message: "主动停用", at: 1791980002, logFile: "gateway.log"}
+  ];
+  f.review.state.lastStatus = {accounts: [
+    {path: "expired.json", state: "active"},
+    {path: "dead<script>.json", state: "disabled"},
+    {path: "paused.json", state: "active", schedulingEnabled: false}
+  ]};
+  f.review.renderAccountAlerts({alerts, source: "gateway 普通日志"});
+  const html = f.element("accountAlerts").innerHTML;
+  assert(!html.includes("expired.json"), "恢复后不能继续展示过期告警");
+  assert(html.includes("alert-urgent") && html.includes("紧急"));
+  assert(html.includes("alert-notice") && html.includes("提示"));
+  assert(html.includes("&lt;script&gt;") && !html.includes("<img"));
+  f.review.renderAccountAlerts({alerts: [], missingLogCount: 1, scanTruncated: true});
+  assert.match(f.element("accountAlerts").innerHTML, /暂未找到对应日志/);
+  assert.match(f.element("accountAlertsInfo").textContent, /读取上限/);
+  f.review.lockDashboard();
+  assert.equal(f.review.state.lastAccountAlerts, null);
+  assert(!f.element("accountAlerts").innerHTML.includes("dead"));
+  audit("账号告警展示通过", {recovered_removed: true, escaped: true, logout_cleared: true});
+});
+
+test("告警日志加载失败保留旧结果，不假报无异常", async () => {
+  const f = fixture(async route => route === "/admin/api/client-events" ? response(204, {}) : response(503, {error: "日志不可读"}));
+  f.review.state.apiKey = "synthetic-admin";
+  f.element("accountAlerts").innerHTML = "原有告警";
+  await f.review.loadAccountAlerts();
+  assert.equal(f.element("accountAlerts").innerHTML, "原有告警");
+  assert.match(f.element("accountAlertsInfo").textContent, /不代表账号池没有异常/);
+  assert.equal(f.review.state.accountAlertsPending, false);
+  audit("告警加载失败保留结果通过");
+});
 
 test("已知零值显示0，未知额度仍显示横线", () => {
   const f = fixture();
@@ -663,4 +724,162 @@ test("展开原始日志后，轮询刷新不会把它自动折叠", async () =>
   assert.equal(f.review.state.openRawLogs["cn|hy3"], undefined);
   assert(!/<details class='rate-raw' open>/.test(f.review.rateDetailHTML(payload, "cn", "hy3")));
   audit("原始日志展开状态在轮询后保持通过");
+});
+
+// ---- 总览 · 用量与性能 ------------------------------------------------------
+
+function statsBucket(label, over = {}) {
+  return Object.assign({start: 0, label, requests: 0, success: 0, failed: 0, tokens: 0, inputTokens: 0,
+    outputTokens: 0, cachedTokens: 0, tokenSamples: 0, credits: 0, creditSamples: 0, ttftSamples: 0,
+    avgLatencyMs: null, avgTtftMs: null}, over);
+}
+
+function statsPayload(over = {}) {
+  return Object.assign({
+    period: "day", account: "", timezone: "Asia/Shanghai", ttftMetric: "first_token_v2", start: "2026-09-15", end: "2026-10-14",
+    startedAt: 1760000000000, accounts: [{id: "acc-a", file: "workbuddy-a.json", edition: "cn"}],
+    summary: {requests: 2, success: 1, failed: 1, tokens: 300, inputTokens: 200, outputTokens: 100,
+      cachedTokens: 50, tokenSamples: 1, credits: 1.25, creditSamples: 1, ttftSamples: 1,
+      avgLatencyMs: 1200, avgTtftMs: 300},
+    buckets: [statsBucket("2026-10-13", {requests: 1, success: 1, tokens: 300, inputTokens: 200,
+      outputTokens: 100, cachedTokens: 50, tokenSamples: 1, credits: 1.25, creditSamples: 1,
+      ttftSamples: 1, avgLatencyMs: 1200, avgTtftMs: 300}), statsBucket("2026-10-14")],
+    models: [
+      {model: "deepseek-v4.1-flash", requests: 3, success: 3, failed: 0, tokens: 900000,
+        inputTokens: 700000, outputTokens: 200000, cachedTokens: 100000, tokenSamples: 3,
+        credits: 4.5, creditSamples: 3, ttftSamples: 3, avgLatencyMs: 1500, avgTtftMs: 400},
+      {model: "hy3", requests: 1, success: 1, failed: 0, tokens: 0, inputTokens: 0, outputTokens: 0,
+        cachedTokens: 0, tokenSamples: 0, credits: 0, creditSamples: 0, ttftSamples: 1,
+        avgLatencyMs: 800, avgTtftMs: 300},
+    ],
+    modelLatency: [
+      {model: "deepseek-v4.1-flash", avgLatencyMs: [1500, null]},
+      {model: "hy3", avgLatencyMs: [null, 800]},
+    ],
+    storage: {mode: "file", message: "", lastSavedAt: 1760000000000},
+  }, over);
+}
+
+test("TTFT新旧口径隔离：旧快照不伪装成首Token，明确显示排除数", () => {
+  const f=fixture();
+  const old=statsPayload({ttftMetric: undefined});
+  old.summary.avgTtftMs=87190;
+  f.review.renderStats(old);
+  assert(!f.element("usageSummary").innerHTML.includes("87.19"));
+  assert.match(f.element("usageSummary").innerHTML,/平均首Token/);
+  assert.match(f.element("latencyLegend").innerHTML, /deepseek-v4\.1-flash/);
+  assert(!f.element("latencyChart").innerHTML.includes("平均首Token"));
+  const current=statsPayload();
+  current.summary.legacyTtftSamples=12;
+  f.review.renderStats(current);
+  assert.match(f.element("statsInfo").textContent,/排除 12 条/);
+  assert.match(f.element("statsInfo").textContent,/不等同于 dsh 当前会话/);
+  assert.match(f.element("usageSummary").innerHTML,/0\.30 s/);
+  f.review.renderModels({models:[{id:"legacy",avgTtftMs:87190,hasTtft:true}]});
+  assert(!f.element("modelsTable").innerHTML.includes("87.19"));
+  audit("首Token新旧样本隔离通过",{legacy_samples_excluded:true});
+});
+
+test("统计摘要区分未知与零值，并显示落盘状态", () => {
+  const f = fixture();
+  f.review.renderStats(statsPayload());
+  const cards = f.element("usageSummary").innerHTML;
+  assert.match(cards, /总消耗 Token/);
+  assert.match(cards, /1\.25/, "积分必须按实际 usage.credit 展示");
+  assert.match(cards, /1\/2 请求有积分/, "必须暴露积分样本覆盖数");
+  assert.equal(f.element("statsStorage").textContent, "stats.json · 已落盘");
+  // 无样本时显示未知，而不是 0。
+  f.review.renderStats(statsPayload({summary: {requests: 1, success: 1, failed: 0, tokenSamples: 0,
+    creditSamples: 0, ttftSamples: 0, avgLatencyMs: 900, avgTtftMs: null}}));
+  const unknown = f.element("usageSummary").innerHTML;
+  assert.match(unknown, /总消耗 Token<\/div><div class="usage-value">—</, "无 Token 样本不得显示为 0");
+  assert.match(unknown, /总消耗积分<\/div><div class="usage-value">—</, "无积分样本不得显示为 0");
+  // 仅内存模式必须给出明确提示，避免被当成已持久化。
+  f.review.renderStats(statsPayload({storage: {mode: "memory", message: "统计暂时无法写入，仍在内存统计"}}));
+  assert.equal(f.element("statsStorage").textContent, "仅内存 · 未落盘");
+  assert.match(f.element("statsStorage").className, /warn/);
+  assert.match(f.element("statsInfo").textContent, /统计暂时无法写入/);
+  audit("统计摘要与落盘状态展示通过", {unknown_not_zero: true, memory_mode_flagged: true});
+});
+
+test("耗时折线在缺失样本处断开，不伪造零值", () => {
+  const f = fixture();
+  const svg = f.review.statsLineChart([
+    statsBucket("2026-10-12", {avgLatencyMs: 1000, avgTtftMs: 200}),
+    statsBucket("2026-10-13"),
+    statsBucket("2026-10-14", {avgLatencyMs: 2000, avgTtftMs: 400}),
+  ], [
+    {label: "平均总耗时", color: "token", value: b => b.avgLatencyMs},
+    {label: "平均首字", color: "first", value: b => b.avgTtftMs},
+  ], "耗时", v => String(v));
+  assert.match(svg, /<svg /);
+  // 中间桶无样本 ⇒ 每序列各断开成两段，共 4 条折线路径。
+  assert.equal((svg.match(/class="chart-line series-token"/g) || []).length, 2);
+  assert.equal((svg.match(/class="chart-line series-first"/g) || []).length, 2);
+  assert.equal((svg.match(/class="chart-line/g) || []).length, 4, "缺失样本处必须断线");
+  assert.equal(f.review.statsLineChart([statsBucket("2026-10-14")], [
+    {label: "平均总耗时", color: "token", value: b => b.avgLatencyMs},
+  ], "耗时", String), '<p class="stats-empty">该时间范围暂无可用样本</p>', "全空必须显示空状态");
+  audit("耗时折线断点与空状态通过", {no_fake_zero: true, path_segments: 4});
+});
+
+test("请求耗时按模型分线，不把所有模型画成一条平均线", () => {
+  const f = fixture();
+  f.review.renderStats(statsPayload());
+  const svg = f.element("latencyChart").innerHTML;
+  const legend = f.element("latencyLegend").innerHTML;
+  assert(legend.indexOf("deepseek-v4.1-flash") < legend.indexOf("hy3"), "图例保持服务端顺序");
+  assert.equal((svg.match(/class="chart-line series-m0"/g) || []).length, 1);
+  assert.equal((svg.match(/class="chart-line series-m1"/g) || []).length, 1);
+  assert.equal((svg.match(/class="chart-line /g) || []).length, 2, "每个模型一条线");
+  assert.match(svg, /deepseek-v4\.1-flash 1\.50 s/);
+  assert.match(svg, /hy3 0\.80 s/);
+  assert(!svg.includes("series-token"), "不能再画所有模型合成的平均线");
+  f.review.renderStats(statsPayload({modelLatency: []}));
+  assert.match(f.element("latencyChart").innerHTML, /该时间范围暂无可用样本/);
+  assert.equal(f.element("latencyLegend").textContent, "");
+  audit("分模型耗时折线通过", {models: 2, blended_line: false});
+});
+
+test("模型用量排名按服务端顺序渲染，并跟随账号选择", () => {
+  const f = fixture();
+  f.review.renderStats(statsPayload({account: "acc-a"}));
+  const rows = f.element("statsTable").querySelector("tbody").innerHTML;
+  assert.match(rows, /deepseek-v4\.1-flash/);
+  assert.match(rows, /hy3/);
+  // 服务端已按用量排序，前端必须保持该顺序、不得重排。
+  assert(rows.indexOf("deepseek-v4.1-flash") < rows.indexOf("hy3"), "用量多的模型必须排在前");
+  assert.match(rows, /<td>1<\/td><td class='mono'>deepseek/, "必须显示排名序号");
+  assert.match(rows, /Token 0\/1/, "无 usage 的模型仍要列出并标出覆盖数");
+  assert(!/<td>\d{4}-\d{2}-\d{2}<\/td>/.test(rows), "明细不应再输出时间列");
+  const select = f.element("statsAccount").innerHTML;
+  assert.match(select, /全局 · 全部账号/);
+  assert.match(select, /workbuddy-a\.json · 国内/);
+  assert.equal(f.element("statsAccount").value, "acc-a", "必须保持当前选择");
+  assert.equal(f.element("statsStart").value, "2026-09-15");
+  assert.equal(f.element("statsEnd").value, "2026-10-14");
+  // 空范围给出明确空态，而不是空表。放在最后，避免重置上面的选择断言。
+  f.review.renderStats(statsPayload({models: []}));
+  assert.match(f.element("statsTable").querySelector("tbody").innerHTML, /没有模型调用记录/);
+  audit("模型用量排名渲染通过", {server_order_kept: true, no_time_column: true, empty_state: true});
+});
+
+// 回归：统计请求变慢或挂起时，状态轮询必须照常完成，不能被统计拖住。
+test("统计加载不阻塞状态轮询", async () => {
+  let releaseStatus;
+  const routes = [];
+  const f = fixture((route, options) => {
+    routes.push(route);
+    if (route === "/admin/api/client-events") return Promise.resolve(response(204, {}));
+    if (route.startsWith("/admin/api/stats")) return new Promise(() => {}); // 永不返回
+    return new Promise(resolve => { releaseStatus = resolve; });
+  });
+  f.review.state.apiKey = "synthetic-admin-key";
+  f.review.state.activeTab = "overview";
+  const pending = f.review.refreshActive();
+  releaseStatus(response(200, {gateway: {}, accounts: [], summary: {total: 0}}));
+  await pending;
+  assert.equal(f.review.state.refreshPending, false, "统计未返回不得让轮询一直处于 pending");
+  assert(routes.some(r => r.startsWith("/admin/api/stats")), "总览页应触发一次统计请求");
+  audit("统计不阻塞轮询通过", {stats_pending_isolated: true});
 });

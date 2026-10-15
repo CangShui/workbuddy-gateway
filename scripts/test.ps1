@@ -23,7 +23,7 @@ $logDirectory = Join-Path $root 'logs'
 [IO.Directory]::CreateDirectory($logDirectory) | Out-Null
 $auditPath = Join-Path $logDirectory ("test-runner-{0}.jsonl" -f (Get-Date -Format 'yyyy-MM-dd'))
 $environmentNames = @('GOOS', 'GOARCH', 'CGO_ENABLED', 'GOARM', 'GOAMD64', 'GO386', 'GOARM64',
-    'WORKBUDDY_BROWSER_FIXTURE', 'WORKBUDDY_BROWSER_DURATION')
+    'WORKBUDDY_BROWSER_FIXTURE', 'WORKBUDDY_HEALTH_BROWSER_FIXTURE', 'WORKBUDDY_BROWSER_DURATION')
 $previousEnvironment = @{}
 foreach ($name in $environmentNames) {
     $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')

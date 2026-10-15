@@ -71,6 +71,8 @@ func registerWebUIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/log-cleanup", handleWebUILogCleanup)
 	mux.HandleFunc("/admin/api/tasks", handleWebUITasks)
 	mux.HandleFunc("/admin/api/rate-detail", handleWebUIRateDetail)
+	mux.HandleFunc("/admin/api/stats", handleWebUIStats)
+	mux.HandleFunc("/admin/api/account-alerts", handleWebUIAccountAlerts)
 }
 
 // 只读日志视图：无额外调度器、任务状态文件或内存任务登记表。
@@ -715,6 +717,7 @@ type webStatusResponse struct {
 	Accounts    []accountSnapshot         `json:"accounts"`
 	Models      []modelStatSnapshot       `json:"models"`
 	Stale       bool                      `json:"stale"`
+	Health      accountHealth             `json:"health"`
 }
 
 // readStatusSnapshot 读取 serve 周期写入的状态快照（与 monitor 命令同一数据源）。
@@ -809,6 +812,7 @@ func handleWebUIStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Summary = summarizeAccounts(resp.Accounts)
 	resp.SiteSummary = summarizeAccountsBySite(resp.Accounts)
+	resp.Health = summarizeAccountHealth(resp.Accounts, resp.Stale)
 	log.Printf("[管理状态] traceId=%s 结果=读取成功 账号数=%d 模型数=%d 快照过旧=%t 说明=只展示快照，不调用上游或改变账本", debugTraceID(r), len(resp.Accounts), len(resp.Models), resp.Stale)
 	writeAdminData(w, r, resp)
 }

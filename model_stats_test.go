@@ -179,7 +179,7 @@ func TestModelTableHasEqualDisplayWidth(t *testing.T) {
 			t.Fatalf("line %d width=%d want=%d:\n%s", i, got, want, table)
 		}
 	}
-	for _, h := range []string{"模型", "国内倍率", "国际倍率", "可用账号", "请求", "首字", "平均", "总Token"} {
+	for _, h := range []string{"模型", "国内倍率", "国际倍率", "可用账号", "请求", "首Token", "平均", "总Token"} {
 		if !strings.Contains(table, h) {
 			t.Fatalf("table missing header %q", h)
 		}
@@ -221,8 +221,12 @@ func TestTTFTReader(t *testing.T) {
 	if _, err := r.Read(buf); err != nil {
 		t.Fatal(err)
 	}
-	if r.duration() <= 0 {
-		t.Fatal("ttft should be recorded on first read")
+	if r.duration() != 0 {
+		t.Fatal("raw read must not be counted as a token")
+	}
+	observeFirstToken(r, map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"content": "hello"}}}})
+	if r.duration() < 50*time.Millisecond {
+		t.Fatal("first token must use request entry as origin")
 	}
 }
 
@@ -258,7 +262,7 @@ func TestModelTableHeadersMentionWindow(t *testing.T) {
 	resetModelStats()
 	rows := buildModelStatSnapshots(time.Now(), []*Account{{Path: "a.json", Auth: &StoredAuth{}}})
 	table := renderModelTable(rows)
-	for _, h := range []string{"平均首字(5h)", "平均总耗时(5h)", "总Token(M)"} {
+	for _, h := range []string{"平均首Token(5h)", "平均总耗时(5h)", "总Token(M)"} {
 		if !strings.Contains(table, h) {
 			t.Fatalf("table missing header %q", h)
 		}

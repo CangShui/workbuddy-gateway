@@ -566,6 +566,7 @@ func convertResponsesToolChoice(tc any) any {
 func writeResponsesAggregate(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
 	defer resp.Body.Close()
 	body := newTTFTReader(resp.Body, startTime)
+	defer finishFirstToken(r, modelName, reqID, body)
 	completionJSON, err := aggregateCompletion(body, modelName)
 	if err != nil {
 		debugEvent(r, "error", "aggregate_response_failed", map[string]any{
@@ -577,9 +578,9 @@ func writeResponsesAggregate(w http.ResponseWriter, r *http.Request, resp *http.
 		return
 	}
 	usage := usageFromCompletion(completionJSON)
+	statsObserveUsage(r, usage, true)
 	observeModelCredit(acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
-	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	out, err := chatCompletionToResponses(completionJSON, modelName)
 	if err != nil {
@@ -838,6 +839,7 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	sawDone := false
 
 	body := newTTFTReader(resp.Body, startTime)
+	defer finishFirstToken(r, modelName, reqID, body)
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -853,6 +855,7 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			continue
 		}
+		observeFirstToken(body, chunk)
 		if u, ok := chunk["usage"].(map[string]any); ok {
 			usage = u
 		}
@@ -931,6 +934,8 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 		}
 	}
 	scanErr := scanner.Err()
+	completeTokenStream(body, scanErr == nil && finishReason != "")
+	statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
 	if scanErr != nil {
 		debugEvent(r, "error", "stream_response_failed", map[string]any{
 			"error_type": debugErrorType(scanErr),
@@ -947,7 +952,6 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 		failed["error"] = map[string]any{"code": "stream_interrupted", "message": reason}
 		emit("response.failed", map[string]any{"response": failed})
 		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流式读取 账号=%s 异常=%v 业务影响=本次响应不完整，已下发 response.failed 而非伪造完成", debugTraceID(r), reqID, acc.Path, scanErr)
-		recordModelTTFT(modelName, body.duration())
 		recordModelLatency(modelName, time.Since(startTime))
 		return
 	}
@@ -973,7 +977,6 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 		emit("response.failed", map[string]any{"response": failed})
 		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=Responses收尾 账号=%s 结果=拒绝当成成功 原因=上游干净结束但没有 finish_reason 是否看到DONE=%t 已收到推理字符数=%d 已收到正文字符数=%d 工具调用数=%d 业务影响=不下发 output_item.done 和 response.completed，客户端收到 response.failed 是否已处理=是",
 			debugTraceID(r), reqID, acc.Path, sawDone, reasoningSB.Len(), msgSB.Len(), len(toolOrder))
-		recordModelTTFT(modelName, body.duration())
 		recordModelLatency(modelName, time.Since(startTime))
 		return
 	}
@@ -1036,9 +1039,8 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	if scanErr == nil {
 		debugEvent(r, "info", "stream_response_completed", map[string]any{"status_code": http.StatusOK})
 	}
-	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
-	log.Printf("[#%d] Responses 流式输出完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
+	log.Printf("[#%d] Responses 流式输出完成 (账号 %s [%s], 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, time.Since(startTime), body.text())
 }
 
 // compactUUID 返回去掉连字符的随机 UUID。

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -209,12 +210,16 @@ func recordModelCostClass(model, edition string, free bool) {
 	modelStatsMu.Unlock()
 }
 
-// ttftReader 记录上游响应体首个非空读取的时间，作为首字响应时间近似值。
+// TTFT v2：网关请求入口 → 首个有效内容/推理/工具调用增量被解析。
+// 按 dsh 的 token-delta 规则，不计角色/心跳/usage/finish等控制帧。
+const ttftMetric = "first_token_v2"
+
 type ttftReader struct {
-	r     io.Reader
-	start time.Time
-	once  sync.Once
-	d     time.Duration
+	r        io.Reader
+	start    time.Time
+	once     sync.Once
+	d        time.Duration
+	complete bool
 }
 
 func newTTFTReader(r io.Reader, start time.Time) *ttftReader {
@@ -222,14 +227,76 @@ func newTTFTReader(r io.Reader, start time.Time) *ttftReader {
 }
 
 func (t *ttftReader) Read(p []byte) (int, error) {
-	n, err := t.r.Read(p)
-	if n > 0 {
-		t.once.Do(func() { t.d = time.Since(t.start) })
-	}
-	return n, err
+	return t.r.Read(p) // 原始字节不代表Token，禁止在这里计时。
 }
 
 func (t *ttftReader) duration() time.Duration { return t.d }
+
+func (t *ttftReader) text() string {
+	if t.d <= 0 {
+		return "未知（无有效Token）"
+	}
+	return t.d.String()
+}
+
+func hasFirstTokenDelta(chunk map[string]any) bool {
+	choices, _ := chunk["choices"].([]any)
+	for _, raw := range choices {
+		choice, _ := raw.(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		for _, field := range []string{"content", "reasoning_content", "reasoning"} {
+			// 与dsh相同：空字符串不算，但非空空白字符串是有效增量。
+			if text, ok := delta[field].(string); ok && text != "" {
+				return true
+			}
+		}
+		calls, _ := delta["tool_calls"].([]any)
+		if legacy, ok := delta["function_call"].(map[string]any); ok {
+			calls = append(calls, map[string]any{"function": legacy})
+		}
+		for _, rawCall := range calls {
+			call, _ := rawCall.(map[string]any)
+			fn, _ := call["function"].(map[string]any)
+			if _, named := fn["name"].(string); named {
+				return true
+			}
+			if args, ok := fn["arguments"].(string); ok && args != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func observeFirstToken(reader io.Reader, chunk map[string]any) {
+	if t, ok := reader.(*ttftReader); ok && hasFirstTokenDelta(chunk) {
+		t.once.Do(func() { t.d = time.Since(t.start) })
+	}
+}
+
+func completeTokenStream(reader io.Reader, complete bool) {
+	if t, ok := reader.(*ttftReader); ok {
+		t.complete = complete
+	}
+}
+
+// 三种协议、流式/非流式统一结算。只有完整且确有Token的步骤参与均值。
+func finishFirstToken(r *http.Request, model string, reqID uint64, body *ttftReader) {
+	complete := body.complete && (r == nil || r.Context().Err() == nil)
+	known := complete && body.duration() > 0
+	if known {
+		recordModelTTFT(model, body.duration())
+	}
+	if p := statsAttemptFor(r); p != nil {
+		p.ttft = nil
+		if known {
+			v := durationMilliseconds(body.duration())
+			p.ttft = &v
+		}
+	}
+	log.Printf("[首Token统计] traceId=%s requestId=%d 模型=%s 口径=%s 完整=%t 有样本=%t 耗时=%s 起点=网关请求入口 终点=有效文本/推理/工具增量 说明=不计心跳或角色声明，不记录正文；非完整步骤不进入平均",
+		debugTraceID(r), reqID, model, ttftMetric, complete, known, body.text())
+}
 
 // modelStatusFromError 从错误响应中提取简短状态标签（业务码优先，其次 HTTP 状态码）。
 func modelStatusFromError(statusCode int, body string) string {
@@ -278,6 +345,7 @@ type modelStatSnapshot struct {
 	Tokens            int64  `json:"tokens,omitempty"`
 	AvgTTFTMs         int64  `json:"avgTtftMs,omitempty"`
 	HasTTFT           bool   `json:"hasTtft,omitempty"`
+	TTFTMetric        string `json:"ttftMetric,omitempty"`
 	AvgLatencyMs      int64  `json:"avgLatencyMs,omitempty"`
 	HasLatency        bool   `json:"hasLatency,omitempty"`
 	LastRequestAt     int64  `json:"lastRequestAt,omitempty"`
@@ -441,6 +509,7 @@ func buildModelRows(now time.Time, accs []*Account, includeDisabled bool) []mode
 				if okT {
 					row.AvgTTFTMs = ttft.Milliseconds()
 					row.HasTTFT = true
+					row.TTFTMetric = ttftMetric
 				}
 				if okL {
 					row.AvgLatencyMs = latency.Milliseconds()
@@ -491,8 +560,8 @@ func formatTokensM(n int64) string {
 
 // renderModelTable 渲染 /v1/models 统计附表。
 func renderModelTable(rows []modelStatSnapshot) string {
-	widths := []int{26, 16, 16, 8, 8, 13, 15, 10}
-	headers := []string{"模型", "国内倍率", "国际倍率", "可用账号", "请求", "平均首字(5h)", "平均总耗时(5h)", "总Token(M)"}
+	widths := []int{26, 16, 16, 8, 8, 19, 15, 10}
+	headers := []string{"模型", "国内倍率", "国际倍率", "可用账号", "请求", "平均首Token(5h)", "平均总耗时(5h)", "总Token(M)"}
 	border := func() string {
 		var b strings.Builder
 		b.WriteByte('+')
@@ -529,7 +598,7 @@ func renderModelTable(rows []modelStatSnapshot) string {
 		b.WriteString(row([]string{
 			r.ID, cnMult, intlMult, strconv.Itoa(r.AvailableAccounts),
 			strconv.FormatInt(r.Requests, 10),
-			formatMilliseconds(r.AvgTTFTMs, r.HasTTFT),
+			formatMilliseconds(r.AvgTTFTMs, r.HasTTFT && r.TTFTMetric == ttftMetric),
 			formatMilliseconds(r.AvgLatencyMs, r.HasLatency),
 			formatTokensM(r.Tokens),
 		}) + "\n")

@@ -49,6 +49,7 @@ func TestPolicyBrowserFixture(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(logDir, "gateway-"+oldDay+".log"), []byte("synthetic historical log\n"), 0600)
 	writeStatusSnapshot()
 	now := time.Now()
+	seedStatsFixture(t, now)
 	for _, fixture := range []struct {
 		id, status, detail string
 		next               time.Time
@@ -114,4 +115,67 @@ func TestPolicyBrowserFixture(t *testing.T) {
 		}
 	}
 	time.Sleep(duration)
+}
+
+// seedStatsFixture 造一份可重复的合成用量数据，用于浏览器验收总览页的
+// 摘要卡、折线图、表格与账号筛选。故意留出空时间桶与缺少 usage 的请求，
+// 以验证「未知不画成 0」和覆盖数展示；不访问上游、不写真实 stats.json。
+func seedStatsFixture(t *testing.T, now time.Time) {
+	t.Helper()
+	accountMu.Lock()
+	ids := map[string]string{}
+	views := map[string]statsAccount{}
+	for _, acc := range accounts {
+		if id, view := statsAccountIDLocked(acc); id != "" {
+			ids[acc.Path], views[id] = id, view
+		}
+	}
+	accountMu.Unlock()
+	if len(ids) == 0 {
+		t.Fatal("统计夹具需要账号池")
+	}
+	requestStats.Lock()
+	previous := requestStats.document
+	previousEnabled := requestStats.enabled
+	requestStats.enabled = true
+	requestStats.mode = "file"
+	requestStats.document = statsDocument{Schema: statsSchema, StartedAt: now.AddDate(0, 0, -21).UnixMilli(),
+		Accounts: views, Requests: []statsRequest{}}
+	credit := 0.35
+	for day := 21; day >= 0; day-- {
+		at := now.AddDate(0, 0, -day)
+		// 故意留两个空日，验证折线在无样本处断开。
+		if day == 14 || day == 7 {
+			continue
+		}
+		for hour := 9; hour <= 17; hour += 4 {
+			when := time.Date(at.Year(), at.Month(), at.Day(), hour, 15, 0, 0, time.Local)
+			tokens := int64(180000 + (21-day)*24000 + hour*1500)
+			latency := float64(2400 + (21-day)*60 + hour*40)
+			ttft := float64(520 + (21-day)*8)
+			row := statsRequest{Account: ids["workbuddy-cn-a.json"], Model: "deepseek-v4.1-flash",
+				At: when.UnixMilli(), Status: 200, Complete: true, LatencyMS: latency, TTFTMS: &ttft, TTFTMetric: ttftMetric,
+				TotalTokens: &tokens, InputTokens: int64p(tokens * 3 / 4), OutputTokens: int64p(tokens / 4),
+				CachedTokens: int64p(tokens / 3), Credit: &credit}
+			requestStats.document.Requests = append(requestStats.document.Requests, row)
+			if id := ids["workbuddy-intl-b.json"]; id != "" && hour == 13 {
+				small := int64(24000 + (21-day)*900)
+				intlCredit := credit / 2
+				requestStats.document.Requests = append(requestStats.document.Requests, statsRequest{
+					Account: id, Model: "hy3", At: when.UnixMilli(), Status: 200, Complete: true,
+					LatencyMS: latency * 0.6, TTFTMS: &ttft, TTFTMetric: ttftMetric, TotalTokens: &small,
+					InputTokens: int64p(small * 4 / 5), OutputTokens: int64p(small / 5), Credit: &intlCredit})
+				// 一条缺 usage 的记录：必须显示为未知，而不是零消耗。
+				requestStats.document.Requests = append(requestStats.document.Requests, statsRequest{
+					Account: id, Model: "hy3", At: when.Add(time.Minute).UnixMilli(), Status: 200,
+					Complete: true, LatencyMS: latency * 0.7})
+			}
+		}
+	}
+	requestStats.Unlock()
+	t.Cleanup(func() {
+		requestStats.Lock()
+		requestStats.document, requestStats.enabled = previous, previousEnabled
+		requestStats.Unlock()
+	})
 }

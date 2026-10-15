@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.3"
+	version = "1.14.7"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -989,6 +989,7 @@ func loadAccounts() error {
 	// 恢复持久化的失效账号标记（凭据文件已删除，仅供控制台提示重新登录）
 	loadDisabledMarkers()
 	restoreAccountRuntimeStateLocked()
+	restoreStatsAccountStatesLocked()
 
 	if len(accounts) == 0 {
 		return fmt.Errorf("未找到有效凭据，请先执行 login 命令扫码登录")
@@ -2812,6 +2813,7 @@ func writeStatusSnapshot() error {
 	}
 	annotateAccountPolicies(snap.Accounts)
 	snap.ModelCatalog = buildAllModelStatSnapshots(now, accounts)
+	captureAccountStatsLocked()
 	for _, row := range snap.ModelCatalog {
 		if disabled, _ := modelDisabled(row.ID); !disabled {
 			snap.Models = append(snap.Models, row)
@@ -2842,7 +2844,11 @@ func writeStatusSnapshot() error {
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, statusSnapshotFile)
+	if err := os.Rename(tmp, statusSnapshotFile); err != nil {
+		return err
+	}
+	logAccountStateChanges(snap.Accounts, snap.UpdatedAt)
+	return nil
 }
 
 func displayWidth(s string) int {
@@ -3235,6 +3241,7 @@ func runServe() {
 	configCtx, stopConfigReload := context.WithCancel(context.Background())
 	defer stopConfigReload()
 	loadModelsCache()
+	loadOptionalStats()
 	if err := loadAccounts(); err != nil {
 		fmt.Printf("警告: 未检测到有效凭据 (%v)。\n请先执行: workbuddy-gateway login 扫码登录，或确保凭据文件存在。\n\n", err)
 	} else {
@@ -3265,6 +3272,16 @@ func runServe() {
 
 	// 启动状态快照协程（monitor 命令实时读取展示）
 	go statusSnapshotLoop()
+	statsCtx, stopStats := context.WithCancel(context.Background())
+	statsDone := make(chan struct{})
+	go func() {
+		defer close(statsDone)
+		statsPersistenceLoop(statsCtx)
+	}()
+	defer func() {
+		stopStats()
+		<-statsDone
+	}()
 
 	// 启动凭据热加载协程（新增/更新/删除凭据文件免重启生效）
 	if cfg.ReloadInterval > 0 {
@@ -3461,6 +3478,7 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Trace-ID", traceID)
 		// 普通落盘审计也需要稳定的 TraceID / requestID；不能依赖可选 JSON 日志。
 		ensureDebugRequestContext(r, traceID, start)
+		r = r.WithContext(context.WithValue(r.Context(), statsRequestContextKey{}, &statsAttempt{}))
 		if debugLoggingEnabled() {
 			debugEvent(r, "info", "request_received", map[string]any{
 				"message": "请求已进入网关，准备执行中间件与路由处理",
@@ -3472,6 +3490,7 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 		if aw.status == 0 {
 			aw.status = http.StatusOK
 		}
+		statsFinishAttempt(r, aw.status)
 		debugEvent(r, "info", "response_returned", map[string]any{
 			"status_code": aw.status,
 			"result":      http.StatusText(aw.status),
@@ -3637,6 +3656,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		// 注入 CodeBuddy 凭据与指纹 Header
 		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
 		acc.lock.Lock()
+		statsSelectAccount(r, acc, modelName)
 		resp, upstreamCancel, err := doUpstreamRequest(r, acc, prof, upstreamBytes, reqID, traceID)
 		acc.lock.Unlock()
 		if err != nil {
@@ -3654,6 +3674,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 
 		// 上游非 200 响应处理
 		if resp.StatusCode >= 400 {
+			statsFinishAttempt(r, resp.StatusCode)
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			upstreamCancel()
@@ -3854,6 +3875,7 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	}
 
 	body := newTTFTReader(resp.Body, startTime)
+	defer finishFirstToken(r, modelName, reqID, body)
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	var usage map[string]any
@@ -3872,6 +3894,7 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		}
 		var chunk map[string]any
 		if json.Unmarshal([]byte(cleanData), &chunk) == nil {
+			observeFirstToken(body, chunk)
 			if u, ok := chunk["usage"].(map[string]any); ok {
 				usage = u
 			}
@@ -3883,6 +3906,7 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		}
 	}
 	scanErr := scanner.Err()
+	completeTokenStream(body, scanErr == nil && finishReason != "")
 	if scanErr != nil {
 		// 流被中断（上游卡死 / 超时 / 客户端取消）时，绝不补发 [DONE]：
 		// 补发等于告诉下游「正常结束」，会让残缺的工具调用被当成完整结果执行。
@@ -3937,11 +3961,11 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		})
 	}
 	observeModelCredit(acc, modelName, usage, reqID)
+	statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
 	recordModelTokens(modelName, usage, reqID)
-	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	if scanErr == nil && finishReason != "" {
-		log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 结束原因=%s, 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, finishReason, time.Since(startTime), body.duration())
+		log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 结束原因=%s, 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, finishReason, time.Since(startTime), body.text())
 	}
 }
 
@@ -3949,6 +3973,7 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
 	defer resp.Body.Close()
 	body := newTTFTReader(resp.Body, startTime)
+	defer finishFirstToken(r, modelName, reqID, body)
 	completionJSON, err := aggregateCompletion(body, modelName)
 	if err != nil {
 		debugEvent(r, "error", "aggregate_response_failed", map[string]any{
@@ -3960,9 +3985,9 @@ func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		return
 	}
 	usage := usageFromCompletion(completionJSON)
+	statsObserveUsage(r, usage, true)
 	observeModelCredit(acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
-	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -3971,7 +3996,7 @@ func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		"status_code":    http.StatusOK,
 		"response_bytes": len(completionJSON),
 	})
-	log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
+	log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, time.Since(startTime), body.text())
 }
 
 // -----------------------------------------------------------------------------
@@ -4339,6 +4364,7 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			continue
 		}
+		observeFirstToken(r, chunk)
 		if v, ok := chunk["id"].(string); ok && v != "" {
 			respID = v
 		}
@@ -4377,6 +4403,7 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	if finish == "" {
 		return nil, errStreamClosedWithoutFinish
 	}
+	completeTokenStream(r, true)
 
 	message := map[string]any{"role": ifEmpty(role, "assistant"), "content": content}
 	if reasoning != "" {

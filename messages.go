@@ -854,11 +854,14 @@ func scanUpstreamSSE(body io.Reader, state *anthropicStreamState, sink func([]by
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			continue
 		}
+		observeFirstToken(body, chunk)
 		if out := state.feed(chunk); sink != nil && len(out) > 0 {
 			sink(out)
 		}
 	}
-	return scanner.Err()
+	err := scanner.Err()
+	completeTokenStream(body, err == nil && state.finish != "")
+	return err
 }
 
 // streamMessagesResponse 将上游流式响应实时回译为 Anthropic SSE。
@@ -884,7 +887,9 @@ func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.R
 
 	state := newAnthropicStreamState(modelName, wantThinking)
 	body := newTTFTReader(resp.Body, startTime)
+	defer finishFirstToken(r, modelName, reqID, body)
 	scanErr := scanUpstreamSSE(body, state, writeEvent)
+	statsObserveUsage(r, state.usage, scanErr == nil && state.finish != "")
 	if scanErr != nil {
 		debugEvent(r, "error", "stream_response_failed", map[string]any{
 			"error_type": debugErrorType(scanErr),
@@ -900,7 +905,6 @@ func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.R
 			"error": map[string]any{"type": "api_error", "message": reason},
 		}))
 		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流式读取 账号=%s 异常=%v 业务影响=本次响应不完整，已下发 error 事件而非伪造完成", debugTraceID(r), reqID, acc.Path, scanErr)
-		recordModelTTFT(modelName, body.duration())
 		recordModelLatency(modelName, time.Since(startTime))
 		return
 	}
@@ -915,18 +919,17 @@ func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.R
 			"error": map[string]any{"type": "api_error", "message": "上游流结束但没有 finish_reason，本次回复不完整"},
 		}))
 		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=Messages收尾 账号=%s 结果=拒绝当成成功 原因=上游干净结束但没有 finish_reason", debugTraceID(r), reqID, acc.Path)
-		recordModelTTFT(modelName, body.duration())
 		recordModelLatency(modelName, time.Since(startTime))
 		return
 	}
 
 	writeEvent(state.finishEvents())
 	observeModelCredit(acc, modelName, state.usage, reqID)
+	statsObserveUsage(r, state.usage, true)
 	recordModelTokens(modelName, state.usage, reqID)
-	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	debugEvent(r, "info", "stream_response_completed", map[string]any{"status_code": http.StatusOK})
-	log.Printf("[响应完成] traceId=%s requestId=%d Messages流式输出完成 账号=%s 站点=%s 耗时=%v 首字=%v", debugTraceID(r), reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
+	log.Printf("[响应完成] traceId=%s requestId=%d Messages流式输出完成 账号=%s 站点=%s 耗时=%v 首Token(v2)=%s", debugTraceID(r), reqID, acc.Path, prof.Label, time.Since(startTime), body.text())
 }
 
 // writeMessagesAggregate 本地聚合上游流式数据，输出完整 Anthropic Message。
@@ -934,6 +937,7 @@ func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.R
 	defer resp.Body.Close()
 	state := newAnthropicStreamState(modelName, wantThinking)
 	body := newTTFTReader(resp.Body, startTime)
+	defer finishFirstToken(r, modelName, reqID, body)
 	if err := scanUpstreamSSE(body, state, nil); err != nil {
 		debugEvent(r, "error", "aggregate_response_failed", map[string]any{
 			"error_type": debugErrorType(err),
@@ -953,8 +957,8 @@ func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.R
 	}
 	msg := state.aggregate()
 	observeModelCredit(acc, modelName, state.usage, reqID)
+	statsObserveUsage(r, state.usage, true)
 	recordModelTokens(modelName, state.usage, reqID)
-	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	out, err := json.Marshal(msg)
 	if err != nil {
