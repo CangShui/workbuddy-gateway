@@ -118,6 +118,35 @@
       </div>
       <p class="hint">调度开关写入 models.accounts.all.blocklist 并立即生效。已有全局白名单时，首次操作会删除 all.allowlist，将当前账号池启停状态转为黑名单；之后新增账号默认开启。停用不删除凭据、不清除账本、不打断已有请求，开启后仍受模型专属规则限制。</p>
       <p id="accountFilterStatus" class="hint hidden" role="status"></p>
+      <div class="account-toolbar">
+        <button id="addAccountBtn" type="button">添加账号</button>
+        <span id="addAccountHint" class="hint">凭据直接写入程序运行目录，无需手工放置文件。</span>
+      </div>
+      <section id="addAccountPanel" class="add-account-panel hidden" aria-labelledby="addAccountTitle">
+        <h3 id="addAccountTitle">添加账号</h3>
+        <div class="add-account-form">
+          <label>站点
+            <select id="addSite">
+              <option value="cn">国内站</option>
+              <option value="intl">国际站</option>
+            </select>
+          </label>
+          <label>凭据名
+            <span class="path-prefix">运行目录 /</span>
+            <input id="addFile" type="text" autocomplete="off" spellcheck="false">
+          </label>
+          <button id="addStart" type="button">获取登录接口</button>
+          <button id="addCancel" class="ghost" type="button">关闭</button>
+        </div>
+        <p id="addAccountStatus" class="hint" role="status" aria-live="polite"></p>
+        <div id="addAccountResult" class="add-account-result hidden">
+          <img id="addAccountQr" alt="登录二维码" width="240" height="240">
+          <div>
+            <p class="hint">用手机扫码完成授权。无法扫码时，可在浏览器里直接打开下面这个链接：</p>
+            <p class="hint"><a id="addAccountLink" href="#" target="_blank" rel="noreferrer"></a></p>
+          </div>
+        </div>
+      </section>
       <div class="table-wrap">
         <table id="accountsTable">
           <thead>
@@ -125,7 +154,7 @@
               <th>#</th><th>全局调度</th><th>凭据文件</th><th>账号</th><th>站点</th><th>状态</th>
               <th>Token 有效期</th><th>总额度</th><th>已用</th><th>剩余</th>
               <th>套餐</th><th>免费模型</th><th>模型冷却</th>
-              <th>刷新令牌到期</th><th>上次续期</th><th>续期失败</th>
+              <th>刷新令牌到期</th><th>上次续期</th><th>续期失败</th><th>操作</th>
             </tr>
           </thead>
           <tbody></tbody>

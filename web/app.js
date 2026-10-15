@@ -42,7 +42,9 @@
     accountAlertsPending: false,
     accountAlertsLastPoll: 0,
     accountAlertsGeneration: 0,
-    lastAccountAlerts: null
+    lastAccountAlerts: null,
+    addAccountId: "",
+    addAccountPoll: 0
   };
 
   function $(id) { return document.getElementById(id); }
@@ -137,6 +139,8 @@
     state.accountAlertsGeneration++;
     state.accountAlertsLastPoll = 0;
     state.lastAccountAlerts = null;
+    state.addAccountId = "";
+    state.addAccountPoll = 0;
     $("poolHealth").textContent = "—";
     $("poolHealth").className = "health-value";
     $("poolHealthBar").style.width = "0%";
@@ -616,6 +620,101 @@
     }
   }
 
+  // ---- 账号：网页新增（复用 CLI 登录流程）与删除 ---------------------------
+  function openAddAccount() {
+    $("addAccountPanel").classList.remove("hidden");
+    $("addAccountResult").classList.add("hidden");
+    $("addAccountQr").removeAttribute("src");
+    $("addAccountStatus").textContent = "正在读取默认凭据名…";
+    state.addAccountId = "";
+    state.addAccountPoll = 0;
+    return api("/admin/api/account-add").then(function (data) {
+      $("addFile").value = data.defaultFile || "";
+      $("addAccountStatus").textContent = "";
+    }).catch(function () {
+      $("addAccountStatus").textContent = "读取默认凭据名失败，可手动填写。";
+    });
+  }
+
+  function closeAddAccount() {
+    var id = state.addAccountId;
+    state.addAccountId = "";
+    state.addAccountPoll = 0;
+    $("addAccountPanel").classList.add("hidden");
+    $("addAccountResult").classList.add("hidden");
+    $("addAccountQr").removeAttribute("src");
+    if (id) return api("/admin/api/account-cancel", {method: "POST", body: {id: id}}).catch(function () {});
+    return Promise.resolve();
+  }
+
+  function startAddAccount() {
+    var site = $("addSite").value === "intl" ? "intl" : "cn";
+    var file = ($("addFile").value || "").replace(/^\s+|\s+$/g, "");
+    if (!file) { $("addAccountStatus").textContent = "请先填写凭据名。"; return; }
+    if (state.addAccountId) closeAddAccount();
+    $("addStart").disabled = true;
+    $("addAccountStatus").textContent = "正在获取登录接口…";
+    return api("/admin/api/account-add", {method: "POST", body: {site: site, file: file}}).then(function (data) {
+      state.addAccountId = data.id || "";
+      state.addAccountPoll = 0;
+      $("addAccountResult").classList.remove("hidden");
+      $("addAccountQr").src = data.qrPng || "";
+      $("addAccountLink").href = data.authUrl || "#";
+      $("addAccountLink").textContent = data.authUrl || "";
+      $("addAccountStatus").textContent = "请用手机扫码完成授权；成功后凭据会自动保存并加载，无需重启。";
+      pollAddAccount();
+    }).catch(function (err) {
+      $("addAccountStatus").textContent = "获取登录接口失败：" + ((err && err.detail) || "请稍后重试");
+    }).then(function () { $("addStart").disabled = false; });
+  }
+
+  function pollAddAccount(force) {
+    if (!state.addAccountId || !state.apiKey) return Promise.resolve();
+    if (!force && Date.now() - state.addAccountPoll < 2000) return Promise.resolve();
+    state.addAccountPoll = Date.now();
+    var id = state.addAccountId;
+    return api("/admin/api/account-add?id=" + encodeURIComponent(id)).then(function (data) {
+      if (state.addAccountId !== id) return;
+      var status = data.status || "pending";
+      if (status === "pending") {
+        $("addAccountStatus").textContent = "等待扫码授权…（可继续扫码，超时后需重新获取）";
+        return;
+      }
+      state.addAccountId = "";
+      if (status === "done") {
+        $("addAccountStatus").textContent = "登录成功，凭据已保存为 " + (data.savedAs || "") + "，账号池已自动加载。";
+        showAlert("账号已添加：" + (data.savedAs || ""), true);
+        refreshActive();
+      } else if (status === "expired") {
+        $("addAccountStatus").textContent = "登录已超时，请重新点击「获取登录接口」。";
+      } else if (status === "cancelled") {
+        $("addAccountStatus").textContent = "登录已取消。";
+      } else {
+        $("addAccountStatus").textContent = "登录失败：" + (data.error || "请重试");
+      }
+    }).catch(function () {
+      $("addAccountStatus").textContent = "查询登录进度失败，保留上次结果。";
+    });
+  }
+
+  function accountRowActions(event) {
+    var target = event && event.target;
+    if (!target || typeof target.closest !== "function") return;
+    var btn = target.closest("[data-account-delete]");
+    if (!btn) return;
+    var name = btn.getAttribute("data-account-delete");
+    if (!name) return;
+    if (!window.confirm("确定删除凭据 " + name + " ？\n\n" +
+        "会从账号池移除该账号，并删除运行目录下的对应凭据文件。统计与历史日志保留，操作不可撤销。")) return;
+    state.policyVersion++;
+    api("/admin/api/account-delete", {method: "POST", body: {file: name}}).then(function () {
+      showAlert("已删除凭据 " + name + "，账号池已同步移除。", true);
+      return refreshActive();
+    }).catch(function (err) {
+      showAlert("删除失败：" + ((err && err.detail) || "请稍后重试"), false);
+    });
+  }
+
   function renderAccounts(list) {
     var onlyUsable = $("onlyUsableAccounts").checked;
     if (onlyUsable) {
@@ -626,7 +725,7 @@
     var tb = $("accountsTable").querySelector("tbody");
     var focusTarget = focusedPolicyTarget(tb);
     if (!list.length) {
-      tb.innerHTML = '<tr><td colspan="16" class="empty">' +
+      tb.innerHTML = '<tr><td colspan="17" class="empty">' +
         (onlyUsable ? "没有符合条件的可用账号，取消勾选可查看全部账号。" : "暂无账号数据（服务是否已写入状态快照？）") + '</td></tr>';
       return;
     }
@@ -655,6 +754,8 @@
         "<td>" + esc(fmtTime(a.refreshExpiresAt)) + "</td>" +
         "<td>" + esc(fmtTime(a.lastRefreshTime)) + "</td>" +
         "<td>" + esc(count(a.refreshFailCount)) + "</td>" +
+        "<td><button class=\"ghost danger\" type=\"button\" data-account-delete=\"" +
+        esc(a.path) + "\">删除</button></td>" +
         "</tr>";
     }).join("");
     restorePolicyFocus(tb, focusTarget);
@@ -1145,6 +1246,7 @@
           loadStats(false);
           loadAccountAlerts();
         }
+        if (state.activeTab === "accounts") pollAddAccount();
       });
     } else if (state.activeTab === "models") {
       pending = api("/admin/api/models").then(function (data) {
@@ -1361,6 +1463,10 @@
       t.addEventListener("click", function () { setTab(t.getAttribute("data-tab")); });
     });
     $("accountsTable").addEventListener("click", togglePolicy);
+    $("accountsTable").addEventListener("click", accountRowActions);
+    $("addAccountBtn").addEventListener("click", openAddAccount);
+    $("addStart").addEventListener("click", startAddAccount);
+    $("addCancel").addEventListener("click", closeAddAccount);
     $("modelsTable").addEventListener("click", togglePolicy);
     $("modelsTable").addEventListener("click", toggleRateDetail);
     $("logFile").addEventListener("change", function () { loadLogs(false); });

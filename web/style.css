@@ -634,3 +634,44 @@ rect.series-m7 { fill: var(--series-m7); }
 @media (min-width: 641px) and (max-width: 980px) {
   .usage-charts { grid-template-columns: 1fr; }
 }
+
+/* ---------------------------------------------------------------------------
+   账号 网页新增 / 删除
+--------------------------------------------------------------------------- */
+.account-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 4px 0 12px; }
+
+.add-account-panel {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 14px 16px; margin-bottom: 14px; background: var(--surface-muted);
+}
+
+.add-account-panel h3 { margin: 0 0 12px; font-size: 14px; }
+
+.add-account-form {
+  display: grid; gap: 12px 16px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  align-items: end;
+}
+
+.add-account-form label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--text-muted); }
+
+.add-account-form select,
+.add-account-form input {
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface); color: var(--text); font: inherit; font-size: 13px;
+}
+
+.add-account-form .path-prefix { font-size: 12px; color: var(--text-muted); }
+
+.add-account-result { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; margin-top: 14px; }
+
+.add-account-result img { border: 1px solid var(--border); border-radius: 8px; background: #fff; }
+
+#addAccountLink { word-break: break-all; }
+
+button.danger { border-color: var(--danger); color: var(--danger); }
+
+@media (max-width: 640px) {
+  .add-account-form { grid-template-columns: 1fr; }
+  .add-account-result img { width: 100%; max-width: 240px; height: auto; }
+}

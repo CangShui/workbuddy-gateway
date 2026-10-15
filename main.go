@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.12"
+	version = "1.14.13"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -3110,10 +3110,11 @@ func runMonitor() {
 }
 
 func runLogin() {
-	prof := &profileCN
+	site := "cn"
 	if cfg.LoginIntl {
-		prof = &profileINTL
+		site = "intl"
 	}
+	prof := profileForEdition(site)
 
 	fmt.Println("================ WorkBuddy 登录 ================")
 	fmt.Printf("目标站点:     %s (%s)\n", prof.Label, strings.TrimPrefix(prof.Base, "https://"))
@@ -3122,32 +3123,14 @@ func runLogin() {
 	}
 	fmt.Println("正在生成登录凭据与二维码...")
 
-	loginClient := &http.Client{
-		Timeout: 30 * time.Second,
-		Jar:     cfg.HttpClient.Jar,
-	}
-
-	// 轮询 auth/token 时与官方客户端一致，显式声明无 Authorization
-	pollHeaders := func(r *http.Request) {
-		commonHeaders(r, prof)
-		r.Header.Set("X-No-Authorization", "1")
-	}
-
-	data, _, err := doJSON(loginClient, http.MethodPost, prof.authStateURL(), nil, bytes.NewReader([]byte("{}")))
+	// 与网页「添加账号」共用同一条登录流程，避免 CLI 与网页两套实现漂移。
+	s, err := beginAccountLogin(site, cfg.AuthFile)
 	if err != nil {
-		fmt.Printf("获取登录状态失败: %v\n", err)
-		return
-	}
-	var st authStateData
-	_ = json.Unmarshal(data, &st)
-	if st.State == "" || st.AuthURL == "" {
-		fmt.Println("上游返回的登录状态信息异常，请重试。")
+		fmt.Printf("%v\n", err)
 		return
 	}
 
-	// 终端字符二维码
-	qr, err := qrcode.New(st.AuthURL, qrcode.Medium)
-	if err == nil {
+	if qr, qrErr := qrcode.New(s.AuthURL, qrcode.Medium); qrErr == nil {
 		if cfg.LoginIntl {
 			fmt.Println("\n请用手机扫描下方二维码，并在浏览器中完成登录（邮箱 / 验证码 / SSO 等）：")
 		} else {
@@ -3155,68 +3138,36 @@ func runLogin() {
 		}
 		fmt.Println(qr.ToSmallString(false))
 	}
-
 	fmt.Println("如无法扫码，也可在浏览器中直接打开以下链接：")
-	fmt.Printf("%s\n\n", st.AuthURL)
+	fmt.Printf("%s\n\n", s.AuthURL)
 	fmt.Println("等待登录授权完成 (按 Ctrl+C 可取消)...")
 
-	deadline := time.Now().Add(prof.LoginTTL)
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if time.Now().After(deadline) {
-				fmt.Println("\n登录已超时，请重新执行 login 命令。")
-				return
-			}
-			tokRaw, _, errTok := doJSON(loginClient, http.MethodGet, prof.authTokenURL(st.State), pollHeaders, nil)
-			if errTok != nil {
-				continue
-			}
-			var tok tokenData
-			if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
-				continue
-			}
-
-			// 登录成功，拉取账号信息
-			var acct accountData
-			acctHeaders := func(r *http.Request) {
-				commonHeaders(r, prof)
-				r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
-			}
-			if acctRaw, _, errAcct := doJSON(loginClient, http.MethodGet, prof.loginAcctURL(st.State), acctHeaders, nil); errAcct == nil {
-				_ = json.Unmarshal(acctRaw, &acct)
-			}
-
-			sa := &StoredAuth{
-				Edition: prof.Key,
-				Auth: StoredTokens{
-					AccessToken:  tok.AccessToken,
-					RefreshToken: tok.RefreshToken,
-					ExpiresAt:    time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix(),
-					Domain:       tok.Domain,
-				},
-				Account: StoredAccount{
-					UID:          acct.UID,
-					EnterpriseID: acct.EnterpriseID,
-					Nickname:     acct.Nickname,
-				},
-			}
-
-			if err := saveAuth(sa); err != nil {
-				fmt.Printf("\n登录成功但保存凭据失败: %v\n", err)
-				return
-			}
-
+	for range ticker.C {
+		snap := s.snapshot()
+		switch snap["status"] {
+		case "done":
 			fmt.Println("\n登录成功")
 			fmt.Printf("站点:         %s (%s)\n", prof.Label, strings.TrimPrefix(prof.Base, "https://"))
-			fmt.Printf("欢迎，%s (UID: %s)\n", sa.Account.Nickname, sa.Account.UID)
-			fmt.Printf("凭据已成功保存至: %s\n", cfg.AuthFile)
-			fmt.Printf("令牌有效期至: %s\n", time.Unix(sa.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
-			fmt.Println("\n现在您可以运行以下命令启动网关服务：")
+			if acct, ok := snap["account"].(map[string]any); ok {
+				fmt.Printf("欢迎，%v (UID: %v)\n", acct["nickname"], acct["uid"])
+				if exp, ok := acct["tokenExpiresAt"].(int64); ok && exp > 0 {
+					fmt.Printf("访问令牌有效期至: %s\n", time.Unix(exp, 0).Format("2006-01-02 15:04:05"))
+				}
+			}
+			fmt.Printf("凭据已成功保存到: %s\n", cfg.AuthFile)
+			fmt.Println("\n现在可以启动网关服务：")
 			fmt.Println("  workbuddy-gateway serve")
+			return
+		case "failed":
+			fmt.Printf("\n%v\n", snap["error"])
+			return
+		case "expired":
+			fmt.Println("\n登录已超时，请重新执行 login 命令。")
+			return
+		case "cancelled":
+			fmt.Println("\n登录已取消。")
 			return
 		}
 	}

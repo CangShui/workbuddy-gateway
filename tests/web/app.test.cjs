@@ -24,7 +24,7 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
     if (!elements.has(id)) {
       const node = {innerHTML: "", textContent: "", className: "", value: "", checked: false, disabled: false,
             style: {}, querySelector() { return this; }, querySelectorAll() { return []; },
-            addEventListener() {}, focus() {}};
+            addEventListener() {}, focus() {}, removeAttribute() {}, setAttribute() {}};
       node.classList = {
         add(name) { node.className += " " + name; },
         remove(name) { node.className = node.className.split(/\s+/).filter(v => v !== name).join(" "); },
@@ -66,6 +66,7 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
     initListFilters, changeListFilter, reportRestoredListFilters,
     rateCell, rateKey, rateDetailHTML, ensureRateDetails, toggleRateDetail, restoreRateDetails
     , renderStats, loadStats, changeStatsFilter, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
+    , openAddAccount, startAddAccount, pollAddAccount, closeAddAccount, accountRowActions
   };})();`);
   vm.createContext(context);
   vm.runInContext(source, context);
@@ -1004,4 +1005,66 @@ test("柱形与折线对齐：柱组中心落在同桶折线点的时间位置",
     assert(Math.abs(centres[i] - cx) <= 1.5, "第 " + i + " 个柱组中心必须贴合同桶折线点: " + centres[i] + " vs " + cx);
   });
   audit("柱线对齐通过", {bars_centered_on_points: true});
+});
+
+test("账号池：添加账号表单复用登录流程，每行可删除凭据", async () => {
+  const calls = [];
+  const f = fixture(async (url, options) => {
+    const method = (options && options.method) || "GET";
+    calls.push(method + " " + url);
+    if (url === "/admin/api/account-add" && method === "GET") return response(200, {defaultFile: "workbuddy4.json"});
+    if (url === "/admin/api/account-add" && method === "POST") {
+      return response(200, {id: "login-abc", site: "cn", file: "workbuddy4.json", status: "pending",
+        authUrl: "https://example.test/auth?state=x", qrPng: "data:image/png;base64,AAAA"});
+    }
+    if (url.indexOf("/admin/api/account-add?id=") === 0) {
+      return response(200, {id: "login-abc", status: "done", savedAs: "workbuddy4.json"});
+    }
+    if (url === "/admin/api/account-cancel") return response(200, {cancelled: true});
+    if (url === "/admin/api/account-delete") return response(200, {deleted: "workbuddy9.json"});
+    if (url === "/admin/api/status") return response(200, {gateway: {}, accounts: [], summary: {total: 0}});
+    return response(200, {});
+  });
+  f.review.state.apiKey = "synthetic-admin";
+  f.review.state.activeTab = "accounts";
+
+  f.review.renderAccounts([{path: "workbuddy9.json", state: "active", schedulingEnabled: true, edition: "cn"}]);
+  const row = f.element("accountsTable").querySelector("tbody").innerHTML;
+  assert(row.includes('data-account-delete="workbuddy9.json"'), "每行必须有删除按钮并带出凭据名");
+
+  await f.review.openAddAccount();
+  assert.equal(f.element("addFile").value, "workbuddy4.json");
+  assert(!f.element("addFile").value.includes("/"), "默认名不能含路径");
+
+  await f.review.startAddAccount();
+  assert.equal(f.review.state.addAccountId, "login-abc");
+  assert.match(f.element("addAccountQr").src, /^data:image\/png;base64,/);
+  assert.match(f.element("addAccountLink").textContent, /example\.test/);
+
+  await f.review.pollAddAccount(true);
+  assert.equal(f.review.state.addAccountId, "", "完成后必须清空会话，避免继续轮询");
+  assert.match(f.element("addAccountStatus").textContent, /workbuddy4\.json/);
+  assert(calls.some(c => c.indexOf("GET /admin/api/status") === 0), "登录成功后应刷新账号池");
+
+  let asked = "";
+  const originalConfirm = f.window.confirm;
+  f.window.confirm = function (msg) { asked = msg; return true; };
+  await f.review.accountRowActions({target: {closest: () => ({getAttribute: () => "workbuddy9.json"})}});
+  f.window.confirm = originalConfirm;
+  assert.match(asked, /workbuddy9\.json/, "删除前必须确认并指名凭据");
+  assert(calls.indexOf("POST /admin/api/account-delete") > -1, "确认后必须提交删除请求");
+
+  const deletesBefore = calls.filter(c => c === "POST /admin/api/account-delete").length;
+  f.window.confirm = function () { return false; };
+  await f.review.accountRowActions({target: {closest: () => ({getAttribute: () => "workbuddy9.json"})}});
+  f.window.confirm = originalConfirm;
+  assert.equal(calls.filter(c => c === "POST /admin/api/account-delete").length, deletesBefore,
+    "取消确认时不能提交删除");
+
+  const cancelsBefore = calls.filter(c => c === "POST /admin/api/account-cancel").length;
+  await f.review.closeAddAccount();
+  assert(f.element("addAccountPanel").classList.contains("hidden"), "关闭后表单必须隐藏");
+  assert.equal(calls.filter(c => c === "POST /admin/api/account-cancel").length, cancelsBefore,
+    "没有进行中的会话时关闭不应请求取消");
+  audit("账号新增与删除通过", {default_name_no_path: true, confirm_required: true});
 });
