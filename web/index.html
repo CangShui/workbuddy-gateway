@@ -49,6 +49,24 @@
 
 <main id="dashboard" class="hidden">
   <section id="panel-overview" class="panel active">
+    <h2 class="overview-subheading">运行状态</h2>
+    <div class="health-layout">
+      <section class="card health-card" aria-labelledby="healthTitle">
+        <h3 class="card-title" id="healthTitle">账号池健康度</h3>
+        <div id="poolHealth" class="health-value" role="status" aria-live="polite">—</div>
+        <div class="health-track" aria-hidden="true"><div id="poolHealthBar"></div></div>
+        <p id="poolHealthStatus" class="health-status">等待账号状态</p>
+        <p class="hint">可用且未停用的账号占全部账号的比例。全部可用为 100%；无账号或快照失效时显示未知。</p>
+        <p class="hint health-footnote">账号级健康度，不代表每个模型都可调用。</p>
+      </section>
+      <section class="card account-alert-card" aria-labelledby="accountAlertsTitle">
+        <div class="card-title"><h3 id="accountAlertsTitle">账号日志告警</h3><span class="badge">只读日志</span></div>
+        <p id="accountAlertsInfo" class="hint" role="status" aria-live="polite">登录后读取账号异常日志。</p>
+        <div id="accountAlerts" class="account-alert-list" tabindex="0" aria-label="账号异常告警列表">
+          <p class="stats-empty">等待日志</p>
+        </div>
+      </section>
+    </div>
     <section class="usage-section" aria-labelledby="usageTitle">
       <div class="usage-heading">
         <div><h2 id="usageTitle">用量与性能</h2><p class="hint">按凭据汇总实际 Token 与积分消耗 · UTC+8</p></div>
@@ -87,24 +105,6 @@
         </table></div>
       </div>
     </section>
-    <h2 class="overview-subheading">运行状态</h2>
-    <div class="health-layout">
-      <section class="card health-card" aria-labelledby="healthTitle">
-        <h3 class="card-title" id="healthTitle">账号池健康度</h3>
-        <div id="poolHealth" class="health-value" role="status" aria-live="polite">—</div>
-        <div class="health-track" aria-hidden="true"><div id="poolHealthBar"></div></div>
-        <p id="poolHealthStatus" class="health-status">等待账号状态</p>
-        <p class="hint">可用且未停用的账号占全部账号的比例。全部可用为 100%；无账号或快照失效时显示未知。</p>
-        <p class="hint health-footnote">账号级健康度，不代表每个模型都可调用。</p>
-      </section>
-      <section class="card account-alert-card" aria-labelledby="accountAlertsTitle">
-        <div class="card-title"><h3 id="accountAlertsTitle">账号日志告警</h3><span class="badge">只读日志</span></div>
-        <p id="accountAlertsInfo" class="hint" role="status" aria-live="polite">登录后读取账号异常日志。</p>
-        <div id="accountAlerts" class="account-alert-list" tabindex="0" aria-label="账号异常告警列表">
-          <p class="stats-empty">等待日志</p>
-        </div>
-      </section>
-    </div>
     <div class="card">
       <div class="card-title">运行信息</div>
       <div class="kv" id="gatewayInfo"></div>

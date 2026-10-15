@@ -324,6 +324,9 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 
 .usage-section { margin-bottom: 22px; }
 
+/* 运行状态移到总览最上面后，标题自身不再叠加顶部间距。 */
+.panel > .overview-subheading:first-child { margin-top: 0; }
+
 .usage-heading {
   display: flex;
   align-items: baseline;

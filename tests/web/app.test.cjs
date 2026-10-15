@@ -96,6 +96,22 @@ test("运行状态只展示健康度，无账号和过旧快照不能显示100%"
   assert(html.includes('id="accountsTable"'), "账号池详细状态不能删掉");
   audit("账号池健康度通过", {unknown_not_100: true, count_cards_removed: true});
 });
+test("总览最上面是运行状态（健康度与告警），用量与性能在其后", () => {
+  const html = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
+  const start = html.indexOf('id="panel-overview"');
+  const end = html.indexOf('id="panel-accounts"');
+  assert(start > -1 && end > start, "总览面板必须存在");
+  const overview = html.slice(start, end);
+  const heading = overview.indexOf("overview-subheading");
+  const health = overview.indexOf("health-layout");
+  const usage = overview.indexOf("usage-section");
+  const info = overview.indexOf("gatewayInfo");
+  assert(heading > -1 && health > -1 && usage > -1 && info > -1, "总览必须包含运行状态、用量与运行信息");
+  assert(heading < health && health < usage, "运行状态必须排在用量与性能之前");
+  assert(usage < info, "运行信息仍应排在最后");
+  audit("总览区块顺序通过", {health_first: true, usage_after_health: true});
+});
+
 
 test("账号日志告警分级、脱敏文本转义、已恢复记录剔除和登录退出清理", () => {
   const f = fixture();
