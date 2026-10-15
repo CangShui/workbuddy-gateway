@@ -209,23 +209,24 @@ func TestTTFTLegacySamplesStayOnDiskButNotInAverage(t *testing.T) {
 	}
 }
 
-func TestTTFTCancelledDoesNotCount(t *testing.T) {
+// 中途被切断的流不能进入平均：判定以上游流本身的结果为准，
+// 不再事后检查请求 Context（那会把已完整结束的响应也一起误杀）。
+func TestTTFTInterruptedStreamDoesNotCount(t *testing.T) {
 	modelStatsMu.Lock()
 	old := modelStats
 	modelStats = map[string]*modelStat{}
 	modelStatsMu.Unlock()
 	defer func() { modelStatsMu.Lock(); modelStats = old; modelStatsMu.Unlock() }()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	r := httptest.NewRequest("POST", "/", nil).WithContext(ctx)
+	r := httptest.NewRequest("POST", "/", nil)
 	reader := newTTFTReader(strings.NewReader(""), time.Now().Add(-time.Second))
 	observeFirstToken(reader, firstTokenChunk(t, `{"content":"x"}`))
-	completeTokenStream(reader, true)
-	finishFirstToken(r, "cancelled", 1, reader)
+	// 读取出错或没有结束原因时，处理器会记为未完成。
+	completeTokenStream(reader, false)
+	finishFirstToken(r, "interrupted", 1, reader)
 	modelStatsMu.Lock()
 	defer modelStatsMu.Unlock()
-	if s := modelStats["cancelled"]; s != nil && len(s.Buckets) > 0 {
-		t.Fatal("cancelled entered mean")
+	if s := modelStats["interrupted"]; s != nil && len(s.Buckets) > 0 {
+		t.Fatal("interrupted stream entered mean")
 	}
 }
 
@@ -245,5 +246,84 @@ func TestTTFTFirstTokenStableAndLegacyCLISnapshotHidden(t *testing.T) {
 	legacy.TTFTMetric = ttftMetric
 	if text := renderModelTable([]modelStatSnapshot{legacy}); !strings.Contains(text, formatted) {
 		t.Fatal("valid new-metric CLI value missing")
+	}
+}
+
+// doneDisconnectWriter 模拟常见客户端：读到 [DONE] 就关闭连接，从而取消请求 Context。
+type doneDisconnectWriter struct {
+	*httptest.ResponseRecorder
+	cancel context.CancelFunc
+}
+
+func (w *doneDisconnectWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(p)
+	if strings.Contains(string(p), "data: [DONE]") {
+		w.cancel()
+	}
+	return n, err
+}
+
+// 已完整结束（有结束原因、[DONE] 已下发）的响应，不能因为客户端随后断开而丢掉首 Token 样本。
+// 线上实测：响应本身完整，但延迟结算时看到请求 Context 已取消，样本被误丢。
+func TestTTFTCompletedStreamKeepsSampleAfterClientDisconnect(t *testing.T) {
+	isolatedGatewayConfig(t)
+	resetStatsState(t)
+	loadOptionalStats()
+	modelStatsMu.Lock()
+	old := modelStats
+	modelStats = map[string]*modelStat{}
+	modelStatsMu.Unlock()
+	t.Cleanup(func() { modelStatsMu.Lock(); modelStats = old; modelStatsMu.Unlock() })
+
+	start := time.Now().Add(-40 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := httptest.NewRequest("POST", "/v1/chat/completions", nil).WithContext(ctx)
+	ensureDebugRequestContext(r, "ttft-done-disconnect", start)
+	p := &statsAttempt{id: "test", account: statsAccount{File: "synthetic.json"}, model: "metric-model", started: start}
+	r = r.WithContext(context.WithValue(r.Context(), statsRequestContextKey{}, p))
+
+	pipeR, pipeW := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer pipeW.Close()
+		fmt.Fprint(pipeW, ": heartbeat\n\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n")
+		time.Sleep(20 * time.Millisecond)
+		fmt.Fprint(pipeW, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprint(pipeW, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":7,\"credit\":0.1}}\n\ndata: [DONE]\n\n")
+	}()
+	rec := &doneDisconnectWriter{ResponseRecorder: httptest.NewRecorder(), cancel: cancel}
+	streamChatResponse(rec, r, &http.Response{Body: pipeR}, "metric-model", 1,
+		&Account{Path: "synthetic.json"}, &profileCN, start)
+	<-done
+
+	if r.Context().Err() == nil {
+		t.Fatal("fixture did not cancel the request context; the regression would not be exercised")
+	}
+	statsFinishAttempt(r, rec.Code)
+	requestStats.Lock()
+	rows := append([]statsRequest(nil), requestStats.document.Requests...)
+	requestStats.Unlock()
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d", len(rows))
+	}
+	if !rows[0].Complete || rows[0].Status != http.StatusOK {
+		t.Fatalf("completed response mis-recorded: %+v", rows[0])
+	}
+	if rows[0].TTFTMS == nil || rows[0].TTFTMetric != ttftMetric {
+		t.Fatalf("completed response lost its TTFT after client disconnect: %+v", rows[0])
+	}
+	modelStatsMu.Lock()
+	st := modelStats["metric-model"]
+	var samples int64
+	if st != nil {
+		for _, b := range st.Buckets {
+			samples += b.TTFTSamples
+		}
+	}
+	modelStatsMu.Unlock()
+	if samples != 1 {
+		t.Fatalf("average sample missing: %d", samples)
 	}
 }

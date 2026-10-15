@@ -280,9 +280,11 @@ func completeTokenStream(reader io.Reader, complete bool) {
 	}
 }
 
-// 三种协议、流式/非流式统一结算。只有完整且确有Token的步骤参与均值。
+// 三种协议、流式/非流式统一结算。完整性只由上游流本身决定：
+// 读取出错或没有结束原因都不计；已确认完整结束后，客户端收到 [DONE] 就断开连接属于正常行为，
+// 不得因为事后看到请求 Context 已取消而追溯抹掉首 Token 样本。
 func finishFirstToken(r *http.Request, model string, reqID uint64, body *ttftReader) {
-	complete := body.complete && (r == nil || r.Context().Err() == nil)
+	complete := body.complete
 	known := complete && body.duration() > 0
 	if known {
 		recordModelTTFT(model, body.duration())
@@ -294,7 +296,7 @@ func finishFirstToken(r *http.Request, model string, reqID uint64, body *ttftRea
 			p.ttft = &v
 		}
 	}
-	log.Printf("[首Token统计] traceId=%s requestId=%d 模型=%s 口径=%s 完整=%t 有样本=%t 耗时=%s 起点=网关请求入口 终点=有效文本/推理/工具增量 说明=不计心跳或角色声明，不记录正文；非完整步骤不进入平均",
+	log.Printf("[首Token统计] traceId=%s requestId=%d 模型=%s 口径=%s 完整=%t 有样本=%t 耗时=%s 起点=网关请求入口 终点=有效文本/推理/工具增量 说明=完整性只看上游流是否正常结束；已完整结束后客户端断开不抹除样本；不计心跳或角色声明，不记录正文",
 		debugTraceID(r), reqID, model, ttftMetric, complete, known, body.text())
 }
 
