@@ -187,7 +187,10 @@ test("已知零值显示0，未知额度仍显示横线", () => {
   const f = fixture();
   f.review.renderAccounts([{path: "fixture.json", state: "active", quotaKnown: true}]);
   let row = cells(f.element("accountsTable").innerHTML);
-  for (const i of [7, 8, 9, 11, 12, 15]) assert.equal(row[i], "0");
+  for (const i of [7, 8, 9, 11, 12, 14]) assert.equal(row[i], "0");
+  assert.equal(row.length, 16, "账号表应为 16 列（已去掉刷新令牌到期）");
+  const accountsPage = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
+  assert(!accountsPage.includes("刷新令牌到期"), "表头不应保留已删除的列");
   f.review.renderAccounts([{path: "fixture.json", state: "active", quotaKnown: false}]);
   row = cells(f.element("accountsTable").innerHTML);
   for (const i of [7, 8, 9]) assert.equal(row[i], "-");

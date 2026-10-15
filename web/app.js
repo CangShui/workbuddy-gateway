@@ -725,7 +725,7 @@
     var tb = $("accountsTable").querySelector("tbody");
     var focusTarget = focusedPolicyTarget(tb);
     if (!list.length) {
-      tb.innerHTML = '<tr><td colspan="17" class="empty">' +
+      tb.innerHTML = '<tr><td colspan="16" class="empty">' +
         (onlyUsable ? "没有符合条件的可用账号，取消勾选可查看全部账号。" : "暂无账号数据（服务是否已写入状态快照？）") + '</td></tr>';
       return;
     }
@@ -751,7 +751,6 @@
         "<td>" + esc((a.planLabel || "-") + (a.planStale ? "（待刷新）" : "")) + "</td>" +
         "<td>" + esc(count(a.freeModels)) + "</td>" +
         "<td>" + esc(count(a.modelCooldowns)) + "</td>" +
-        "<td>" + esc(fmtTime(a.refreshExpiresAt)) + "</td>" +
         "<td>" + esc(fmtTime(a.lastRefreshTime)) + "</td>" +
         "<td>" + esc(count(a.refreshFailCount)) + "</td>" +
         "<td><button class=\"ghost danger\" type=\"button\" data-account-delete=\"" +
