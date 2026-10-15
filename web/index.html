@@ -83,16 +83,13 @@
       <div id="usageSummary" class="usage-cards"></div>
       <div class="usage-charts">
         <div class="card chart-card">
-          <div class="card-title">Token 消耗趋势 <span class="chart-legend"><i class="series-dot token"></i>总 Token</span></div>
-          <div id="tokenChart" class="stats-chart"><p class="stats-empty">等待统计</p></div>
-        </div>
-        <div class="card chart-card">
-          <div class="card-title">积分消耗趋势 <span class="chart-legend"><i class="series-dot credit"></i>实际积分</span></div>
-          <div id="creditChart" class="stats-chart"><p class="stats-empty">等待统计</p></div>
+          <div class="card-title">用量趋势 <span class="chart-legend"><i class="series-dot token"></i>总 Token（折线·左轴） <i class="series-dot credit"></i>积分（柱形·右轴）</span></div>
+          <p class="hint">总 Token 用折线、积分用柱形，放在同一张图里对照；两者量级差很多，分别看左右两侧刻度。某个时间桶没有样本时不画点、不补 0。</p>
+          <div id="usageChart" class="stats-chart"><p class="stats-empty">等待统计</p></div>
         </div>
         <div class="card chart-card latency-chart">
           <div class="card-title">请求耗时趋势 <span id="latencyLegend" class="chart-legend"></span></div>
-          <p class="hint">每条线是一个模型在当前时间范围和账号下的平均总耗时，不会把不同模型合成一条平均线。该模型在某个时间桶没有调用时线条断开，不画成 0。首 Token 仍看上方摘要和下面的排名表。</p>
+          <p class="hint">柱形是首 Token，折线是总耗时，同一张图里对照。每条柱、每条线都属于一个模型，不会把不同模型合成一条平均线；该模型在某个时间桶没有样本时柱和线都断开，不画成 0。</p>
           <div id="latencyChart" class="stats-chart"><p class="stats-empty">等待统计</p></div>
         </div>
       </div>

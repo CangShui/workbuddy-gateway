@@ -462,11 +462,14 @@ type statsModelRow struct {
 type statsModelLatency struct {
 	Model        string     `json:"model"`
 	AvgLatencyMS []*float64 `json:"avgLatencyMs"`
+	AvgTTFTMS    []*float64 `json:"avgTtftMs"`
 }
 
 type statsLatencyCell struct {
-	sum float64
-	n   int
+	sum     float64
+	n       int
+	ttftSum float64
+	ttftN   int
 }
 
 var statsZone = time.FixedZone("UTC+8", 8*3600)
@@ -603,6 +606,11 @@ func handleWebUIStats(w http.ResponseWriter, r *http.Request) {
 		}
 		cells[i].sum += row.LatencyMS
 		cells[i].n++
+		// 首字与总耗时同一时间桶、同一模型分别平均，口径与总览摘要一致。
+		if row.TTFTMS != nil && row.TTFTMetric == ttftMetric && row.Complete && row.Status < 400 {
+			cells[i].ttftSum += *row.TTFTMS
+			cells[i].ttftN++
+		}
 	}
 	startedAt, mode, problem, savedAt := requestStats.document.StartedAt, requestStats.mode, requestStats.problem, requestStats.lastSaved
 	requestStats.Unlock()
@@ -632,15 +640,20 @@ func handleWebUIStats(w http.ResponseWriter, r *http.Request) {
 	modelLatency := make([]statsModelLatency, 0, len(models))
 	for _, m := range models {
 		points := make([]*float64, len(buckets))
+		ttftPoints := make([]*float64, len(buckets))
 		if cells := latencyCells[m.Model]; cells != nil {
 			for i, cell := range cells {
 				if cell.n > 0 {
 					v := cell.sum / float64(cell.n)
 					points[i] = &v
 				}
+				if cell.ttftN > 0 {
+					v := cell.ttftSum / float64(cell.ttftN)
+					ttftPoints[i] = &v
+				}
 			}
 		}
-		modelLatency = append(modelLatency, statsModelLatency{Model: m.Model, AvgLatencyMS: points})
+		modelLatency = append(modelLatency, statsModelLatency{Model: m.Model, AvgLatencyMS: points, AvgTTFTMS: ttftPoints})
 	}
 	log.Printf("[统计查询] traceId=%s 维度=%s 单账号=%t 时间桶=%d 请求记录=%d 耗时线条=%d 存储=%s 结果=成功 说明=耗时按模型分别平均，不把各模型合成一条；UTC+8，周一开周；仅读内存聚合，不请求上游", debugTraceID(r), period, account != "", len(buckets), summary.Requests, len(modelLatency), mode)
 	writeAdminData(w, r, map[string]any{

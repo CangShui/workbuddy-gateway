@@ -321,21 +321,22 @@ func TestStatsLatencySeriesStaysPerModel(t *testing.T) {
 	loadOptionalStats()
 	day1 := time.Date(2026, 10, 13, 10, 0, 0, 0, statsZone)
 	day2 := time.Date(2026, 10, 14, 11, 0, 0, 0, statsZone)
-	req := func(account, model string, at time.Time, tokens int64, latency float64) statsRequest {
+	req := func(account, model string, at time.Time, tokens int64, latency, ttft float64) statsRequest {
 		row := statsTestRequest(account, model, at, int64p(tokens), nil)
 		row.LatencyMS = latency
+		row.TTFTMS, row.TTFTMetric, row.Complete, row.Status = &ttft, ttftMetric, true, 200
 		return row
 	}
 	requestStats.Lock()
 	requestStats.document.Accounts["a"] = statsAccount{File: "a.json", Edition: "cn"}
 	requestStats.document.Accounts["b"] = statsAccount{File: "b.json", Edition: "intl"}
 	requestStats.document.Requests = []statsRequest{
-		req("a", "model-fast", day1, 10, 100),
-		req("a", "model-fast", day1, 10, 300),
-		req("a", "model-fast", day2, 10, 300),
-		req("a", "model-slow", day1, 50, 900),
-		req("b", "other-model", day1, 999, 50),
-		req("a", "old-model", time.Date(2026, 10, 1, 10, 0, 0, 0, statsZone), 999999, 10),
+		req("a", "model-fast", day1, 10, 100, 30),
+		req("a", "model-fast", day1, 10, 300, 50),
+		req("a", "model-fast", day2, 10, 300, 60),
+		req("a", "model-slow", day1, 50, 900, 300),
+		req("b", "other-model", day1, 999, 50, 20),
+		req("a", "old-model", time.Date(2026, 10, 1, 10, 0, 0, 0, statsZone), 999999, 10, 10),
 	}
 	requestStats.Unlock()
 
@@ -358,6 +359,14 @@ func TestStatsLatencySeriesStaysPerModel(t *testing.T) {
 	if fast[0] != float64(200) || fast[1] != float64(300) {
 		t.Fatalf("同模型应单独平均，不能和慢模型合成一个值: %+v", fast)
 	}
+	slowTtft := raw[0].(map[string]any)["avgTtftMs"].([]any)
+	fastTtft := raw[1].(map[string]any)["avgTtftMs"].([]any)
+	if len(slowTtft) != 2 || slowTtft[0] != float64(300) || slowTtft[1] != nil {
+		t.Fatalf("首字序列也要按模型分桶，缺失桶为 null: %+v", slowTtft)
+	}
+	if fastTtft[0] != float64(40) || fastTtft[1] != float64(60) {
+		t.Fatalf("首字不能把不同模型合成一个值: %+v", fastTtft)
+	}
 	blended := body["buckets"].([]any)[0].(map[string]any)["avgLatencyMs"].(float64)
 	if blended <= 400 || blended >= 500 {
 		t.Fatalf("时间桶总平均应仍是全部调用的平均，实际 %v", blended)
@@ -366,6 +375,45 @@ func TestStatsLatencySeriesStaysPerModel(t *testing.T) {
 		t.Fatalf("status=%d", code)
 	} else if rows, _ := body["modelLatency"].([]any); len(rows) != 1 || rows[0].(map[string]any)["model"] != "other-model" {
 		t.Fatalf("账号过滤未作用到耗时线: %+v", rows)
+	}
+}
+
+// 首字序列只收 v2 口径、完整且成功的调用；旧口径、未完成、失败都不能混进柱形。
+func TestStatsModelTTFTSeriesIgnoresLegacyAndIncomplete(t *testing.T) {
+	chdirTemp(t)
+	resetStatsState(t)
+	loadOptionalStats()
+	day := time.Date(2026, 10, 13, 10, 0, 0, 0, statsZone)
+	row := func(metric string, complete bool, status int, ttft float64) statsRequest {
+		r := statsTestRequest("a", "m", day, int64p(10), nil)
+		r.LatencyMS = 100
+		r.TTFTMS, r.TTFTMetric, r.Complete, r.Status = &ttft, metric, complete, status
+		return r
+	}
+	requestStats.Lock()
+	requestStats.document.Accounts["a"] = statsAccount{File: "a.json", Edition: "cn"}
+	requestStats.document.Requests = []statsRequest{
+		row(ttftMetric, true, 200, 100),
+		row("", true, 200, 900),          // 旧口径，不能进入首字柱形
+		row(ttftMetric, false, 200, 900), // 不完整
+		row(ttftMetric, true, 429, 900),  // 失败
+	}
+	requestStats.Unlock()
+	code, body := statsQuery(t, "period=day&account=a&start=2026-10-13&end=2026-10-13")
+	if code != http.StatusOK {
+		t.Fatalf("status=%d body=%v", code, body)
+	}
+	rows, _ := body["modelLatency"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("models=%+v", rows)
+	}
+	series, _ := rows[0].(map[string]any)["avgTtftMs"].([]any)
+	if len(series) != 1 || series[0] != float64(100) {
+		t.Fatalf("首字柱形只能收 v2、完整、成功的样本: %+v", series)
+	}
+	latency, _ := rows[0].(map[string]any)["avgLatencyMs"].([]any)
+	if len(latency) != 1 || latency[0] != float64(100) {
+		t.Fatalf("总耗时折线仍是该桶全部调用的平均: %+v", latency)
 	}
 }
 

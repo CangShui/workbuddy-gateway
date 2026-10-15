@@ -65,7 +65,7 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
     showConfigWarning, loadConfigEditor, saveConfigEditor, exitConfigEdit, setTab, lockDashboard,
     initListFilters, changeListFilter, reportRestoredListFilters,
     rateCell, rateKey, rateDetailHTML, ensureRateDetails, toggleRateDetail, restoreRateDetails
-    , renderStats, loadStats, changeStatsFilter, statsLineChart, statsDuration, statsNumber, statsCredit
+    , renderStats, loadStats, changeStatsFilter, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
   };})();`);
   vm.createContext(context);
   vm.runInContext(source, context);
@@ -800,8 +800,8 @@ function statsPayload(over = {}) {
         avgLatencyMs: 800, avgTtftMs: 300},
     ],
     modelLatency: [
-      {model: "deepseek-v4.1-flash", avgLatencyMs: [1500, null]},
-      {model: "hy3", avgLatencyMs: [null, 800]},
+      {model: "deepseek-v4.1-flash", avgLatencyMs: [1500, null], avgTtftMs: [400, null]},
+      {model: "hy3", avgLatencyMs: [null, 800], avgTtftMs: [null, 300]},
     ],
     storage: {mode: "file", message: "", lastSavedAt: 1760000000000},
   }, over);
@@ -929,4 +929,79 @@ test("统计加载不阻塞状态轮询", async () => {
   assert.equal(f.review.state.refreshPending, false, "统计未返回不得让轮询一直处于 pending");
   assert(routes.some(r => r.startsWith("/admin/api/stats")), "总览页应触发一次统计请求");
   audit("统计不阻塞轮询通过", {stats_pending_isolated: true});
+});
+
+test("用量趋势合并为一张图：Token 折线 + 积分柱形，左右双轴", () => {
+  const f = fixture();
+  f.review.renderStats(statsPayload());
+  const svg = f.element("usageChart").innerHTML;
+  assert.match(svg, /class="chart-line series-token"/, "总 Token 必须画成折线");
+  assert.match(svg, /class="chart-bar series-credit"/, "积分必须画成柱形");
+  assert.equal((svg.match(/class="chart-line series-credit"/g) || []).length, 0, "积分不能再画折线");
+  assert.equal((svg.match(/class="chart-bar series-token"/g) || []).length, 0, "Token 不能再画柱形");
+  assert((svg.match(/class="chart-label"/g) || []).length >= 10, "Token 与积分量级不同，必须左右双轴");
+  assert(!/NaN|undefined/.test(svg), "图表不能出现 NaN 或 undefined");
+  audit("用量合并图通过", {token_line: true, credit_bar: true, dual_axis: true});
+});
+
+test("耗时趋势：首 Token 画柱形、总耗时画折线，且都按模型分开", () => {
+  const f = fixture();
+  f.review.renderStats(statsPayload());
+  const svg = f.element("latencyChart").innerHTML;
+  assert.equal((svg.match(/class="chart-line series-m0"/g) || []).length, 1, "总耗时仍是折线");
+  assert.equal((svg.match(/class="chart-line series-m1"/g) || []).length, 1);
+  assert.equal((svg.match(/class="chart-bar series-m0"/g) || []).length, 1, "首 Token 必须是柱形");
+  assert.equal((svg.match(/class="chart-bar series-m1"/g) || []).length, 1);
+  assert.equal((svg.match(/class="chart-line /g) || []).length, 2, "折线数等于模型数");
+  assert.equal((svg.match(/class="chart-bar /g) || []).length, 2, "柱形数等于模型数");
+  assert(!svg.includes("series-token"), "耗时图不能混入用量系列色");
+  audit("耗时柱线组合通过", {ttft_bar: true, latency_line: true, per_model: true});
+});
+
+test("双轴组合图：折线走左轴、柱形走右轴，缺样本处不补零", () => {
+  const f = fixture();
+  const svg = f.review.statsComboChart([
+    statsBucket("2026-10-13", {tokens: 2000000, tokenSamples: 1, credits: 20, creditSamples: 1}),
+    statsBucket("2026-10-14"),
+    statsBucket("2026-10-15", {tokens: 4000000, tokenSamples: 1, credits: 40, creditSamples: 1}),
+  ], {
+    lines: [{label: "总 Token", color: "token", value: b => (b.tokenSamples ? b.tokens : null)}],
+    bars: [{label: "积分", color: "credit", value: b => (b.creditSamples ? b.credits : null)}],
+    title: "双轴", leftFormat: v => (v / 1000000).toFixed(2) + "M",
+    rightFormat: v => Number(v).toFixed(2), box: {w: 600, h: 240}
+  });
+  assert.match(svg, /class="chart-line series-token"/);
+  assert.match(svg, /class="chart-bar series-credit"/);
+  assert((svg.match(/class="chart-label"/g) || []).length >= 10, "双轴必须有左右两套刻度");
+  assert.match(svg, /M<\/text>/, "左轴按 Token 单位显示，右轴按积分精度");
+  assert(!/NaN|undefined/.test(svg), "双轴不能出现 NaN 或 undefined");
+  assert.equal((svg.match(/class="chart-line series-token"/g) || []).length, 2, "中间桶缺样本要断线");
+  assert.equal((svg.match(/class="chart-bar series-credit"/g) || []).length, 2, "中间桶缺样本不画柱");
+  assert(!f.review.statsComboChart([statsBucket("2026-10-14")], {
+    lines: [], bars: [{label: "积分", color: "credit", value: b => (b.creditSamples ? b.credits : null)}],
+    title: "空", leftFormat: String, box: {w: 600, h: 240}
+  }).includes("<svg"), "全空必须显示空状态");
+  audit("双轴组合图通过", {gap_broken: true, dual_axis: true});
+});
+
+test("柱形与折线对齐：柱组中心落在同桶折线点的时间位置", () => {
+  const f = fixture();
+  const svg = f.review.statsComboChart([
+    statsBucket("2026-10-13", {tokens: 10, tokenSamples: 1, credits: 10, creditSamples: 1}),
+    statsBucket("2026-10-14", {tokens: 20, tokenSamples: 1, credits: 20, creditSamples: 1}),
+    statsBucket("2026-10-15", {tokens: 30, tokenSamples: 1, credits: 30, creditSamples: 1}),
+  ], {
+    lines: [{label: "总 Token", color: "token", value: b => (b.tokenSamples ? b.tokens : null)}],
+    bars: [{label: "积分", color: "credit", value: b => (b.creditSamples ? b.credits : null)}],
+    title: "对齐", leftFormat: String, box: {w: 600, h: 240}
+  });
+  const points = [...svg.matchAll(/<circle class="series-token" cx="([\d.]+)"/g)].map(m => Number(m[1]));
+  const centres = [...svg.matchAll(/<rect class="chart-bar series-credit" x="([\d.]+)" y="[\d.]+" width="([\d.]+)"/g)]
+    .map(m => Number(m[1]) + Number(m[2]) / 2);
+  assert.equal(points.length, 3, "折线点数量");
+  assert.equal(centres.length, 3, "柱形数量");
+  points.forEach((cx, i) => {
+    assert(Math.abs(centres[i] - cx) <= 1.5, "第 " + i + " 个柱组中心必须贴合同桶折线点: " + centres[i] + " vs " + cx);
+  });
+  audit("柱线对齐通过", {bars_centered_on_points: true});
 });

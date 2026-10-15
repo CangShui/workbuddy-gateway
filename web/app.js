@@ -127,7 +127,7 @@
     state.statsVersion++;
     state.statsLastPoll = 0;
     state.lastStats = null;
-    ["usageSummary", "tokenChart", "creditChart", "latencyChart", "statsInfo", "statsRange"].forEach(function (id) {
+    ["usageSummary", "usageChart", "latencyChart", "statsInfo", "statsRange"].forEach(function (id) {
       $(id).textContent = "";
     });
     if ($("latencyLegend")) $("latencyLegend").textContent = "";
@@ -280,31 +280,56 @@
   // 原生 SVG，不访问 CDN。空时间桶及未知耗时断开折线，不伪造连续的零值。
   // box 决定 viewBox 尺寸。让它贴近容器实际像素（比例≈1:1），
   // 字号才不会随缩放变小；窄屏用更矮的目标高度。
-  function statsLineChart(buckets, series, title, format, box) {
-    var values = [];
-    series.forEach(function (s) { buckets.forEach(function (b, i) {
+  // 原生 SVG，不加载 CDN。折线在时间桶缺样本处断开，不补零；柱形画在下层，折线覆盖在上层。
+  // opts = {lines, bars, title, leftFormat, rightFormat, box}；给了 rightFormat 时柱形改用右轴。
+  function statsComboChart(buckets, opts) {
+    opts = opts || {};
+    var lines = opts.lines || [], bars = opts.bars || [];
+    var title = opts.title || "";
+    var leftFormat = opts.leftFormat || function (v) { return String(v); };
+    var rightFormat = opts.rightFormat || null;
+    var box = opts.box || {w: 900, h: 260};
+    var pick = function (s, b, i) {
       var v = s.value(b, i);
-      if (v !== null && v !== undefined && isFinite(v)) values.push(Number(v));
-    }); });
-    if (!values.length) return '<p class="stats-empty">该时间范围暂无可用样本</p>';
-    box = box || {w: 900, h: 260};
+      return (v === null || v === undefined || !isFinite(v)) ? null : Number(v);
+    };
+    var gather = function (list) {
+      var out = [];
+      list.forEach(function (s) { buckets.forEach(function (b, i) {
+        var v = pick(s, b, i);
+        if (v !== null) out.push(v);
+      }); });
+      return out;
+    };
+    var lineValues = gather(lines), barValues = gather(bars);
+    if (!lineValues.length && !barValues.length) return '<p class="stats-empty">该时间范围暂无可用样本</p>';
+    var dual = !!rightFormat && barValues.length > 0;
+    var scaleMax = function (values) {
+      var m = values.length ? Math.max.apply(null, values) : 0;
+      if (m <= 0) m = 1;
+      return m * 1.12;
+    };
+    var leftMax = scaleMax(dual ? lineValues : lineValues.concat(barValues));
+    var rightMax = scaleMax(dual ? barValues : []);
     var width = Math.max(260, Math.round(box.w)), height = Math.max(190, Math.round(box.h));
-    var right = 16, top = 18, bottom = 40;
-    var max = Math.max.apply(null, values);
-    if (max <= 0) max = 1;
-    max *= 1.12;
-    // 左侧留白按最长的刻度文字算，避免「27,759,000」这类长标签被裁。
-    var ticks = [0, 1, 2, 3, 4].map(function (n) { return format(max * (1 - n / 4)); });
-    var left = Math.min(130, Math.max(52, 14 + Math.max.apply(null, ticks.map(function (t) { return t.length; })) * 7));
+    var top = 18, bottom = 40;
+    var leftTicks = [0, 1, 2, 3, 4].map(function (n) { return leftFormat(leftMax * (1 - n / 4)); });
+    var rightTicks = dual ? [0, 1, 2, 3, 4].map(function (n) { return rightFormat(rightMax * (1 - n / 4)); }) : [];
+    var left = Math.min(130, Math.max(52, 14 + Math.max.apply(null, leftTicks.map(function (t) { return t.length; })) * 7));
+    var right = dual ? Math.min(130, Math.max(44, 14 + Math.max.apply(null, rightTicks.map(function (t) { return t.length; })) * 7)) : 16;
     var plotW = width - left - right, plotH = height - top - bottom;
     var x = function (i) { return buckets.length < 2 ? left + plotW / 2 : left + i * plotW / (buckets.length - 1); };
-    var y = function (v) { return top + plotH * (1 - v / max); };
+    var yLeft = function (v) { return top + plotH * (1 - v / leftMax); };
+    var yRight = function (v) { return top + plotH * (1 - v / rightMax); };
     var out = '<svg viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="' + esc(title) +
       '"><title>' + esc(title) + '</title>';
     for (var n = 0; n <= 4; n++) {
       var yy = top + plotH * n / 4;
       out += '<line class="chart-grid" x1="' + left + '" y1="' + yy + '" x2="' + (width - right) + '" y2="' + yy + '"/>' +
-        '<text class="chart-label" text-anchor="end" x="' + (left - 8) + '" y="' + (yy + 4) + '">' + esc(ticks[n]) + '</text>';
+        '<text class="chart-label" text-anchor="end" x="' + (left - 8) + '" y="' + (yy + 4) + '">' + esc(leftTicks[n]) + '</text>';
+      if (dual) {
+        out += '<text class="chart-label" text-anchor="start" x="' + (width - right + 8) + '" y="' + (yy + 4) + '">' + esc(rightTicks[n]) + '</text>';
+      }
     }
     // 窄屏把日期缩成 MM-DD；刻度数量按可用宽度反推，避免标签互相重叠。
     var narrow = width < 520;
@@ -349,24 +374,48 @@
       out += '<text class="chart-label" text-anchor="' + t.anchor + '" x="' + t.tx + '" y="' + (height - 12) + '">' +
         esc(tickLabel(buckets[t.i].label)) + '</text>';
     });
-    series.forEach(function (s) {
+    if (bars.length) {
+      // 柱组必须居中在该桶折线点的时间位置上，否则柱会比线偏半个桶位；
+      // 只做 SVG 边界保护，正常尺寸下不会触发。
+      var slot = plotW / Math.max(1, buckets.length);
+      var groupW = Math.min(slot * 0.7, 24);
+      var barW = Math.max(1, groupW / bars.length);
+      var baseY = top + plotH;
+      buckets.forEach(function (b, i) {
+        var groupX = Math.min(Math.max(x(i) - groupW / 2, 0), width - groupW);
+        bars.forEach(function (s, j) {
+          var value = pick(s, b, i);
+          if (value === null) return;
+          var yy = (dual ? yRight : yLeft)(value);
+          var h = Math.max(1, baseY - yy);
+          out += '<rect class="chart-bar series-' + s.color + '" x="' + (groupX + j * barW).toFixed(2) +
+            '" y="' + yy.toFixed(2) + '" width="' + Math.max(1, barW - 1).toFixed(2) + '" height="' + h.toFixed(2) + '">' +
+            '<title>' + esc(b.label + " · " + s.label + " " + (dual ? rightFormat : leftFormat)(value)) + '</title></rect>';
+        });
+      });
+    }
+    lines.forEach(function (s) {
       var points = [], paths = [];
       buckets.forEach(function (b, i) {
-        var value = s.value(b, i);
-        if (value === null || value === undefined || !isFinite(value)) {
+        var value = pick(s, b, i);
+        if (value === null) {
           if (points.length) paths.push(points.join(" "));
           points = [];
           return;
         }
-        var xx = x(i), yy = y(Number(value));
+        var xx = x(i), yy = yLeft(value);
         points.push((points.length ? "L" : "M") + xx.toFixed(2) + "," + yy.toFixed(2));
         out += '<circle class="series-' + s.color + '" cx="' + xx + '" cy="' + yy + '" r="' + (buckets.length > 80 ? 1.8 : 3.2) +
-          '"><title>' + esc(b.label + " · " + s.label + " " + format(value)) + '</title></circle>';
+          '"><title>' + esc(b.label + " · " + s.label + " " + leftFormat(value)) + '</title></circle>';
       });
       if (points.length) paths.push(points.join(" "));
       paths.forEach(function (p) { out += '<path class="chart-line series-' + s.color + '" d="' + p + '"/>'; });
     });
     return out + "</svg>";
+  }
+
+  function statsLineChart(buckets, series, title, format, box) {
+    return statsComboChart(buckets, {lines: series, bars: [], title: title, leftFormat: format, box: box});
   }
 
   function renderStats(data) {
@@ -401,26 +450,36 @@
       var el = $(id), w = el && el.clientWidth ? el.clientWidth : 900;
       return {w: w, h: w < 520 ? 230 : 280};
     };
-    $("tokenChart").innerHTML = statsLineChart(rows, [{label: "总 Token", color: "token", value: function (b) { return b.tokenSamples ? b.tokens : null; }}],
-      "总 Token 消耗趋势", function (v) { return v >= 1000000 ? (v / 1000000).toFixed(2) + "M" : statsNumber(v); }, chartBox("tokenChart"));
-    $("creditChart").innerHTML = statsLineChart(rows, [{label: "积分", color: "credit", value: function (b) { return b.creditSamples ? b.credits : null; }}],
-      "积分消耗趋势", statsCredit, chartBox("creditChart"));
-    var latencyRows = data.modelLatency || [];
-    var latencySeries = latencyRows.map(function (row, index) {
-      return {
-        label: row.model || "未命名模型",
-        color: "m" + (index % 8),
-        value: function (_bucket, i) {
-          var points = row.avgLatencyMs || [];
-          return i < points.length ? points[i] : null;
-        }
-      };
+    $("usageChart").innerHTML = statsComboChart(rows, {
+      lines: [{label: "总 Token", color: "token", value: function (b) { return b.tokenSamples ? b.tokens : null; }}],
+      bars: [{label: "积分", color: "credit", value: function (b) { return b.creditSamples ? b.credits : null; }}],
+      title: "总 Token（折线，左轴）与积分（柱形，右轴）消耗趋势",
+      leftFormat: function (v) { return v >= 1000000 ? (v / 1000000).toFixed(2) + "M" : statsNumber(v); },
+      rightFormat: statsCredit,
+      box: chartBox("usageChart")
     });
-    $("latencyLegend").innerHTML = latencySeries.map(function (s) {
+    var latencyRows = data.modelLatency || [];
+    var latencyLines = [], latencyBars = [];
+    latencyRows.forEach(function (row, index) {
+      var color = "m" + (index % 8), label = row.model || "未命名模型";
+      latencyLines.push({label: label, color: color, value: function (_bucket, i) {
+        var points = row.avgLatencyMs || [];
+        return i < points.length ? points[i] : null;
+      }});
+      latencyBars.push({label: label, color: color, value: function (_bucket, i) {
+        var points = row.avgTtftMs || [];
+        return i < points.length ? points[i] : null;
+      }});
+    });
+    $("latencyLegend").innerHTML = latencyLines.map(function (s) {
       return '<i class="series-dot ' + s.color + '"></i><span>' + esc(s.label) + "</span>";
     }).join("");
-    $("latencyChart").innerHTML = statsLineChart(rows, latencySeries,
-      "各模型请求耗时。按当前时间和账号分别计算，不把不同模型合成一条线", statsDuration, chartBox("latencyChart"));
+    $("latencyChart").innerHTML = statsComboChart(rows, {
+      lines: latencyLines, bars: latencyBars,
+      title: "各模型请求耗时：柱形=首Token，折线=总耗时。按当前时间和账号分别计算",
+      leftFormat: statsDuration,
+      box: chartBox("latencyChart")
+    });
     // 明细改为按模型排名，跟随同一时间范围与账号筛选；服务端已按用量排序并剔除无调用模型。
     var ranked = data.models || [];
     $("statsRange").textContent = data.start + " → " + data.end + " · " + ranked.length + " 个模型有调用";

@@ -459,8 +459,8 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 
 .usage-charts {
   display: grid;
-  /* 固定两列：三张图里有两张单序列，auto-fit 会排出第三列空位。 */
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* 单列堆叠：合并后的用量图和耗时图都需要完整宽度。 */
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
   margin-bottom: 14px;
 }
@@ -554,6 +554,20 @@ circle.series-m4 { fill: var(--series-m4); }
 circle.series-m5 { fill: var(--series-m5); }
 circle.series-m6 { fill: var(--series-m6); }
 circle.series-m7 { fill: var(--series-m7); }
+
+/* 柱形与折线同图时，柱形用半透明的同一系列色，折线保持实线覆盖在上层。 */
+.chart-bar { stroke: none; opacity: 0.55; }
+rect.series-token { fill: var(--series-token); }
+rect.series-credit { fill: var(--series-credit); }
+rect.series-first { fill: var(--series-first); }
+rect.series-m0 { fill: var(--series-m0); }
+rect.series-m1 { fill: var(--series-m1); }
+rect.series-m2 { fill: var(--series-m2); }
+rect.series-m3 { fill: var(--series-m3); }
+rect.series-m4 { fill: var(--series-m4); }
+rect.series-m5 { fill: var(--series-m5); }
+rect.series-m6 { fill: var(--series-m6); }
+rect.series-m7 { fill: var(--series-m7); }
 
 .stats-empty {
   margin: 0;
