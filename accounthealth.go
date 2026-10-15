@@ -50,16 +50,15 @@ func summarizeAccountHealth(accs []accountSnapshot, stale bool) accountHealth {
 type accountAlertRule struct {
 	Label    string
 	Severity string
-	Rank     int
 	Message  string
 }
 
 var accountAlertRules = map[string]accountAlertRule{
-	"disabled":       {"账号失效", "urgent", 0, "登录授权已失效，账号已停止调度，请重新登录。"},
-	"expired":        {"账号过期", "important", 1, "访问令牌已过期，请检查自动续期结果或重新登录。"},
-	"paid_exhausted": {"积分用尽", "important", 1, "已确认账号额度耗尽，收费模型暂不可用；等待额度恢复。"},
-	"cooldown":       {"账号冷却", "warning", 2, "账号触发频率限制，冷却期间暂不调度，请等待自动恢复。"},
-	"paused":         {"账号停用", "notice", 3, "该账号被全局调度规则停用；这不是授权失效，可在账号池恢复。"},
+	"disabled":       {"账号失效", "urgent", "登录授权已失效，账号已停止调度，请重新登录。"},
+	"expired":        {"账号过期", "important", "访问令牌已过期，请检查自动续期结果或重新登录。"},
+	"paid_exhausted": {"积分用尽", "important", "已确认账号额度耗尽，收费模型暂不可用；等待额度恢复。"},
+	"cooldown":       {"账号冷却", "warning", "账号触发频率限制，冷却期间暂不调度，请等待自动恢复。"},
+	"paused":         {"账号停用", "notice", "该账号被全局调度规则停用；这不是授权失效，可在账号池恢复。"},
 }
 
 func accountAlertKinds(acc accountSnapshot) []string {
@@ -291,15 +290,16 @@ func currentAccountAlerts(accs []accountSnapshot, scan accountAlertScan) ([]acco
 				Severity: rule.Severity, Message: rule.Message, At: event.At, LogFile: event.File})
 		}
 	}
+	// 最新日志在上；等级只决定颜色和标签，不改变排序。
+	// 秒级时间相同则按账号、类别稳定排序，避免每次轮询跳动。
 	sort.Slice(out, func(i, j int) bool {
-		a, b := accountAlertRules[out[i].State], accountAlertRules[out[j].State]
-		if a.Rank != b.Rank {
-			return a.Rank < b.Rank
-		}
 		if out[i].At != out[j].At {
 			return out[i].At > out[j].At
 		}
-		return out[i].Account < out[j].Account
+		if out[i].Account != out[j].Account {
+			return out[i].Account < out[j].Account
+		}
+		return out[i].State < out[j].State
 	})
 	return out, missing
 }
@@ -333,7 +333,7 @@ func handleWebUIAccountAlerts(w http.ResponseWriter, r *http.Request) {
 	if limited {
 		alerts = alerts[:100]
 	}
-	log.Printf("[账号告警] traceId=%s 结果=成功 条目=%d 缺少日志=%d 扫描字节=%d 扫描截断=%t 说明=只返回快照中仍异常且有日志证据的账号，不含令牌或上游错误正文", debugTraceID(r), len(alerts), missing, scan.Scanned, scan.Truncated)
+	log.Printf("[账号告警] traceId=%s 结果=成功 条目=%d 缺少日志=%d 扫描字节=%d 扫描截断=%t 排序=最新日志优先 说明=先剔除已恢复项，再按时间倒序取前100条；等级只用于颜色和标签，不含令牌或上游错误正文", debugTraceID(r), len(alerts), missing, scan.Scanned, scan.Truncated)
 	writeAdminData(w, r, map[string]any{
 		"alerts": alerts, "updatedAt": snap.UpdatedAt, "stale": time.Now().Unix()-snap.UpdatedAt > 15,
 		"source": "gateway 普通日志", "missingLogCount": missing,

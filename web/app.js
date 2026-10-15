@@ -230,7 +230,7 @@
         });
       });
     }
-    var notes = ["来源：普通日志 · 只列当前异常，按紧急程度排序"];
+    var notes = ["来源：普通日志 · 只列当前异常，最新告警在上；等级仅区分颜色和标签"];
     if (data.stale || (snapshot && snapshot.stale)) notes.push("快照过旧，以下为上次确认的异常");
     if (data.missingLogCount) notes.push("部分异常暂未找到对应日志，可能等待下一次扫描");
     if (data.scanTruncated || data.listTruncated) notes.push("已达到读取上限，仅显示扫描范围内记录");

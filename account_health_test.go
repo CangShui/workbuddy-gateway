@@ -118,11 +118,100 @@ func TestAccountAlertReadDeduplicateAndResolve(t *testing.T) {
 	rows := []accountSnapshot{{Path: "a.json", State: "active"}, {Path: "b.json", State: "expired"},
 		{Path: "c.json", State: "active", SchedulingEnabled: &off}, {Path: "d.json", State: "cooldown"}}
 	alerts, missing := currentAccountAlerts(rows, scan)
-	if len(alerts) != 2 || alerts[0].State != "expired" || alerts[1].State != "paused" || missing != 1 {
-		t.Fatalf("recovery/dedup/priority: %+v missing=%d", alerts, missing)
+	if len(alerts) != 2 || alerts[0].State != "paused" || alerts[1].State != "expired" || missing != 1 {
+		t.Fatalf("recovery/dedup/newest first: %+v missing=%d", alerts, missing)
 	}
 	if alerts[0].LogFile != day {
 		t.Fatal("source must reference real log")
+	}
+}
+
+func TestAccountAlertNewestFirstWithoutSeverityPriority(t *testing.T) {
+	off := false
+	rows := []accountSnapshot{
+		{Path: "old-urgent.json", State: "disabled"},
+		{Path: "new-notice.json", State: "active", SchedulingEnabled: &off},
+		{Path: "middle-important.json", State: "expired"},
+		{Path: "same-time.json", State: "paid_exhausted", SchedulingEnabled: &off},
+	}
+	scan := accountAlertScan{Events: map[string]accountLogEvent{}}
+	for _, event := range []accountLogEvent{
+		{At: 100, Account: "old-urgent.json", State: "disabled"},
+		{At: 500, Account: "new-notice.json", State: "paused"},
+		{At: 300, Account: "middle-important.json", State: "expired"},
+		{At: 300, Account: "same-time.json", State: "paused"},
+		{At: 300, Account: "same-time.json", State: "paid_exhausted"},
+	} {
+		scan.Events[event.Account+"\x00"+event.State] = event
+	}
+	alerts, missing := currentAccountAlerts(rows, scan)
+	want := []string{"new-notice.json/paused", "middle-important.json/expired",
+		"same-time.json/paid_exhausted", "same-time.json/paused", "old-urgent.json/disabled"}
+	if missing != 0 || len(alerts) != len(want) {
+		t.Fatalf("alerts=%+v missing=%d", alerts, missing)
+	}
+	for i, alert := range alerts {
+		if got := alert.Account + "/" + alert.State; got != want[i] {
+			t.Fatalf("position %d got=%s want=%s; severity must not override timestamp", i, got, want[i])
+		}
+	}
+	if alerts[0].Severity != "notice" || alerts[len(alerts)-1].Severity != "urgent" {
+		t.Fatal("new ordering must preserve severity labels")
+	}
+	// Recovery removes only the resolved category. Global pause remains.
+	rows[3].State = "active"
+	alerts, missing = currentAccountAlerts(rows, scan)
+	if missing != 0 || len(alerts) != 4 {
+		t.Fatalf("recovery did not remove only the quota alert: %+v missing=%d", alerts, missing)
+	}
+	for _, alert := range alerts {
+		if alert.Account == "same-time.json" && alert.State != "paused" {
+			t.Fatal("resolved quota alert must not survive merely because the account remains paused")
+		}
+	}
+}
+
+func TestAccountAlertRecoveryUsesFreshSnapshotWhileLogsCached(t *testing.T) {
+	isolatedGatewayConfig(t)
+	accountAlertCache.Lock()
+	oldAt, oldScan := accountAlertCache.at, accountAlertCache.scan
+	accountAlertCache.at = time.Now()
+	accountAlertCache.scan = accountAlertScan{Events: map[string]accountLogEvent{
+		"a.json\x00cooldown": {At: time.Now().Unix(), Account: "a.json", State: "cooldown"},
+	}}
+	cachedAt := accountAlertCache.at
+	accountAlertCache.Unlock()
+	t.Cleanup(func() {
+		accountAlertCache.Lock()
+		accountAlertCache.at, accountAlertCache.scan = oldAt, oldScan
+		accountAlertCache.Unlock()
+	})
+	for _, state := range []string{"cooldown", "active"} {
+		raw, err := json.Marshal(statusSnapshot{UpdatedAt: time.Now().Unix(),
+			Accounts: []accountSnapshot{{Path: "a.json", State: state}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(statusSnapshotFile, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		rec := httptest.NewRecorder()
+		handleWebUIAccountAlerts(rec, httptest.NewRequest(http.MethodGet, "/admin/api/account-alerts", nil))
+		var body struct {
+			Alerts []accountAlertView `json:"alerts"`
+		}
+		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &body) != nil {
+			t.Fatalf("state=%s code=%d body=%s", state, rec.Code, rec.Body)
+		}
+		if (state == "cooldown" && len(body.Alerts) != 1) || (state == "active" && len(body.Alerts) != 0) {
+			t.Fatalf("latest snapshot must hide recovered account without rescanning logs: state=%s alerts=%+v", state, body.Alerts)
+		}
+	}
+	accountAlertCache.Lock()
+	unchanged := accountAlertCache.at.Equal(cachedAt) && len(accountAlertCache.scan.Events) == 1
+	accountAlertCache.Unlock()
+	if !unchanged {
+		t.Fatal("fixture unexpectedly rescanned logs; recovery must be independent of the 10s log cache")
 	}
 }
 

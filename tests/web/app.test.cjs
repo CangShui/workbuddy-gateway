@@ -100,9 +100,9 @@ test("运行状态只展示健康度，无账号和过旧快照不能显示100%"
 test("账号日志告警分级、脱敏文本转义、已恢复记录剔除和登录退出清理", () => {
   const f = fixture();
   const alerts = [
-    {account: "expired.json", state: "expired", severity: "important", label: "账号过期", message: "请检查续期", at: 1791980000, logFile: "gateway-2026-10-14.log"},
+    {account: "paused.json", state: "paused", severity: "notice", label: "账号停用", message: "主动停用", at: 1791980002, logFile: "gateway.log"},
     {account: "dead<script>.json", state: "disabled", severity: "urgent", label: "账号失效", message: '<img src=x onerror="alert(1)">', at: 1791980001, logFile: "gateway.log"},
-    {account: "paused.json", state: "paused", severity: "notice", label: "账号停用", message: "主动停用", at: 1791980002, logFile: "gateway.log"}
+    {account: "expired.json", state: "expired", severity: "important", label: "账号过期", message: "请检查续期", at: 1791980000, logFile: "gateway-2026-10-14.log"}
   ];
   f.review.state.lastStatus = {accounts: [
     {path: "expired.json", state: "active"},
@@ -115,6 +115,9 @@ test("账号日志告警分级、脱敏文本转义、已恢复记录剔除和�
   assert(html.includes("alert-urgent") && html.includes("紧急"));
   assert(html.includes("alert-notice") && html.includes("提示"));
   assert(html.includes("&lt;script&gt;") && !html.includes("<img"));
+  assert(html.indexOf("paused.json") < html.indexOf("dead&lt;script&gt;.json"), "较新的提示告警必须在较旧紧急告警之前，前端不得重新按等级排序");
+  assert.match(f.element("accountAlertsInfo").textContent, /最新告警在上/);
+  assert(!f.element("accountAlertsInfo").textContent.includes("按紧急程度排序"));
   f.review.renderAccountAlerts({alerts: [], missingLogCount: 1, scanTruncated: true});
   assert.match(f.element("accountAlerts").innerHTML, /暂未找到对应日志/);
   assert.match(f.element("accountAlertsInfo").textContent, /读取上限/);
@@ -122,6 +125,34 @@ test("账号日志告警分级、脱敏文本转义、已恢复记录剔除和�
   assert.equal(f.review.state.lastAccountAlerts, null);
   assert(!f.element("accountAlerts").innerHTML.includes("dead"));
   audit("账号告警展示通过", {recovered_removed: true, escaped: true, logout_cleared: true});
+});
+
+test("新状态快照恢复后立即剔除旧告警，无需等待再次扫描日志", () => {
+  const f = fixture();
+  const payload = {alerts: [
+    {account: "cooling.json", state: "cooldown", severity: "warning", label: "账号冷却",
+      message: "等待恢复", at: 1791980005, logFile: "gateway.log"},
+    {account: "paused.json", state: "paid_exhausted", severity: "important", label: "积分用尽",
+      message: "等待额度", at: 1791980004, logFile: "gateway.log"},
+    {account: "paused.json", state: "paused", severity: "notice", label: "账号停用",
+      message: "主动停用", at: 1791980003, logFile: "gateway.log"}
+  ]};
+  f.review.state.lastStatus = {accounts: [
+    {path: "cooling.json", state: "cooldown"},
+    {path: "paused.json", state: "paid_exhausted", schedulingEnabled: false}
+  ]};
+  f.review.renderAccountAlerts(payload);
+  assert.match(f.element("accountAlerts").innerHTML, /账号冷却/);
+  assert.match(f.element("accountAlerts").innerHTML, /积分用尽/);
+  // renderStatus re-filters the existing payload on the normal status poll.
+  f.review.renderStatus({accounts: [
+    {path: "cooling.json", state: "active"},
+    {path: "paused.json", state: "active", schedulingEnabled: false}
+  ]});
+  const html = f.element("accountAlerts").innerHTML;
+  assert(!html.includes("账号冷却") && !html.includes("积分用尽"));
+  assert(html.includes("账号停用"), "额度恢复不能自动撤销用户主动停用");
+  audit("新快照剔除已恢复告警通过", {log_rescan_required: false, manual_pause_preserved: true});
 });
 
 test("告警日志加载失败保留旧结果，不假报无异常", async () => {
