@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.14"
+	version = "1.14.15"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"

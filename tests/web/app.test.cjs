@@ -67,6 +67,7 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
     rateCell, rateKey, rateDetailHTML, ensureRateDetails, toggleRateDetail, restoreRateDetails
     , renderStats, loadStats, changeStatsFilter, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
     , openAddAccount, startAddAccount, pollAddAccount, closeAddAccount, accountRowActions
+    , initStatsFilter, writeStatsFilterCookie, readStatsFilterCookie
   };})();`);
   vm.createContext(context);
   vm.runInContext(source, context);
@@ -1070,4 +1071,65 @@ test("账号池：添加账号表单复用登录流程，每行可删除凭据",
   assert.equal(calls.filter(c => c === "POST /admin/api/account-cancel").length, cancelsBefore,
     "没有进行中的会话时关闭不应请求取消");
   audit("账号新增与删除通过", {default_name_no_path: true, confirm_required: true});
+});
+
+test("统计筛选记进 Cookie：粒度/范围/日期可恢复，失效账号退回全局", async () => {
+  const f = fixture(async () => response(200, statsPayload({account: "acc-a"})));
+  f.review.state.apiKey = "synthetic-admin";
+
+  // 用户改过粒度、范围与日期后查询，四项都应写进 Cookie。
+  f.element("statsPeriod").value = "week";
+  f.element("statsStart").value = "2026-10-01";
+  f.element("statsEnd").value = "2026-10-07";
+  f.review.state.statsDatesTouched = true;
+  f.element("statsAccount").value = "acc-a";
+  await f.review.changeStatsFilter(false);
+  const saved = JSON.parse(decodeURIComponent(f.cookies.get("gateway_stats_filter")));
+  assert.equal(saved.period, "week");
+  assert.equal(saved.account, "acc-a");
+  assert.equal(saved.start, "2026-10-01");
+  assert.equal(saved.end, "2026-10-07");
+  const stored = f.cookieWrites[f.cookieWrites.length - 1];
+  assert.match(stored, /Path=\/ui/);
+  assert.match(stored, /SameSite=Lax/);
+  assert.match(stored, /Max-Age=31536000/);
+
+  // 新会话带着同一个 Cookie 打开，控件自动回到上次选择。
+  const restored = fixture(async () => response(200, statsPayload({account: "acc-a"})), new Map(f.cookies));
+  restored.review.initStatsFilter();
+  assert.equal(restored.element("statsPeriod").value, "week");
+  assert.equal(restored.element("statsStart").value, "2026-10-01");
+  assert.equal(restored.element("statsEnd").value, "2026-10-07");
+  assert.equal(restored.review.state.statsAccount, "acc-a");
+
+  // 没动过日期时不冻结默认区间，Cookie 里的日期保持为空。
+  const plain = fixture(async () => response(200, {}), new Map());
+  plain.review.state.apiKey = "synthetic-admin";
+  plain.element("statsStart").value = "";
+  plain.element("statsEnd").value = "";
+  plain.review.state.statsDatesTouched = false;
+  await plain.review.changeStatsFilter(false);
+  const plainSaved = JSON.parse(decodeURIComponent(plain.cookies.get("gateway_stats_filter")));
+  assert.equal(plainSaved.start, "");
+  assert.equal(plainSaved.end, "");
+
+  // 记住的账号已被删除：服务端返回 400 后自动清掉并回到全局查询。
+  const seen = [];
+  const staleJar = new Map([["gateway_stats_filter",
+    encodeURIComponent(JSON.stringify({period: "day", account: "gone", start: "", end: ""}))]]);
+  const stale = fixture(async (url) => {
+    seen.push(url);
+    return url.indexOf("account=gone") > -1
+      ? response(400, {error: "账号统计标识不存在"})
+      : response(200, statsPayload());
+  }, staleJar);
+  stale.review.state.apiKey = "synthetic-admin";
+  stale.review.initStatsFilter();
+  assert.equal(stale.review.state.statsAccount, "gone");
+  await stale.review.loadStats(true);
+  assert.equal(stale.review.state.statsAccount, "", "失效账号必须被清掉");
+  assert(seen.some(function (u) { return u.indexOf("account=") === -1; }), "必须回退到全局查询");
+  assert.equal(JSON.parse(decodeURIComponent(stale.cookies.get("gateway_stats_filter"))).account, "");
+
+  audit("统计筛选 Cookie 通过", {restored: true, dates_opt_in: true, stale_account_fallback: true});
 });

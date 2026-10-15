@@ -44,7 +44,9 @@
     accountAlertsGeneration: 0,
     lastAccountAlerts: null,
     addAccountId: "",
-    addAccountPoll: 0
+    addAccountPoll: 0,
+    statsAccount: "",
+    statsDatesTouched: false
   };
 
   function $(id) { return document.getElementById(id); }
@@ -436,12 +438,14 @@
       " 首Token按有效内容增量计时，仅完整步骤参与平均；旧首响应体样本不混入（排除 " + (s.legacyTtftSamples || 0) + " 条）。不等同于 dsh 当前会话范围。";
     $("statsStart").value = data.start;
     $("statsEnd").value = data.end;
-    var choice = data.account || "";
+    var choice = state.statsAccount || data.account || "";
     $("statsAccount").innerHTML = '<option value="">全局 · 全部账号</option>' + (data.accounts || []).map(function (a) {
       return '<option value="' + esc(a.id) + '"' + (a.id === choice ? " selected" : "") + '>' +
         esc(a.file + " · " + (a.edition === "intl" ? "国际" : "国内") + " · " + a.id.slice(0, 6)) + "</option>";
     }).join("");
+    if (!(data.accounts || []).some(function (a) { return a.id === choice; })) choice = "";
     $("statsAccount").value = choice;
+    state.statsAccount = choice;
     var coverage = (s.tokenSamples || 0) + "/" + (s.requests || 0) + " 请求有 Token";
     $("usageSummary").innerHTML =
       statsCard("总消耗 Token", s.tokenSamples ? statsNumber(s.tokens) : "—", "输入 " + statsNumber(s.inputTokens) +
@@ -503,8 +507,9 @@
     state.statsPending = true;
     var version = state.statsVersion, key = state.apiKey;
     var params = ["period=" + encodeURIComponent($("statsPeriod").value || "day")];
-    ["account", "start", "end"].forEach(function (field) {
-      var value = $(field === "account" ? "statsAccount" : (field === "start" ? "statsStart" : "statsEnd")).value;
+    if (state.statsAccount) params.push("account=" + encodeURIComponent(state.statsAccount));
+    ["start", "end"].forEach(function (field) {
+      var value = $(field === "start" ? "statsStart" : "statsEnd").value;
       if (value) params.push(field + "=" + encodeURIComponent(value));
     });
     $("statsInfo").textContent = "正在读取统计；图表与表格保持上次数据…";
@@ -512,7 +517,14 @@
       if (version !== state.statsVersion || key !== state.apiKey) return;
       renderStats(data);
       state.statsLastPoll = Date.now();
-    }).catch(function () {
+    }).catch(function (err) {
+      if (err && err.status === 400 && state.statsAccount) {
+        // 上次记住的账号已被删除时，退回全局查询而不是一直报错。
+        state.statsAccount = "";
+        rememberStatsFilter();
+        state.statsVersion++;
+        return;
+      }
       if (version === state.statsVersion && key === state.apiKey) $("statsInfo").textContent = "统计读取失败，图表保留上次结果；请检查筛选日期或稍后重试。";
     }).then(function () {
       state.statsPending = false;
@@ -523,7 +535,13 @@
   function changeStatsFilter(resetDates) {
     state.statsVersion++;
     state.statsLastPoll = 0;
-    if (resetDates) { $("statsStart").value = ""; $("statsEnd").value = ""; }
+    if (resetDates) {
+      $("statsStart").value = "";
+      $("statsEnd").value = "";
+      state.statsDatesTouched = false;
+    }
+    state.statsAccount = $("statsAccount").value || "";
+    rememberStatsFilter();
     return loadStats(true);
   }
 
@@ -566,6 +584,82 @@
   };
 
   // Cookie 仅保存两个显示偏好，不包含管理 Key、凭据、配置或账号信息。
+  // 统计筛选（粒度/范围/起止日期）记在 Cookie 里，退出登录或重新打开页面都能恢复。
+  // 只保存用户真正改过的日期：没动过就留空，继续用默认的滚动区间，避免把默认区间冻结住。
+  var STATS_FILTER_COOKIE = "gateway_stats_filter";
+
+  function readCookieRaw(name) {
+    try {
+      var cookies = String(document.cookie || "").split(";");
+      for (var i = 0; i < cookies.length; i++) {
+        var pair = cookies[i].trim();
+        if (pair.indexOf(name + "=") === 0) return decodeURIComponent(pair.slice(name.length + 1));
+      }
+    } catch (_) { /* Cookie 被禁用时按默认值渲染，不影响登录与查询 */ }
+    return "";
+  }
+
+  function writeCookieRaw(name, value) {
+    try {
+      document.cookie = name + "=" + encodeURIComponent(value) +
+        "; Path=/ui; Max-Age=31536000; SameSite=Lax" +
+        (window.location.protocol === "https:" ? "; Secure" : "");
+      return readCookieRaw(name) === value;
+    } catch (_) { return false; }
+  }
+
+  function readStatsFilterCookie() {
+    var raw = readCookieRaw(STATS_FILTER_COOKIE);
+    if (!raw) return null;
+    try {
+      var saved = JSON.parse(raw);
+      if (!saved || typeof saved !== "object") return null;
+      var periods = ["hour", "day", "week", "month"];
+      return {
+        period: periods.indexOf(saved.period) > -1 ? saved.period : "",
+        account: typeof saved.account === "string" ? saved.account : "",
+        start: typeof saved.start === "string" ? saved.start : "",
+        end: typeof saved.end === "string" ? saved.end : ""
+      };
+    } catch (_) { return null; }
+  }
+
+  function writeStatsFilterCookie() {
+    return writeCookieRaw(STATS_FILTER_COOKIE, JSON.stringify({
+      period: $("statsPeriod").value || "day",
+      account: state.statsAccount || "",
+      start: state.statsDatesTouched ? ($("statsStart").value || "") : "",
+      end: state.statsDatesTouched ? ($("statsEnd").value || "") : ""
+    }));
+  }
+
+  function initStatsFilter() {
+    var saved = readStatsFilterCookie();
+    if (!saved) return;
+    if (saved.period) $("statsPeriod").value = saved.period;
+    state.statsAccount = saved.account;
+    if (saved.start || saved.end) {
+      $("statsStart").value = saved.start;
+      $("statsEnd").value = saved.end;
+      state.statsDatesTouched = true;
+    }
+    var hint = $("statsFilterStatus");
+    if (hint) {
+      hint.textContent = "已恢复上次的统计筛选；改完点「查询」即可生效。";
+      hint.classList.remove("hidden");
+    }
+  }
+
+  function rememberStatsFilter() {
+    var remembered = writeStatsFilterCookie();
+    var hint = $("statsFilterStatus");
+    if (hint) {
+      hint.textContent = remembered ? "" : "统计筛选已应用，但浏览器没能保存 Cookie，刷新后可能记不住这次选择。";
+      hint.classList.toggle("hidden", remembered);
+    }
+    return remembered;
+  }
+
   function readListFilterCookie(name) {
     try {
       var cookies = String(document.cookie || "").split(";");
@@ -1415,6 +1509,10 @@
     // 清理旧版同源页面遗留的模型 API Key，不把它误当成管理 Key。
     localStorage.removeItem("wb_gateway_api_key");
     initListFilters();
+    initStatsFilter();
+    ["statsStart", "statsEnd"].forEach(function (id) {
+      $(id).addEventListener("change", function () { state.statsDatesTouched = true; });
+    });
     $("apiKey").value = state.apiKey;
     initTheme();
     $("saveKey").addEventListener("click", saveKey);
