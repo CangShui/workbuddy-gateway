@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -72,30 +73,57 @@ func TestAccountAlertParsesKnownLogsOnly(t *testing.T) {
 	}
 }
 
-func TestAccountStateLogsTransitionsWithoutFlooding(t *testing.T) {
-	accountStateLog.Lock()
-	old := accountStateLog.last
-	accountStateLog.last = map[string]string{}
-	accountStateLog.Unlock()
-	t.Cleanup(func() { accountStateLog.Lock(); accountStateLog.last = old; accountStateLog.Unlock() })
+func TestAccountAlertMarksTrackTransitionsWithoutFlooding(t *testing.T) {
+	accountAlertMarks.Lock()
+	oldCurrent, oldLast := accountAlertMarks.current, accountAlertMarks.last
+	accountAlertMarks.current, accountAlertMarks.last = map[string]accountAlertMark{}, map[string]string{}
+	accountAlertMarks.Unlock()
+	t.Cleanup(func() {
+		accountAlertMarks.Lock()
+		accountAlertMarks.current, accountAlertMarks.last = oldCurrent, oldLast
+		accountAlertMarks.Unlock()
+	})
 	var audit bytes.Buffer
 	writer := log.Writer()
 	log.SetOutput(&audit)
 	defer log.SetOutput(writer)
 	off := false
+	now := time.Now().Unix()
 	rows := []accountSnapshot{{Path: "a.json", State: "expired", SchedulingEnabled: &off, DisabledReason: "Bearer never-emit-raw"}}
-	logAccountStateChanges(rows, time.Now().Unix())
-	logAccountStateChanges(rows, time.Now().Add(time.Second).Unix())
-	if strings.Count(audit.String(), "[账号状态]") != 2 {
-		t.Fatal("identical snapshot must not flood logs")
+	marks := recordAccountAlertMarks(rows, now)
+	recordAccountAlertMarks(rows, now+1)
+	if got := strings.Count(audit.String(), "[账号状态]"); got != 2 {
+		t.Fatalf("状态没变化时不应重复写日志，实际写了 %d 条", got)
 	}
-	if !strings.Contains(audit.String(), `"state":"expired"`) || !strings.Contains(audit.String(), `"state":"paused"`) || strings.Contains(audit.String(), "never-emit-raw") {
-		t.Fatal("missing kinds or leaked raw reason")
+	if strings.Contains(audit.String(), "never-emit-raw") {
+		t.Fatal("不能把失效原因原文写进日志")
+	}
+	seen := map[string]bool{}
+	for _, mark := range marks["a.json"] {
+		seen[mark.State] = true
+		if mark.At != now {
+			t.Fatalf("标记时间应为首次观察时间: %+v", mark)
+		}
+	}
+	// 重复快照必须沿用同一份标记：时间不刷新，定位符也不能丢。
+	if again := recordAccountAlertMarks(rows, now+9); len(again["a.json"]) == 0 {
+		t.Fatal("重复快照不应丢掉告警标记")
+	} else {
+		for _, mark := range again["a.json"] {
+			if mark.At != now {
+				t.Fatalf("重复快照不得刷新首次观察时间: %+v", mark)
+			}
+		}
+	}
+	if !seen["expired"] || !seen["paused"] {
+		t.Fatalf("快照标记应包含当前全部异常类别: %+v", marks)
 	}
 	rows[0].State, rows[0].SchedulingEnabled = "active", nil
-	logAccountStateChanges(rows, time.Now().Add(2*time.Second).Unix())
+	if after := recordAccountAlertMarks(rows, now+2); len(after["a.json"]) != 0 {
+		t.Fatalf("恢复后不应再保留告警标记: %+v", after)
+	}
 	if !strings.Contains(audit.String(), `"state":"active"`) {
-		t.Fatal("recovery transition not logged")
+		t.Fatal("恢复转换也应留一条审计日志")
 	}
 }
 
@@ -293,5 +321,50 @@ func TestAccountAlertLogReadFailureDoesNotBreakHealth(t *testing.T) {
 	handleWebUIStatus(rec, httptest.NewRequest(http.MethodGet, "/admin/api/status", nil))
 	if rec.Code != 200 {
 		t.Fatalf("logs failure broke health endpoint: %d", rec.Code)
+	}
+}
+
+func TestReadWebLogAroundFocusesOffset(t *testing.T) {
+	chdirTemp(t)
+	if err := os.Mkdir(logDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	name := "gateway-2026-10-16.log"
+	var body strings.Builder
+	offset := int64(0)
+	for i := 1; i <= 50; i++ {
+		line := fmt.Sprintf("line-%02d\n", i)
+		if i == 30 {
+			offset = int64(body.Len())
+		}
+		body.WriteString(line)
+	}
+	if err := os.WriteFile(filepath.Join(logDir, name), []byte(body.String()), 0600); err != nil {
+		t.Fatal(err)
+	}
+	lines, focus, resolved, err := readWebLogAround(name, offset, 64)
+	if err != nil || !resolved {
+		t.Fatalf("err=%v resolved=%t", err, resolved)
+	}
+	if focus < 0 || focus >= len(lines) || lines[focus] != "line-30" {
+		t.Fatalf("定位到错误行 focus=%d lines=%v", focus, lines)
+	}
+	// 偏移超出文件（日志已轮转或清理）时不能假装定位成功。
+	if _, _, resolved, err := readWebLogAround(name, 1<<20, 64); err != nil || resolved {
+		t.Fatalf("越界偏移应 resolved=false: resolved=%t err=%v", resolved, err)
+	}
+}
+
+func TestSnapshotAlertsPreferInlineAndHideRecovered(t *testing.T) {
+	mark := accountAlertMark{State: "cooldown", At: 1792056948, LogFile: "gateway-2026-10-16.log", LogOffset: 12345}
+	rows := []accountSnapshot{{Path: "a.json", State: "cooldown", Alerts: []accountAlertMark{mark}}}
+	alerts := currentAlertsFromSnapshot(rows)
+	if len(alerts) != 1 || alerts[0].LogOffset != 12345 || alerts[0].Severity != "warning" {
+		t.Fatalf("快照内联告警渲染错误: %+v", alerts)
+	}
+	// 账号已恢复但快照标记还残留时，不允许继续展示。
+	rows[0].State = "active"
+	if got := currentAlertsFromSnapshot(rows); len(got) != 0 {
+		t.Fatalf("恢复后必须不再展示: %+v", got)
 	}
 }

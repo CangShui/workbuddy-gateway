@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.15"
+	version = "1.14.17"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -2678,24 +2678,25 @@ func runRefresh() {
 
 // accountSnapshot 是写入状态快照文件的单个账号状态。
 type accountSnapshot struct {
-	Path              string  `json:"path"`
-	SchedulingEnabled *bool   `json:"schedulingEnabled,omitempty"`
-	SchedulingReason  string  `json:"schedulingReason,omitempty"`
-	Edition           string  `json:"edition,omitempty"` // 站点标识（cn/intl）
-	Nickname          string  `json:"nickname"`
-	UID               string  `json:"uid"`
-	State             string  `json:"state"` // active | cooldown | paid_exhausted | expired | disabled
-	CooldownUntil     int64   `json:"cooldownUntil,omitempty"`
-	CooldownMsg       string  `json:"cooldownMsg,omitempty"`
-	DisabledReason    string  `json:"disabledReason,omitempty"`
-	TokenExpiresAt    int64   `json:"tokenExpiresAt,omitempty"`
-	QuotaTotal        float64 `json:"quotaTotal,omitempty"`
-	QuotaUsed         float64 `json:"quotaUsed,omitempty"`
-	QuotaRemaining    float64 `json:"quotaRemaining"`
-	IsPaidUser        bool    `json:"isPaidUser"`
-	PlanLabel         string  `json:"planLabel,omitempty"` // 官方套餐名称或已知短名称
-	PlanCheckedAt     int64   `json:"planCheckedAt,omitempty"`
-	PlanStale         bool    `json:"planStale,omitempty"`
+	Alerts            []accountAlertMark `json:"alerts,omitempty"`
+	Path              string             `json:"path"`
+	SchedulingEnabled *bool              `json:"schedulingEnabled,omitempty"`
+	SchedulingReason  string             `json:"schedulingReason,omitempty"`
+	Edition           string             `json:"edition,omitempty"` // 站点标识（cn/intl）
+	Nickname          string             `json:"nickname"`
+	UID               string             `json:"uid"`
+	State             string             `json:"state"` // active | cooldown | paid_exhausted | expired | disabled
+	CooldownUntil     int64              `json:"cooldownUntil,omitempty"`
+	CooldownMsg       string             `json:"cooldownMsg,omitempty"`
+	DisabledReason    string             `json:"disabledReason,omitempty"`
+	TokenExpiresAt    int64              `json:"tokenExpiresAt,omitempty"`
+	QuotaTotal        float64            `json:"quotaTotal,omitempty"`
+	QuotaUsed         float64            `json:"quotaUsed,omitempty"`
+	QuotaRemaining    float64            `json:"quotaRemaining"`
+	IsPaidUser        bool               `json:"isPaidUser"`
+	PlanLabel         string             `json:"planLabel,omitempty"` // 官方套餐名称或已知短名称
+	PlanCheckedAt     int64              `json:"planCheckedAt,omitempty"`
+	PlanStale         bool               `json:"planStale,omitempty"`
 	// 登录续期状态：刷新令牌到期时间与最近成功续期时间，便于提前发现需要重新登录的账号。
 	RefreshExpiresAt int64                         `json:"refreshExpiresAt,omitempty"`
 	LastRefreshTime  int64                         `json:"lastRefreshTime,omitempty"`
@@ -2719,6 +2720,7 @@ type modelStateSnapshot struct {
 
 // statusSnapshot 是写入 workbuddy-status.json 的完整快照。
 type statusSnapshot struct {
+	AlertSource  string              `json:"alertSource,omitempty"`
 	UpdatedAt    int64               `json:"updatedAt"`
 	Accounts     []accountSnapshot   `json:"accounts"`
 	Models       []modelStatSnapshot `json:"models,omitempty"`
@@ -2835,6 +2837,13 @@ func writeStatusSnapshot() error {
 	}
 	accountMu.Unlock()
 
+	// 告警标记与快照同一次写入，避免出现「快照已异常、日志还没扫到」的时间差。
+	marks := recordAccountAlertMarks(snap.Accounts, snap.UpdatedAt)
+	for i := range snap.Accounts {
+		snap.Accounts[i].Alerts = marks[snap.Accounts[i].Path]
+	}
+	snap.AlertSource = alertSourceSnapshot
+
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return err
@@ -2847,7 +2856,6 @@ func writeStatusSnapshot() error {
 	if err := os.Rename(tmp, statusSnapshotFile); err != nil {
 		return err
 	}
-	logAccountStateChanges(snap.Accounts, snap.UpdatedAt)
 	return nil
 }
 

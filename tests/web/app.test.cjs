@@ -68,6 +68,7 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
     , renderStats, loadStats, changeStatsFilter, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
     , openAddAccount, startAddAccount, pollAddAccount, closeAddAccount, accountRowActions
     , initStatsFilter, writeStatsFilterCookie, readStatsFilterCookie
+    , jumpToLog
   };})();`);
   vm.createContext(context);
   vm.runInContext(source, context);
@@ -1132,4 +1133,43 @@ test("统计筛选记进 Cookie：粒度/范围/日期可恢复，失效账号�
   assert.equal(JSON.parse(decodeURIComponent(stale.cookies.get("gateway_stats_filter"))).account, "");
 
   audit("统计筛选 Cookie 通过", {restored: true, dates_opt_in: true, stale_account_fallback: true});
+});
+
+test("告警条目可点日志跳转：切到日志页、按偏移拉取并高亮那一行", async () => {
+  const calls = [];
+  const f = fixture(async (url) => {
+    calls.push(url);
+    if (url.indexOf("/admin/api/logs") === 0) {
+      return response(200, {files: [{name: "gateway-2026-10-16.log"}], file: "gateway-2026-10-16.log",
+        lines: ["head", "line-29", "line-30", "line-31"], focusIndex: 2, resolved: true, truncated: false});
+    }
+    return response(200, {gateway: {}, accounts: [], summary: {total: 0}});
+  });
+  f.review.state.apiKey = "synthetic-admin";
+  f.review.state.lastStatus = {accounts: [{path: "a.json", state: "cooldown"}]};
+  f.review.renderAccountAlerts({alerts: [{account: "a.json", state: "cooldown", severity: "warning",
+    label: "账号冷却", message: "等待恢复", at: 1791980005,
+    logFile: "gateway-2026-10-16.log", logOffset: 12345}]});
+  const html = f.element("accountAlerts").innerHTML;
+  assert(html.includes('data-log-file="gateway-2026-10-16.log"'), "日志名必须成为可点入口");
+  assert(html.includes('data-log-offset="12345"'), "必须带上日志定位偏移");
+  assert(html.includes("linklike"), "必须是按钮而不是纯文本");
+
+  await f.review.jumpToLog("gateway-2026-10-16.log", 12345);
+  await new Promise(resolve => setImmediate(resolve));
+  assert(calls.some(function (u) { return u.indexOf("offset=12345") > -1; }), "必须按偏移拉取日志窗口");
+  assert.match(f.element("logBox").innerHTML, /log-line-focus/, "目标行必须被高亮");
+  assert.equal(f.review.state.logFocus, null, "跳转用完后必须清空，避免影响后续普通加载");
+
+  // 定位失败（日志轮转/清理）时回退展示文件末尾并提示，不静默失败。
+  const stale = fixture(async (url) => url.indexOf("/admin/api/logs") === 0
+    ? response(200, {files: [{name: "gateway-2026-10-16.log"}], file: "gateway-2026-10-16.log",
+        lines: ["tail-1", "tail-2"], focusIndex: -1, resolved: false})
+    : response(200, {gateway: {}, accounts: [], summary: {total: 0}}));
+  stale.review.state.apiKey = "synthetic-admin";
+  await stale.review.jumpToLog("gateway-2026-10-16.log", 999999);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stale.element("logBox").textContent, "tail-1\ntail-2");
+  assert.match(stale.element("alert").textContent, /未能.*定位/);
+  audit("告警跳日志通过", {offset: true, highlighted: true, fallback_notice: true});
 });

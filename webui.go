@@ -917,7 +917,20 @@ func handleWebUILogs(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{"files": files, "file": name, "lines": []string{}, "truncated": false, "readBudgetBytes": webUILogReadBudget}
 	if name != "" {
 		log.Printf("[管理日志] traceId=%s 阶段=读取 文件=%s 请求行数=%d 扫描字节预算=%d", debugTraceID(r), name, linesN, webUILogReadBudget)
-		lines, truncated, err := readWebLog(name, linesN)
+		var lines []string
+		var truncated bool
+		var err error
+		// 带 offset 时按告警定位到的字节偏移返回窗口，否则保持读取文件尾部。
+		if focus := parseLogOffset(r.URL.Query().Get("offset")); focus >= 0 {
+			var focusIndex int
+			var resolved bool
+			lines, focusIndex, resolved, err = readWebLogAround(name, focus, 64<<10)
+			if err == nil {
+				resp["focusIndex"], resp["resolved"] = focusIndex, resolved
+			}
+		} else {
+			lines, truncated, err = readWebLog(name, linesN)
+		}
 		if err != nil {
 			log.Printf("[管理日志] traceId=%s 结果=失败 文件=%s 原因=%v 状态码=503", debugTraceID(r), name, err)
 			writeJSONError(w, http.StatusServiceUnavailable, "日志暂不可读，请刷新文件列表后重试")

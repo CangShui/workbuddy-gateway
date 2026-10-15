@@ -675,3 +675,17 @@ button.danger { border-color: var(--danger); color: var(--danger); }
   .add-account-form { grid-template-columns: 1fr; }
   .add-account-result img { width: 100%; max-width: 240px; height: auto; }
 }
+
+
+/* 告警→日志跳转：可点的日志文件名与高亮行。 */
+.linklike {
+  background: none; border: 0; padding: 0; font: inherit; color: var(--link, #4a7dff);
+  cursor: pointer; text-decoration: underline;
+}
+
+.log-line { display: block; }
+.log-line-focus {
+  background: rgba(224, 163, 60, 0.28);
+  outline: 1px solid var(--series-credit);
+  border-radius: 3px;
+}

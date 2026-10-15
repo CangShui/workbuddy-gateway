@@ -86,36 +86,6 @@ type accountLogEvent struct {
 
 // 仅用于压低重复日志：不建立新的状态文件。启动及状态转换写一条普通日志，
 // 让过期/停用（包括直接编辑配置）也能有真实的可追溯日志来源。
-var accountStateLog = struct {
-	sync.Mutex
-	last map[string]string
-}{last: map[string]string{}}
-
-func logAccountStateChanges(accs []accountSnapshot, now int64) {
-	accountStateLog.Lock()
-	defer accountStateLog.Unlock()
-	next := make(map[string]string, len(accs))
-	trace := newTraceID()
-	for _, acc := range accs {
-		kinds := accountAlertKinds(acc)
-		signature := acc.UID + "\x00" + acc.State + "\x00" + strings.Join(kinds, ",")
-		next[acc.Path] = signature
-		if accountStateLog.last[acc.Path] == signature {
-			continue
-		}
-		if len(kinds) == 0 {
-			kinds = []string{acc.State}
-		}
-		for _, kind := range kinds {
-			event := accountLogEvent{At: now, Account: acc.Path, State: kind, Trace: trace}
-			raw, err := json.Marshal(event)
-			if err == nil {
-				log.Printf("[账号状态] %s", raw)
-			}
-		}
-	}
-	accountStateLog.last = next
-}
 
 // 兼容已有普通日志。仅匹配已知日志标签/措辞，不将任意包含“失效”的正文当告警。
 func parseAccountLogEvent(line, file string) (accountLogEvent, bool) {
@@ -266,13 +236,14 @@ var accountAlertCache struct {
 }
 
 type accountAlertView struct {
-	Account  string `json:"account"`
-	State    string `json:"state"`
-	Label    string `json:"label"`
-	Severity string `json:"severity"`
-	Message  string `json:"message"`
-	At       int64  `json:"at"`
-	LogFile  string `json:"logFile"`
+	Account   string `json:"account"`
+	State     string `json:"state"`
+	Label     string `json:"label"`
+	Severity  string `json:"severity"`
+	Message   string `json:"message"`
+	At        int64  `json:"at"`
+	LogFile   string `json:"logFile"`
+	LogOffset int64  `json:"logOffset,omitempty"`
 }
 
 func currentAccountAlerts(accs []accountSnapshot, scan accountAlertScan) ([]accountAlertView, int) {
@@ -292,15 +263,7 @@ func currentAccountAlerts(accs []accountSnapshot, scan accountAlertScan) ([]acco
 	}
 	// 最新日志在上；等级只决定颜色和标签，不改变排序。
 	// 秒级时间相同则按账号、类别稳定排序，避免每次轮询跳动。
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].At != out[j].At {
-			return out[i].At > out[j].At
-		}
-		if out[i].Account != out[j].Account {
-			return out[i].Account < out[j].Account
-		}
-		return out[i].State < out[j].State
-	})
+	sortAccountAlerts(out)
 	return out, missing
 }
 
@@ -315,8 +278,10 @@ func handleWebUIAccountAlerts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	annotateAccountPolicies(snap.Accounts)
+	// 新版快照自带告警标记：直接使用，不再读取日志；只有旧快照才回退扫描。
+	inline := snap.AlertSource == alertSourceSnapshot
 	accountAlertCache.Lock()
-	if accountAlertCache.at.IsZero() || time.Since(accountAlertCache.at) >= 10*time.Second {
+	if !inline && (accountAlertCache.at.IsZero() || time.Since(accountAlertCache.at) >= 10*time.Second) {
 		scan, readErr := readAccountAlertLogs()
 		if readErr != nil {
 			accountAlertCache.Unlock()
@@ -328,7 +293,12 @@ func handleWebUIAccountAlerts(w http.ResponseWriter, r *http.Request) {
 	}
 	scan := accountAlertCache.scan
 	accountAlertCache.Unlock()
-	alerts, missing := currentAccountAlerts(snap.Accounts, scan)
+	alerts, missing := []accountAlertView{}, 0
+	if inline {
+		alerts = currentAlertsFromSnapshot(snap.Accounts)
+	} else {
+		alerts, missing = currentAccountAlerts(snap.Accounts, scan)
+	}
 	limited := len(alerts) > 100
 	if limited {
 		alerts = alerts[:100]
