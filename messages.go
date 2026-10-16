@@ -118,6 +118,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	wantThinking := anthropicThinkingOn(msgReq)
 	debugSetModelAndStream(r, modelName, isStream)
 	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
+	prepareConversationContext(r, msgReq)
 
 	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
 	if disabled, reason := modelDisabled(modelName); disabled {

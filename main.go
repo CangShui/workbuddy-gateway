@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.18"
+	version = "1.14.19"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -144,6 +144,8 @@ func isTransientNetworkError(err error) bool {
 //
 // 返回的 cancel 用于在流式读取结束后取消上游 context（调用方负责）。
 func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, upstreamBytes []byte, reqID uint64, traceID string) (*http.Response, context.CancelFunc, error) {
+	// 兼容直接调用与测试；正常入口已经在协议转换前准备完成。只生成一次，不能在 try 循环里重建。
+	prepareConversationContext(r, nil)
 	var lastErr error
 	_, _, retries := upstreamSettings()
 	for try := 0; try <= retries; try++ {
@@ -3522,6 +3524,7 @@ func authMiddleware(next http.Handler) http.Handler {
 // 成功时返回 200 响应（调用方负责关闭 Body）与命中的账号/站点；失败时函数内部已写回
 // 错误响应并返回 ok=false。Chat Completions 与 Responses 两个入口共用此逻辑。
 func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelName string, upstreamBytes []byte, startTime time.Time) (*http.Response, *Account, *upstreamProfile, bool) {
+	prepareConversationContext(r, nil)
 	traceID := w.Header().Get("X-Trace-ID")
 	log.Printf("[业务入口] traceId=%s requestId=%d 业务=上游模型调用 请求体字节数=%d", traceID, reqID, len(upstreamBytes))
 	recordModelRequest(modelName)
@@ -3762,6 +3765,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	isStream, _ := reqObj["stream"].(bool)
 	debugSetModelAndStream(r, modelName, isStream)
 	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
+	prepareConversationContext(r, reqObj)
 
 	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
 	if disabled, reason := modelDisabled(modelName); disabled {
@@ -4152,6 +4156,7 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile) {
 	reqID := uuid.New().String()
 	req.Header.Set("X-Request-ID", reqID)
 	req.Header.Set("X-Trace-ID", reqID)
+	setConversationHeaders(req)
 	req.Header.Set("X-Client-ID", prof.ClientID)
 	req.Header.Set("X-Client-Version", prof.ClientVer)
 

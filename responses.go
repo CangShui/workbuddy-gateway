@@ -64,6 +64,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	isStream, _ := respReq["stream"].(bool)
 	debugSetModelAndStream(r, modelName, isStream)
 	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
+	prepareConversationContext(r, respReq)
 
 	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
 	if disabled, reason := modelDisabled(modelName); disabled {

@@ -708,6 +708,26 @@ systemctl restart workbuddy-gateway
 
 ---
 
+## 上游会话请求头（v1.14.19）
+
+网关参照 WorkBuddy 5.8.4 官方客户端的会话／轮次／消息标识语义，为每次模型调用补齐
+`X-Conversation-ID`、`X-Conversation-Request-ID`、`X-Conversation-Message-ID`。
+国际站带工具声明的请求此前可能触发 `11128 conversation id missing`；这项兼容不关闭工具或思考，
+也不改变提示词、输出预算和原有鉴权指纹。
+
+- 三个协议入口（Chat Completions、Responses、Anthropic Messages）、流式与非流式聚合、
+  国内与国际站都经过同一出站路径；手工 `probe` 和后台价格探测也有统一兜底。
+- 优先读取客户端 `X-Conversation-ID`，再读取 `X-Session-ID`、
+  请求顶层或 `metadata` 内的 `conversation_id`／`conversationId`／`session_id`／`sessionId`。
+  合法 UUID 沿用；其他有效会话键按调用方隔离后生成稳定 UUIDv5。过长或带控制字符的键忽略。
+- `X-Conversation-Request-ID` 与 `X-Conversation-Message-ID` 可由客户端提供，
+  也可通过顶层或 `metadata` 的同名下划线／驼峰字段提供；缺失时独立生成。
+  新生成的消息 ID 采用客户端主路径的 32 位无连字符 UUID 格式。
+- 同一个逻辑 HTTP 请求的安全网络重试、跨账号／站点回退复用全部三个标识。
+  新 HTTP 请求的轮次与消息标识默认重新生成。**没有显式会话键时，每个 HTTP 调用独立生成会话**，
+  不会根据提示词、用户名或模型名猜测会话归属；需要跨轮稳定会话时请显式提供会话键。
+- 仅生成或规范化请求头，不记录原始会话键、请求正文或令牌；不向登录、续期、额度查询接口添加这些头。
+
 ## probe
 
 免费 / 收费属性按「账号（含站点）+ 模型」学习，只有该账号真正请求过该模型才会写入账本。默认调度优先使用有余额账号，**余额耗尽的账号几乎不会被选中，也就学不到属性**。`probe` 用于主动补课。
