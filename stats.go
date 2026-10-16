@@ -566,6 +566,12 @@ func handleWebUIStats(w http.ResponseWriter, r *http.Request) {
 	}
 	requestStats.Lock()
 	account := q.Get("account")
+	site := q.Get("site")
+	if site != "" && site != "cn" && site != "intl" {
+		requestStats.Unlock()
+		writeJSONError(w, http.StatusBadRequest, "站点维度只能是 cn 或 intl")
+		return
+	}
 	if account != "" {
 		if _, ok := requestStats.document.Accounts[account]; !ok {
 			requestStats.Unlock()
@@ -588,6 +594,9 @@ func handleWebUIStats(w http.ResponseWriter, r *http.Request) {
 	latencyCells := map[string][]statsLatencyCell{}
 	for _, row := range requestStats.document.Requests {
 		if (account != "" && row.Account != account) || row.At < from.UnixMilli() || row.At >= to.UnixMilli() {
+			continue
+		}
+		if site != "" && requestStats.document.Accounts[row.Account].Edition != site {
 			continue
 		}
 		summary.add(row)
@@ -657,7 +666,7 @@ func handleWebUIStats(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[统计查询] traceId=%s 维度=%s 单账号=%t 时间桶=%d 请求记录=%d 耗时线条=%d 存储=%s 结果=成功 说明=耗时按模型分别平均，不把各模型合成一条；UTC+8，周一开周；仅读内存聚合，不请求上游", debugTraceID(r), period, account != "", len(buckets), summary.Requests, len(modelLatency), mode)
 	writeAdminData(w, r, map[string]any{
-		"period": period, "account": account, "timezone": "Asia/Shanghai",
+		"period": period, "account": account, "site": site, "timezone": "Asia/Shanghai",
 		"start": from.Format("2006-01-02"), "end": to.AddDate(0, 0, -1).Format("2006-01-02"),
 		"startedAt": startedAt, "accounts": choices, "summary": summary, "buckets": buckets, "models": models, "modelLatency": modelLatency,
 		"ttftMetric": ttftMetric,

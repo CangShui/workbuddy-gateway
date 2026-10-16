@@ -68,7 +68,6 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
     , renderStats, loadStats, changeStatsFilter, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
     , openAddAccount, startAddAccount, pollAddAccount, closeAddAccount, accountRowActions
     , initStatsFilter, writeStatsFilterCookie, readStatsFilterCookie
-    , jumpToLog
   };})();`);
   vm.createContext(context);
   vm.runInContext(source, context);
@@ -1135,41 +1134,40 @@ test("统计筛选记进 Cookie：粒度/范围/日期可恢复，失效账号�
   audit("统计筛选 Cookie 通过", {restored: true, dates_opt_in: true, stale_account_fallback: true});
 });
 
-test("告警条目可点日志跳转：切到日志页、按偏移拉取并高亮那一行", async () => {
+test("告警条目排成一行且不再有日志跳转；统计范围可按站点筛选；版本号可点", async () => {
   const calls = [];
   const f = fixture(async (url) => {
     calls.push(url);
-    if (url.indexOf("/admin/api/logs") === 0) {
-      return response(200, {files: [{name: "gateway-2026-10-16.log"}], file: "gateway-2026-10-16.log",
-        lines: ["head", "line-29", "line-30", "line-31"], focusIndex: 2, resolved: true, truncated: false});
-    }
-    return response(200, {gateway: {}, accounts: [], summary: {total: 0}});
+    if (url.indexOf("/admin/api/stats?") === 0) return response(200, statsPayload());
+    return response(200, {});
   });
   f.review.state.apiKey = "synthetic-admin";
   f.review.state.lastStatus = {accounts: [{path: "a.json", state: "cooldown"}]};
   f.review.renderAccountAlerts({alerts: [{account: "a.json", state: "cooldown", severity: "warning",
     label: "账号冷却", message: "等待恢复", at: 1791980005,
     logFile: "gateway-2026-10-16.log", logOffset: 12345}]});
-  const html = f.element("accountAlerts").innerHTML;
-  assert(html.includes('data-log-file="gateway-2026-10-16.log"'), "日志名必须成为可点入口");
-  assert(html.includes('data-log-offset="12345"'), "必须带上日志定位偏移");
-  assert(html.includes("linklike"), "必须是按钮而不是纯文本");
+  const alertHtml = f.element("accountAlerts").innerHTML;
+  assert(!alertHtml.includes("account-alert-source"), "日志来源整块必须删除");
+  assert(!alertHtml.includes("data-log-file"), "日志跳转入口必须删除");
+  assert(!alertHtml.includes("linklike"), "跳转按钮样式必须删除");
+  assert(/class="account-alert-head">[\s\S]*account-alert-file[\s\S]*<time>/.test(alertHtml),
+    "状态、类别、凭据与时间必须排在同一行");
 
-  await f.review.jumpToLog("gateway-2026-10-16.log", 12345);
-  await new Promise(resolve => setImmediate(resolve));
-  assert(calls.some(function (u) { return u.indexOf("offset=12345") > -1; }), "必须按偏移拉取日志窗口");
-  assert.match(f.element("logBox").innerHTML, /log-line-focus/, "目标行必须被高亮");
-  assert.equal(f.review.state.logFocus, null, "跳转用完后必须清空，避免影响后续普通加载");
+  f.review.renderStats(statsPayload());
+  const options = f.element("statsAccount").innerHTML;
+  assert(options.includes('value="site:intl"') && options.includes('value="site:cn"'),
+    "统计范围必须包含国际站与国内站");
+  f.element("statsAccount").value = "site:intl";
+  await f.review.changeStatsFilter(false);
+  const siteCall = calls.filter(function (u) { return u.indexOf("site=intl") > -1; });
+  assert(siteCall.length > 0, "选中站点后必须按 site 查询");
+  assert(siteCall.every(function (u) { return u.indexOf("account=") === -1; }), "站点与单账号不能同时下发");
 
-  // 定位失败（日志轮转/清理）时回退展示文件末尾并提示，不静默失败。
-  const stale = fixture(async (url) => url.indexOf("/admin/api/logs") === 0
-    ? response(200, {files: [{name: "gateway-2026-10-16.log"}], file: "gateway-2026-10-16.log",
-        lines: ["tail-1", "tail-2"], focusIndex: -1, resolved: false})
-    : response(200, {gateway: {}, accounts: [], summary: {total: 0}}));
-  stale.review.state.apiKey = "synthetic-admin";
-  await stale.review.jumpToLog("gateway-2026-10-16.log", 999999);
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(stale.element("logBox").textContent, "tail-1\ntail-2");
-  assert.match(stale.element("alert").textContent, /未能.*定位/);
-  audit("告警跳日志通过", {offset: true, highlighted: true, fallback_notice: true});
+  f.review.renderStatus({gateway: {version: "1.14.17", listen: "127.0.0.1:8317", modelSource: "x"},
+    updatedAt: 1791980005, accounts: [], models: []});
+  const meta = f.element("meta").innerHTML;
+  assert(meta.includes('href="https://github.com/CangShui/workbuddy-gateway"'), "版本号必须指向项目地址");
+  assert(meta.includes('target="_blank"'), "必须在新标签页打开");
+  assert(meta.includes('rel="noreferrer"'), "必须带 rel=noreferrer");
+  audit("告警行重排与站点筛选通过", {jump_removed: true, site_scope: true, chip_link: true});
 });

@@ -46,8 +46,7 @@
     addAccountId: "",
     addAccountPoll: 0,
     statsAccount: "",
-    statsDatesTouched: false,
-    logFocus: null
+    statsDatesTouched: false
   };
 
   function $(id) { return document.getElementById(id); }
@@ -144,7 +143,6 @@
     state.lastAccountAlerts = null;
     state.addAccountId = "";
     state.addAccountPoll = 0;
-    state.logFocus = null;
     $("poolHealth").textContent = "—";
     $("poolHealth").className = "health-value";
     $("poolHealthBar").style.width = "0%";
@@ -247,13 +245,8 @@
       var level = labels[a.severity] ? a.severity : "notice";
       return '<article class="account-alert alert-' + level + '"><div class="account-alert-head">' +
         '<span class="alert-priority">' + esc(labels[level]) + '</span><strong>' + esc(a.label) +
-        '</strong><time>' + esc(fmtTime(a.at)) + '</time></div><div class="account-alert-file">' + esc(a.account) +
-        '</div><p>' + esc(a.message) + '</p><span class="account-alert-source">' +
-        (a.logFile
-          ? '日志：<button class="linklike" type="button" data-log-file="' + esc(a.logFile) +
-            '" data-log-offset="' + esc(String(a.logOffset || 0)) + '">' + esc(a.logFile) + '</button>'
-          : '日志：-') +
-        '</span></article>';
+        '</strong><span class="account-alert-file">' + esc(a.account) + '</span><time>' + esc(fmtTime(a.at)) +
+        '</time></div><p>' + esc(a.message) + '</p></article>';
     }).join("") : '<p class="stats-empty">' + (data.missingLogCount ? "当前存在异常，但扫描范围内暂未找到对应日志" :
       data.stale ? "暂无日志记录，账号状态待确认" : "未发现当前账号异常日志") + '</p>';
   }
@@ -446,11 +439,16 @@
     $("statsStart").value = data.start;
     $("statsEnd").value = data.end;
     var choice = state.statsAccount || data.account || "";
-    $("statsAccount").innerHTML = '<option value="">全局 · 全部账号</option>' + (data.accounts || []).map(function (a) {
-      return '<option value="' + esc(a.id) + '"' + (a.id === choice ? " selected" : "") + '>' +
-        esc(a.file + " · " + (a.edition === "intl" ? "国际" : "国内") + " · " + a.id.slice(0, 6)) + "</option>";
-    }).join("");
-    if (!(data.accounts || []).some(function (a) { return a.id === choice; })) choice = "";
+    var siteScope = choice === "site:cn" || choice === "site:intl";
+    var scopeOption = function (value, label) {
+      return '<option value="' + esc(value) + '"' + (value === choice ? " selected" : "") + '>' + esc(label) + "</option>";
+    };
+    $("statsAccount").innerHTML = scopeOption("", "全局 · 全部账号") +
+      scopeOption("site:intl", "国际站 · 全部国际账号") + scopeOption("site:cn", "国内站 · 全部国内账号") +
+      (data.accounts || []).map(function (a) {
+        return scopeOption(a.id, a.file + " · " + (a.edition === "intl" ? "国际" : "国内") + " · " + a.id.slice(0, 6));
+      }).join("");
+    if (!siteScope && !(data.accounts || []).some(function (a) { return a.id === choice; })) choice = "";
     $("statsAccount").value = choice;
     state.statsAccount = choice;
     var coverage = (s.tokenSamples || 0) + "/" + (s.requests || 0) + " 请求有 Token";
@@ -514,7 +512,9 @@
     state.statsPending = true;
     var version = state.statsVersion, key = state.apiKey;
     var params = ["period=" + encodeURIComponent($("statsPeriod").value || "day")];
-    if (state.statsAccount) params.push("account=" + encodeURIComponent(state.statsAccount));
+    var scope = state.statsAccount || "";
+    if (scope.indexOf("site:") === 0) params.push("site=" + encodeURIComponent(scope.slice(5)));
+    else if (scope) params.push("account=" + encodeURIComponent(scope));
     ["start", "end"].forEach(function (field) {
       var value = $(field === "start" ? "statsStart" : "statsEnd").value;
       if (value) params.push(field + "=" + encodeURIComponent(value));
@@ -558,7 +558,8 @@
     state.lastStatus = data;
     var g = data.gateway || {};
     $("meta").innerHTML =
-      '<span class="chip">v' + esc(g.version) + '</span>' +
+      '<a class="chip chip-link" href="https://github.com/CangShui/workbuddy-gateway"' +
+      ' target="_blank" rel="noreferrer" title="在新标签页打开项目地址">v' + esc(g.version) + '</a>' +
       '<span class="chip">' + esc(g.listen) + '</span>' +
       '<span class="chip">模型源 ' + esc(g.modelSource || "unavailable") + '</span>' +
       '<span class="chip">更新 ' + esc(fmtTime(data.updatedAt)) + '</span>';
@@ -1070,52 +1071,24 @@
   }
 
   // ---- 渲染：日志 --------------------------------------------------------
-  // 跳转入口：记住目标文件与字节偏移，切到日志页后由 loadLogs 拉取并高亮那一行。
-  function jumpToLog(file, offset) {
-    if (!file) return;
-    state.logFocus = {file: file, offset: offset > 0 ? offset : 0};
-    return setTab("logs");
-  }
-
   function loadLogs(initial) {
-    var focus = state.logFocus;
-    var file = focus ? focus.file : (initial ? "" : $("logFile").value);
+    var file = initial ? "" : $("logFile").value;
     var lines = $("logLines").value;
     var q = "/admin/api/logs?lines=" + encodeURIComponent(lines);
     if (file) q += "&file=" + encodeURIComponent(file);
-    if (focus && focus.offset > 0) q += "&offset=" + encodeURIComponent(focus.offset);
     return api(q).then(function (data) {
       var sel = $("logFile");
-      if (data.files && (initial || focus)) {
+      if (initial && data.files) {
         sel.innerHTML = data.files.map(function (f) {
           return '<option value="' + esc(f.name) + '">' + esc(f.name) + '</option>';
         }).join("");
         if (data.file) sel.value = data.file;
       }
       var box = $("logBox");
-      if (data.error) { box.textContent = "读取日志失败: " + data.error; state.logFocus = null; return; }
-      var rows = data.lines || [];
-      var focusIndex = (typeof data.focusIndex === "number") ? data.focusIndex : -1;
-      if (!rows.length) {
-        box.textContent = "该文件暂无日志。";
-      } else if (focusIndex >= 0) {
-        // 只有定位成功时才输出逐行标记，其余情况保持纯文本，避免破坏原有展示。
-        box.innerHTML = rows.map(function (line, i) {
-          return '<span class="log-line' + (i === focusIndex ? " log-line-focus" : "") +
-            (i === focusIndex ? '" id="logFocusLine"' : '"') + '>' + esc(line) + "</span>";
-        }).join("\n");
-        var target = $("logFocusLine");
-        if (target && target.scrollIntoView) target.scrollIntoView({block: "center"});
-      } else {
-        box.textContent = rows.join("\n");
-        if (focus && !data.resolved) {
-          showAlert("未能在当前文件中定位到原日志行（可能已轮转或清理），已显示该文件末尾。");
-        }
-      }
-      state.logFocus = null;
-      if (data.truncated) showAlert("日志达到本次读取预算，只展示部分行；筛选文件列表仍完整。原日志文件未修改。");
+      if (data.error) { box.textContent = "\u8bfb\u53d6\u65e5\u5fd7\u5931\u8d25: " + data.error; return; }
+      box.textContent = (data.lines && data.lines.length) ? data.lines.join("\n") : "\u8be5\u6587\u4ef6\u6682\u65e0\u65e5\u5fd7\u3002";
+      if (data.truncated) showAlert("\u65e5\u5fd7\u8fbe\u5230\u672c\u6b21\u8bfb\u53d6\u9884\u7b97\uff0c\u53ea\u5c55\u793a\u90e8\u5206\u884c\uff1b\u539f\u65e5\u5fd7\u6587\u4ef6\u672a\u4fee\u6539\u3002");
     }).catch(function () {
-      state.logFocus = null;
       if (!initial && file) return loadLogs(true);
     });
   }
@@ -1595,14 +1568,6 @@
     });
     $("accountsTable").addEventListener("click", togglePolicy);
     $("accountsTable").addEventListener("click", accountRowActions);
-    $("accountAlerts").addEventListener("click", function (event) {
-      var target = event && event.target;
-      if (!target || typeof target.closest !== "function") return;
-      var link = target.closest("[data-log-file]");
-      if (!link) return;
-      jumpToLog(link.getAttribute("data-log-file"),
-        Number(link.getAttribute("data-log-offset") || 0));
-    });
     $("addAccountBtn").addEventListener("click", openAddAccount);
     $("addStart").addEventListener("click", startAddAccount);
     $("addCancel").addEventListener("click", closeAddAccount);
