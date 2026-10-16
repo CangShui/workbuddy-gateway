@@ -18,7 +18,6 @@
 ## WorldofPlainness
 
 - GitHub: https://github.com/WorldofPlainness （亦使用 `Cooky0606` 提交）
-- 邮箱: yl-77@qq.com
 - 提议: https://github.com/CangShui/workbuddy-gateway/pull/3
 - 标题: `fix: normalize empty finish_reason in upstream stream chunks`
 - 采纳内容: 上游在每个流式分片都下发 `finish_reason:""`，而 OpenAI 规范要求中间分片为

@@ -10,6 +10,19 @@ wb-models-cache.json
 wb-models-cache.json.tmp
 config.json
 stats.json
+.env
+.env.*
+!.env.example
+!.env.sample
+.netrc
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+.ssh/
+backups/
 
 # 本地编译产物
 workbuddy-gateway
