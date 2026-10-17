@@ -670,6 +670,10 @@ rect.series-m7 { fill: var(--series-m7); }
 
 #addAccountLink { word-break: break-all; }
 
+.add-account-link-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.add-account-link-row #addAccountLink { flex: 1 1 260px; min-width: 0; }
+.add-account-link-row #addAccountCopy { flex: none; }
+
 button.danger { border-color: var(--danger); color: var(--danger); }
 
 @media (max-width: 640px) {

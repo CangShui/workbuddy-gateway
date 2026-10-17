@@ -45,6 +45,7 @@
     lastAccountAlerts: null,
     addAccountId: "",
     addAccountPoll: 0,
+    addAccountDeadline: 0,
     statsAccount: "",
     statsDatesTouched: false
   };
@@ -143,6 +144,7 @@
     state.lastAccountAlerts = null;
     state.addAccountId = "";
     state.addAccountPoll = 0;
+    state.addAccountDeadline = 0;
     $("poolHealth").textContent = "—";
     $("poolHealth").className = "health-value";
     $("poolHealthBar").style.width = "0%";
@@ -184,9 +186,11 @@
         throw new Error("管理鉴权失败");
       }
       if (!resp.ok) {
-        setConn("请求失败 (" + resp.status + ")", "danger");
-        showAlert("HTTP " + resp.status + "：" + (result.data.error || "请求失败") +
-          (path.split("?")[0] === "/admin/api/config-edit" ? "；操作未完成，已有编辑输入保留。" : "；已有数据保留，未更新为零。"));
+        if (!options.quiet) {
+          setConn("请求失败 (" + resp.status + ")", "danger");
+          showAlert("HTTP " + resp.status + "：" + (result.data.error || "请求失败") +
+            (path.split("?")[0] === "/admin/api/config-edit" ? "；操作未完成，已有编辑输入保留。" : "；已有数据保留，未更新为零。"));
+        }
         var failure = new Error("HTTP " + resp.status);
         failure.status = resp.status;
         failure.detail = result.data.error || "请求失败";
@@ -723,13 +727,102 @@
   }
 
   // ---- 账号：网页新增（复用 CLI 登录流程）与删除 ---------------------------
+  function clearAddAccountArtifacts() {
+    $("addAccountQr").removeAttribute("src");
+    $("addAccountLink").href = "#";
+    $("addAccountLink").textContent = "";
+    var copy = $("addAccountCopy");
+    if (copy) {
+      copy.disabled = true;
+      copy.textContent = "复制链接";
+    }
+  }
+
+  function fallbackCopyText(text, done) {
+    var area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.top = "-1000px";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    var ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch (_) {
+      ok = false;
+    }
+    document.body.removeChild(area);
+    done(ok);
+  }
+
+  function copyAddAccountLink() {
+    var link = $("addAccountLink");
+    var text = (link.textContent || "").replace(/^\s+|\s+$/g, "");
+    if (!text) return;
+    var button = $("addAccountCopy");
+    var done = function (ok) {
+      button.textContent = ok ? "已复制" : "复制失败";
+      if (!ok) {
+        // 非安全上下文或浏览器拒绝剪贴板权限时，至少把链接选中，方便手动复制。
+        try {
+          var range = document.createRange();
+          range.selectNodeContents(link);
+          var selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+        } catch (_) { /* 选中失败不影响提示 */ }
+      }
+      window.setTimeout(function () { button.textContent = "复制链接"; }, 1500);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try {
+        navigator.clipboard.writeText(text).then(function () {
+          done(true);
+        }, function () {
+          fallbackCopyText(text, done);
+        });
+        return;
+      } catch (_) { /* 继续走 execCommand 回退 */ }
+    }
+    fallbackCopyText(text, done);
+  }
+
+  function addAccountRemainingSeconds() {
+    if (!state.addAccountDeadline) return 0;
+    return Math.max(0, Math.ceil((state.addAccountDeadline - Date.now()) / 1000));
+  }
+
+  function fmtAddAccountRemaining(seconds) {
+    var m = Math.floor(seconds / 60);
+    var s = seconds % 60;
+    return m + ":" + (s < 10 ? "0" : "") + s;
+  }
+
+  function showAddAccountPending() {
+    var left = addAccountRemainingSeconds();
+    $("addAccountStatus").textContent = "请用手机扫码完成授权；成功后凭据会自动保存并加载。" +
+      (left > 0 ? "剩余 " + fmtAddAccountRemaining(left) + "，超时后需重新获取。"
+        : "登录链接即将失效，请重新获取。");
+  }
+
+  function showAddAccountExpired() {
+    state.addAccountId = "";
+    state.addAccountPoll = 0;
+    state.addAccountDeadline = 0;
+    clearAddAccountArtifacts();
+    $("addAccountStatus").textContent = "登录链接已失效，请重新点击「获取登录接口」。";
+  }
+
   function openAddAccount() {
     $("addAccountPanel").classList.remove("hidden");
     $("addAccountResult").classList.add("hidden");
-    $("addAccountQr").removeAttribute("src");
+    clearAddAccountArtifacts();
     $("addAccountStatus").textContent = "正在读取默认凭据名…";
     state.addAccountId = "";
     state.addAccountPoll = 0;
+    state.addAccountDeadline = 0;
     return api("/admin/api/account-add").then(function (data) {
       $("addFile").value = data.defaultFile || "";
       $("addAccountStatus").textContent = "";
@@ -742,9 +835,10 @@
     var id = state.addAccountId;
     state.addAccountId = "";
     state.addAccountPoll = 0;
+    state.addAccountDeadline = 0;
     $("addAccountPanel").classList.add("hidden");
     $("addAccountResult").classList.add("hidden");
-    $("addAccountQr").removeAttribute("src");
+    clearAddAccountArtifacts();
     if (id) return api("/admin/api/account-cancel", {method: "POST", body: {id: id}}).catch(function () {});
     return Promise.resolve();
   }
@@ -759,11 +853,15 @@
     return api("/admin/api/account-add", {method: "POST", body: {site: site, file: file}}).then(function (data) {
       state.addAccountId = data.id || "";
       state.addAccountPoll = 0;
+      state.addAccountDeadline = data.remainingSeconds
+        ? Date.now() + Number(data.remainingSeconds) * 1000
+        : (data.expiresAt ? Number(data.expiresAt) * 1000 : 0);
       $("addAccountResult").classList.remove("hidden");
       $("addAccountQr").src = data.qrPng || "";
       $("addAccountLink").href = data.authUrl || "#";
       $("addAccountLink").textContent = data.authUrl || "";
-      $("addAccountStatus").textContent = "请用手机扫码完成授权；成功后凭据会自动保存并加载，无需重启。";
+      $("addAccountCopy").disabled = !data.authUrl;
+      showAddAccountPending();
       pollAddAccount();
     }).catch(function (err) {
       $("addAccountStatus").textContent = "获取登录接口失败：" + ((err && err.detail) || "请稍后重试");
@@ -775,26 +873,37 @@
     if (!force && Date.now() - state.addAccountPoll < 2000) return Promise.resolve();
     state.addAccountPoll = Date.now();
     var id = state.addAccountId;
-    return api("/admin/api/account-add?id=" + encodeURIComponent(id)).then(function (data) {
+    return api("/admin/api/account-add?id=" + encodeURIComponent(id), {quiet: true}).then(function (data) {
       if (state.addAccountId !== id) return;
       var status = data.status || "pending";
       if (status === "pending") {
-        $("addAccountStatus").textContent = "等待扫码授权…（可继续扫码，超时后需重新获取）";
+        if (typeof data.remainingSeconds === "number") {
+          state.addAccountDeadline = Date.now() + data.remainingSeconds * 1000;
+        }
+        showAddAccountPending();
         return;
       }
       state.addAccountId = "";
+      state.addAccountDeadline = 0;
       if (status === "done") {
         $("addAccountStatus").textContent = "登录成功，凭据已保存为 " + (data.savedAs || "") + "，账号池已自动加载。";
         showAlert("账号已添加：" + (data.savedAs || ""), true);
         refreshActive();
       } else if (status === "expired") {
-        $("addAccountStatus").textContent = "登录已超时，请重新点击「获取登录接口」。";
+        showAddAccountExpired();
       } else if (status === "cancelled") {
+        clearAddAccountArtifacts();
         $("addAccountStatus").textContent = "登录已取消。";
       } else {
+        clearAddAccountArtifacts();
         $("addAccountStatus").textContent = "登录失败：" + (data.error || "请重试");
       }
-    }).catch(function () {
+    }).catch(function (err) {
+      if (state.addAccountId !== id) return;
+      if (err && err.status === 404) {
+        showAddAccountExpired();
+        return;
+      }
       $("addAccountStatus").textContent = "查询登录进度失败，保留上次结果。";
     });
   }
@@ -1571,6 +1680,7 @@
     $("addAccountBtn").addEventListener("click", openAddAccount);
     $("addStart").addEventListener("click", startAddAccount);
     $("addCancel").addEventListener("click", closeAddAccount);
+    $("addAccountCopy").addEventListener("click", copyAddAccountLink);
     $("modelsTable").addEventListener("click", togglePolicy);
     $("modelsTable").addEventListener("click", toggleRateDetail);
     $("logFile").addEventListener("change", function () { loadLogs(false); });

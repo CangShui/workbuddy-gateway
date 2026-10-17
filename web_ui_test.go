@@ -76,7 +76,7 @@ func TestWebUIBrandNeutralLabelsAndBothListFilters(t *testing.T) {
 		t.Fatal("web console static copy still contains the old brand")
 	}
 	for _, text := range []string{"<title>本地网关 · 网页控制台</title>", `id="onlyUsableAccounts"`, `id="onlyUsable"`,
-		"只显示可用账号", "只显示可用模型"} {
+		"只显示可用账号", "只显示可用模型", `id="addAccountCopy"`, "复制链接"} {
 		if !bytes.Contains(html, []byte(text)) {
 			t.Errorf("web console missing list control or neutral copy: %s", text)
 		}

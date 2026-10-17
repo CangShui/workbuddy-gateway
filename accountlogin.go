@@ -109,6 +109,12 @@ var (
 	loginSessions   = map[string]*loginSession{}
 )
 
+// loginSessionRetention 让已结束的登录会话在内存中多保留一段时间。
+// CLI 直接持有 *loginSession，不依赖会话表；网页只拿到 id，必须再查一次才能看到
+// expired / failed / done。若结束时立刻删除，前端轮询几乎总是拿到 404，表现为
+// 「链接失效了但控制台还在等」。
+var loginSessionRetention = 2 * time.Minute
+
 func newLoginSessionID() string {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {
@@ -136,6 +142,15 @@ func (s *loginSession) snapshot() map[string]any {
 	out := map[string]any{
 		"id": s.ID, "site": s.Site, "file": s.File, "authUrl": s.AuthURL,
 		"status": s.status, "expiresAt": s.deadline.Unix(),
+	}
+	if s.status == "pending" {
+		remaining := int(time.Until(s.deadline).Seconds())
+		if remaining < 0 {
+			remaining = 0
+		}
+		out["remainingSeconds"] = remaining
+	} else {
+		out["remainingSeconds"] = 0
 	}
 	if s.errText != "" {
 		out["error"] = s.errText
@@ -165,6 +180,13 @@ func forgetLoginSession(id string) {
 	loginSessionsMu.Lock()
 	delete(loginSessions, id)
 	loginSessionsMu.Unlock()
+}
+
+// scheduleForgetLoginSession 延迟清理已结束的会话，给网页轮询留出读取终态的时间。
+func scheduleForgetLoginSession(id string) {
+	time.AfterFunc(loginSessionRetention, func() {
+		forgetLoginSession(id)
+	})
 }
 
 // beginAccountLogin 复用 CLI login 的同一条流程：先取 state 与二维码，再轮询换取 token 并落地凭据。
@@ -198,7 +220,7 @@ func (s *loginSession) run(ctx context.Context, targetPath string, pollHeaders f
 	trace := newTraceID()
 	log.Printf("[网页登录] traceId=%s 阶段=开始 站点=%s 凭据=%s 说明=已复用 CLI login 同一流程，等待扫码授权",
 		trace, s.Site, filepath.Base(targetPath))
-	defer forgetLoginSession(s.ID)
+	defer scheduleForgetLoginSession(s.ID)
 	defer s.cancel()
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
