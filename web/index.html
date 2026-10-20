@@ -176,13 +176,14 @@
         </span>
       </div>
       <p class="hint" id="modelPolicyHint">模型开关写入 models.blocklist 并立即生效；停用模型仍保留在此列表，客户端模型目录会隐藏停用项。</p>
+      <p class="hint">请求、平均首Token、平均总耗时和总Token 取自 stats.json 的近 5 小时；启用状态、倍率、可用账号与末次状态取自状态快照。</p>
       <p id="modelFilterStatus" class="hint hidden" role="status"></p>
       <div class="table-wrap">
         <table id="modelsTable">
           <thead>
             <tr>
               <th>启用</th><th>模型</th><th>国内倍率</th><th>国际倍率</th><th>可用账号</th>
-              <th>请求</th><th title="网关请求入口到首个有效内容增量，心跳和角色声明不计；仅完整步骤">平均首Token(5h)</th><th>平均总耗时(5h)</th><th>总Token(M)</th><th>末次状态</th>
+              <th title="来自 stats.json 的近 5 小时窗口">请求(5h)</th><th title="网关请求入口到首个有效内容增量，心跳和角色声明不计；仅完整步骤；来自 stats.json 的近 5 小时窗口">平均首Token(5h)</th><th title="来自 stats.json 的近 5 小时窗口">平均总耗时(5h)</th><th title="来自 stats.json 的近 5 小时窗口">总Token(M, 5h)</th><th>末次状态</th>
             </tr>
           </thead>
           <tbody></tbody>

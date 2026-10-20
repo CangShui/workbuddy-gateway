@@ -141,7 +141,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	chatReq["stream"] = true // 上游强制流式，非流式由网关本地聚合
 
 	applyThinkingRules(chatReq, modelName)
-	sanitizeMessages(chatReq)
+	if modified := sanitizeMessages(chatReq); modified > 0 {
+		logSystemPrefixSanitized(r, reqID, modified)
+	}
 	prepareSystemPromptForUpstream(chatReq, r, reqID, w.Header().Get("X-Trace-ID"))
 	// 输出预算归一化：客户端未声明 max_tokens 时补模型输出上限，
 	// 避免上游默认预留 384000 导致长会话在远未到窗口上限时被 11133 拒绝

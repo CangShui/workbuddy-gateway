@@ -472,6 +472,66 @@ type statsLatencyCell struct {
 	ttftN   int
 }
 
+// modelWindowStats 是按时间窗口从 stats.json 记录聚合出的单模型摘要。
+// 模型列表复用它与总览相同的持久化数据源，避免服务重启后只显示内存里的少量样本。
+type modelWindowStats struct {
+	Requests     int64
+	Success      int64
+	Failed       int64
+	Tokens       int64
+	AvgTTFTMS    *float64
+	AvgLatencyMS *float64
+}
+
+func aggregateModelStatsWindow(from, to time.Time) map[string]modelWindowStats {
+	type accumulator struct {
+		requests, success, failed, tokens, ttftSamples, latencySamples int64
+		ttftSum, latencySum                                            float64
+	}
+	requestStats.Lock()
+	defer requestStats.Unlock()
+	acc := map[string]*accumulator{}
+	for _, row := range requestStats.document.Requests {
+		if row.At < from.UnixMilli() || row.At >= to.UnixMilli() {
+			continue
+		}
+		a := acc[row.Model]
+		if a == nil {
+			a = &accumulator{}
+			acc[row.Model] = a
+		}
+		a.requests++
+		if row.Complete {
+			a.success++
+		} else {
+			a.failed++
+		}
+		if row.TotalTokens != nil {
+			a.tokens += *row.TotalTokens
+		}
+		a.latencySum += row.LatencyMS
+		a.latencySamples++
+		if row.TTFTMS != nil && row.TTFTMetric == ttftMetric && row.Complete && row.Status < 400 {
+			a.ttftSum += *row.TTFTMS
+			a.ttftSamples++
+		}
+	}
+	out := make(map[string]modelWindowStats, len(acc))
+	for model, a := range acc {
+		w := modelWindowStats{Requests: a.requests, Success: a.success, Failed: a.failed, Tokens: a.tokens}
+		if a.ttftSamples > 0 {
+			v := a.ttftSum / float64(a.ttftSamples)
+			w.AvgTTFTMS = &v
+		}
+		if a.latencySamples > 0 {
+			v := a.latencySum / float64(a.latencySamples)
+			w.AvgLatencyMS = &v
+		}
+		out[model] = w
+	}
+	return out
+}
+
 var statsZone = time.FixedZone("UTC+8", 8*3600)
 
 func statsBucketStart(at time.Time, period string) time.Time {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,6 +76,58 @@ func TestDeleteAccountCredentialGuardsAndRemoval(t *testing.T) {
 	}
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Fatal("凭据文件没有被删除")
+	}
+}
+
+// 授权失效的账号会以 Disabled 条目留在账号池中（凭据文件可能已被删除，
+// 只剩失效标记用于提示重新登录）。用户从网页显式删除时必须连账号条目一起移除，
+// 否则网页和 CLI 都会一直显示已经删掉的 workbuddyN.json。
+func TestDeleteAccountCredentialRemovesDisabledPhantom(t *testing.T) {
+	isolatedGatewayConfig(t)
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "workbuddy9.json")
+	marker := disabledMarker{
+		Path: target, Reason: "上游鉴权失败 (HTTP 403)", Nickname: "synthetic-user",
+	}
+	raw, err := json.Marshal(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(markerPath(target), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	accountMu.Lock()
+	old := accounts
+	accounts = []*Account{{Path: target, Disabled: true, DisabledReason: marker.Reason, Nickname: marker.Nickname}}
+	accountMu.Unlock()
+	t.Cleanup(func() { accountMu.Lock(); accounts = old; accountMu.Unlock() })
+	if err := writeStatusSnapshot(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := deleteAccountCredential("workbuddy9.json"); err != nil {
+		t.Fatalf("删除失效账号失败: %v", err)
+	}
+	accountMu.Lock()
+	remaining := len(accounts)
+	accountMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("失效账号应从账号池移除，剩余 %d 个", remaining)
+	}
+	if _, err := os.Stat(markerPath(target)); !os.IsNotExist(err) {
+		t.Fatal("失效标记应被清除")
+	}
+	snap, err := readStatusSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, acc := range snap.Accounts {
+		if filepath.Base(acc.Path) == "workbuddy9.json" {
+			t.Fatal("状态快照仍包含已删除的账号，网页会继续显示它")
+		}
 	}
 }
 

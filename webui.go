@@ -825,6 +825,11 @@ func handleWebUIModels(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "仅支持 GET")
 		return
 	}
+	rangeParam := strings.TrimSpace(r.URL.Query().Get("range"))
+	if rangeParam != "" && rangeParam != "5h" {
+		writeJSONError(w, http.StatusBadRequest, "range 只能是 5h")
+		return
+	}
 	snap, err := readStatusSnapshot()
 	if err != nil {
 		webSnapshotUnavailable(w, r, err)
@@ -845,12 +850,38 @@ func handleWebUIModels(w http.ResponseWriter, r *http.Request) {
 			models[i].AvailableAccounts = 0
 		}
 	}
+	if rangeParam == "5h" {
+		now := time.Now()
+		window := aggregateModelStatsWindow(now.Add(-5*time.Hour), now)
+		for i := range models {
+			// 请求 / Token / 首Token / 总耗时统一改读 stats.json 的近 5 小时窗口；
+			// 模型目录、启停、倍率、可用账号与末次状态仍来自状态快照。
+			models[i].Requests, models[i].Success, models[i].Failed, models[i].Tokens = 0, 0, 0, 0
+			models[i].AvgTTFTMs, models[i].HasTTFT, models[i].TTFTMetric = 0, false, ""
+			models[i].AvgLatencyMs, models[i].HasLatency = 0, false
+			row, ok := window[models[i].ID]
+			if !ok {
+				continue
+			}
+			models[i].Requests, models[i].Success, models[i].Failed, models[i].Tokens = row.Requests, row.Success, row.Failed, row.Tokens
+			if row.AvgTTFTMS != nil {
+				models[i].AvgTTFTMs = int64(*row.AvgTTFTMS)
+				models[i].HasTTFT = true
+				models[i].TTFTMetric = ttftMetric
+			}
+			if row.AvgLatencyMS != nil {
+				models[i].AvgLatencyMs = int64(*row.AvgLatencyMS)
+				models[i].HasLatency = true
+			}
+		}
+	}
 	log.Printf("[管理模型] traceId=%s 结果=读取成功 模型数=%d", debugTraceID(r), len(models))
 	writeAdminData(w, r, map[string]any{
 		"source":     modelSourceLabel(modelSourceFromSnapshots(models)),
 		"models":     models,
 		"stale":      time.Now().Unix()-snap.UpdatedAt > 15,
 		"policyMode": currentModelPolicyMode(),
+		"range":      rangeParam,
 	})
 }
 

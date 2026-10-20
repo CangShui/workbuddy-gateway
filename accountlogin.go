@@ -335,18 +335,46 @@ func deleteAccountCredential(name string) (string, error) {
 		return "", errors.New("凭据名不符合 workbuddy*.json，拒绝删除")
 	}
 	info, err := os.Lstat(target)
-	if err != nil {
+	switch {
+	case err == nil:
+		if !info.Mode().IsRegular() {
+			return "", errors.New("凭据不是普通文件，拒绝删除")
+		}
+		if err := os.Remove(target); err != nil {
+			return "", fmt.Errorf("删除凭据失败：%w", err)
+		}
+	case errors.Is(err, os.ErrNotExist):
+		// 授权失效流程可能已经删掉了凭据文件，只在账号池里留下失效提示项。
+		// 这种条目仍应允许用户从网页显式删除。
+	default:
 		return "", fmt.Errorf("凭据不可读取：%w", err)
 	}
-	if !info.Mode().IsRegular() {
-		return "", errors.New("凭据不是普通文件，拒绝删除")
+	if err := os.Remove(markerPath(target)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("[账号删除] 凭据=%s 失效标记清除失败：%v", filepath.Base(target), err)
 	}
-	if err := os.Remove(target); err != nil {
-		return "", fmt.Errorf("删除凭据失败：%w", err)
+	// 显式删除必须无条件移出账号池：热加载收敛会保留 Disabled 的失效提示项，
+	// 只删除凭据文件无法让网页和 CLI 里的条目消失。
+	accountMu.Lock()
+	kept := make([]*Account, 0, len(accounts))
+	for _, acc := range accounts {
+		if acc.Path == target {
+			continue
+		}
+		kept = append(kept, acc)
 	}
-	_ = os.Remove(markerPath(target))
+	accounts = kept
+	if len(accounts) > 0 {
+		rrIndex %= len(accounts)
+	} else {
+		rrIndex = 0
+	}
+	accountMu.Unlock()
 	reloadAccountsResult()
 	requestQuotaScan()
+	// 立即刷新状态快照，避免网页在下一次 3 秒快照前继续显示已删除账号。
+	if err := writeStatusSnapshot(); err != nil {
+		log.Printf("[账号删除] 凭据=%s 状态快照刷新失败：%v", filepath.Base(target), err)
+	}
 	return target, nil
 }
 

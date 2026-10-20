@@ -143,10 +143,15 @@ workbuddy-gateway serve -webui -allow-price-probes
 ```json
 {
   "debug": {
-    "enabled": true
+    "enabled": true,
+    "fullRequests": false
   }
 }
 ```
+
+`config.example.json` 和首次部署的默认配置都会显式写出 `enabled: false`、`fullRequests: false` 作为占位。
+缺少 `debug` 段、`debug` 为 `null`/空对象/空字符串、或两个值缺失/为空时均按 `false` 处理，
+不会阻断程序启动；`0/1` 和 `"true"/"false"` 也会被容错解析，未知的 debug 子字段会被忽略。
 
 开启后，网关把单行 JSON 写入 `logs/debug-YYYY-MM-DD.jsonl`；普通运行日志仍写入原来的 `logs/gateway-YYYY-MM-DD.log`，两者互不替代。可复制 `config.example.json` 作为起点。
 
@@ -184,7 +189,7 @@ workbuddy-gateway serve -webui -allow-price-probes
 | `fallback` | 继续使用 `You are a helpful assistant.` | **仅在客户端没有任何 system 时**，替换网关注入的保底提示词；已有 system 不变 |
 | `force` | 不启用；请求提示词完全按原规则处理 | **实验功能**：在 Chat、Responses、Anthropic Messages 三个入口的首条 system 内容**末尾追加**配置文本（后置），使其成为位置最靠后、紧贴用户消息的指令；原 system 内容仍完整保留 |
 
-例如 `{"systemPrompt":{"fallback":"你是一个助手。","force":"请用中文回答。"}}`：客户端没有 system 时，发往上游的是 `你是一个助手。\n\n请用中文回答。`；客户端自带 system 时，发往上游的是 `<客户端原 system>\n\n请用中文回答。`。配置值仅支持 JSON 字符串；空串或全空白视为未配置。不会写出或替换客户端的 user、assistant、tool 消息，也不改变账号选择。普通日志和 JSON 调试日志只记录规则分支、位置与字符数，**不记录提示词正文**。
+例如 `{"systemPrompt":{"fallback":"你是一个助手。","force":"请用中文回答。"}}`：客户端没有 system 时，发往上游的是 `你是一个助手。\n\n请用中文回答。`；客户端自带 system 时，发往上游的是 `<客户端原 system>\n\n请用中文回答。`。配置值仅支持 JSON 字符串；空串或全空白视为未配置。不会写出或替换客户端的 user、assistant、tool 消息，也不改变账号选择。普通日志和普通 JSON 调试模式只记录规则分支、位置与字符数；显式开启 `debug.fullRequests` 后，完整请求事件会包含处理前后的提示词正文。
 
 > **实验功能风险自负：** `force` 后置于 system 末尾（紧贴用户消息），因此比客户端自带指令更"新近"，冲突时通常更有影响力——这正是人设类、风格类指令希望达到的效果，但也可能与客户端的 system 指令冲突、改变模型行为、增加 token 消耗，或触发上游内容/参数校验。需要回退时将 `force` 改回 `""` 并保存；建议先在测试会话验证，切勿在配置中写入密码、密钥或个人隐私。`config.json` 已被 Git 忽略，不要将真实配置提交到仓库。
 
@@ -349,7 +354,7 @@ workbuddy-gateway serve -keepalive-hours ""
 |---|---|
 | 模型名单、`models.accounts`（含 `all`） | 热生效，控制后续调度 |
 | `gateway.adminKey` / `apiKeyEnabled` / `apiKey` | 热生效；管理 Key 改变后需使用新 Key 登录 |
-| `systemPrompt` / `debug.enabled` | 热生效 |
+| `systemPrompt` / `debug.enabled` / `debug.fullRequests` | 热生效 |
 | `upstream` 超时、网络重试次数 | 后续上游请求使用新值；已有流式响应保持原空闲超时 |
 | `gateway.apiPort` / `webPort` | 写入配置但**重启后**变更监听；页面仍显示实际监听端口 |
 
@@ -370,7 +375,51 @@ workbuddy-gateway serve -keepalive-hours ""
 - `body_limit_bytes`、`body_limit_exceeded`（当前未设置请求体限制，因此分别为 `0`、`false`）
 - `read_error_type`、脱敏截断后的 `read_error`
 
-调试日志不会记录 `Authorization`、Cookie、API Key、Access Token、Refresh Token 或完整请求体。只记录是否提供 Authorization，以及凭据的不可逆短哈希 `api_key_fingerprint`。
+普通调试模式（`debug.fullRequests` 缺省或为 `false`）不记录完整请求体，也不记录明文 `Authorization`、Cookie、API Key、Access Token、Refresh Token。
+
+#### 完整请求对比日志（显式开启）
+
+排查不同客户端或协议转译差异时，合并以下设置到现有配置；不要用此片段覆盖整份配置：
+
+```json
+{
+  "debug": {
+    "enabled": true,
+    "fullRequests": true
+  }
+}
+```
+
+两个开关都开启才生效，约 1 秒热加载，无须重启。关闭 `fullRequests` 即恢复普通调试日志；
+关闭 `enabled` 则关闭全部 JSON 调试日志。正式功能没有临时采集的 30 分钟或 200 次限制。
+
+记录仍写入 `logs/debug-YYYY-MM-DD.jsonl`，按 `trace_id` 串联：
+
+| 事件 | 内容 |
+|---|---|
+| `full_request_inbound_headers` | 模型 API 入站方法、URL、请求头；此时未读取正文 |
+| `full_request_inbound` | 鉴权通过后读取的完整客户端 JSON 请求体，位于 `body` |
+| `full_request_upstream` | 协议转换、系统提示词规则及历史修复后的完整上游 JSON；包含实际构造的出站请求头 |
+| `full_request_upstream_result` | 每次发送的 HTTP 状态、响应头、请求头/请求体是否写出、网络错误类型 |
+| `full_request_upstream_error` | 已读取的上游错误 JSON，例如 `11128`；不预读成功响应流 |
+
+同一请求的换号通过 `acc` 区分，网络重试通过 `attempt` 区分，
+具体发送通过 `upstream_request_id` 关联。`user_agent` 顶层字段始终是客户端 UA，
+实际出站 UA 看 `full_request_upstream.request.headers`，不要混淆两者。
+
+完整 JSON **不截断**，包括所有消息、工具定义和图片数据；JSON 空白/转义可能重新序列化，
+不是逐字节原始抓包。凭据字段、Cookie、已知密钥及 URL 中的凭据参数会脱敏；
+请求头敏感字段另有进程内随机密钥生成的 HMAC 摘要，用于同一进程内判断是否相同，
+重启后不能跨进程比较。不合法或读取不完整的 JSON 明确标记 `body_capture` 为省略，
+避免损坏 JSON 的凭据泄露，不伪装为完整采集。
+
+鉴权/CORS/方法拦截不会为了日志而额外读取正文；相关拒绝原因仍由原有中间件事件记录。
+管理配置、账号登录及凭据接口不属于完整正文采集范围。
+
+**隐私与磁盘提示：** 完整请求包含真实对话、源代码、工具输入和图片，即使凭据脱敏也仍属敏感日志。
+无法保证识别正文内所有任意格式的秘密。文件按 `0600` 创建（Windows 还应检查目录 ACL），
+不要上传或公开分享原始日志。多兆请求会迅速增加磁盘占用和日志写入耗时，建议仅排障期间开启；
+沿用 `logs.retentionDays` 的既有日志清理策略。网页日志查看器有读取大小限制，完整比对应读取服务器文件。
 
 ---
 

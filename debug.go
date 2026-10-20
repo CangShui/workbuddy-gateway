@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -71,10 +72,8 @@ type runtimeFileConfig struct {
 		Fallback string `json:"fallback"`
 		Force    string `json:"force"`
 	} `json:"systemPrompt"`
-	Debug struct {
-		Enabled bool `json:"enabled"`
-	} `json:"debug"`
-	Logs struct {
+	Debug debugFileConfig `json:"debug"`
+	Logs  struct {
 		RetentionDays int `json:"retentionDays"` // 0 保留全部；正数保留含今天在内的 N 个日历日。
 	} `json:"logs"`
 	// Upstream 段可选，用于按网络状况调整上游超时（单位秒，<=0 或省略表示用默认值）。
@@ -96,6 +95,54 @@ type runtimeFileConfig struct {
 		// Accounts：all 控制全局调度，其余键限定各模型的凭据文件名。
 		Accounts map[string]modelAccountFileConfig `json:"accounts"`
 	} `json:"models"`
+}
+
+// debugFileConfig 对缺少 debug、null、空对象、空字符串、0/1、true/false 和
+// 未知字段全部容错；任何非对象或非布尔值都按 false 处理，不让配置语法细节
+// 阻断网关启动。显式 false 仍写入示例和首次部署默认配置，便于发现开关。
+type debugFileConfig struct {
+	Enabled      bool `json:"enabled"`
+	FullRequests bool `json:"fullRequests"`
+}
+
+func (d *debugFileConfig) UnmarshalJSON(data []byte) error {
+	*d = debugFileConfig{}
+	raw := bytes.TrimSpace(data)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return nil // 非对象值按全 false 处理，不阻断启动；未知字段同样忽略。
+	}
+	d.Enabled = tolerantConfigBool(object["enabled"])
+	d.FullRequests = tolerantConfigBool(object["fullRequests"])
+	return nil
+}
+
+func tolerantConfigBool(raw json.RawMessage) bool {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) || bytes.Equal(raw, []byte(`""`)) {
+		return false
+	}
+	var value bool
+	if json.Unmarshal(raw, &value) == nil {
+		return value
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "true", "1", "yes", "on":
+			return true
+		default:
+			return false
+		}
+	}
+	var number float64
+	if json.Unmarshal(raw, &number) == nil {
+		return number == 1
+	}
+	return false
 }
 
 type modelAccountFileConfig struct {
@@ -524,8 +571,12 @@ func debugEvent(r *http.Request, level, event string, fields map[string]any) {
 		return
 	}
 	sink.mu.Lock()
-	_, _ = sink.writer.Write(append(data, '\n'))
+	n, writeErr := sink.writer.Write(append(data, '\n'))
 	sink.mu.Unlock()
+	if writeErr != nil || n != len(data)+1 {
+		log.Printf("[调试日志] traceId=%s 事件=%s 结果=写入失败 错误类型=%T 业务影响=本条诊断记录可能不完整，不中断模型请求",
+			traceID, event, writeErr)
+	}
 }
 
 func debugBodyReadStarted(r *http.Request) time.Time {
@@ -555,6 +606,7 @@ func debugBodyReadCompleted(r *http.Request, body []byte, readDuration, decodeDu
 		fields["json_error"] = safeDebugError(decodeErr)
 	}
 	debugEvent(r, level, "request_body_read_completed", fields)
+	debugFullIncomingBody(r, body, decodeErr == nil, false)
 }
 
 func debugBodyReadFailed(r *http.Request, body []byte, readStarted time.Time, readErr error) {
@@ -562,6 +614,7 @@ func debugBodyReadFailed(r *http.Request, body []byte, readStarted time.Time, re
 		return
 	}
 	debugEvent(r, "error", "request_body_read_failed", debugBodyFields(r, body, time.Since(readStarted), 0, false, readErr))
+	debugFullIncomingBody(r, body, false, true)
 }
 
 func debugBodyFields(r *http.Request, body []byte, readDuration, decodeDuration time.Duration, jsonValid bool, readErr error) map[string]any {

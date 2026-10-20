@@ -112,6 +112,11 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	if !hot {
 		cfg.DebugEnabled = c.Debug.Enabled // 仅启动时写入 cfg，运行期间由 sink 判断。
 	}
+	previousFull := debugFullRequests.Swap(c.Debug.FullRequests)
+	if previousFull != c.Debug.FullRequests || !hot && c.Debug.FullRequests {
+		log.Printf("[完整请求日志] traceId=%s 配置开启=%t 调试日志开启=%t 说明=仅模型API；入站与实际出站请求完整记录到debug日志，已知凭据脱敏，提示词代码与图片仍属敏感数据；无次数和时长限制，请排障后关闭",
+			trace, c.Debug.FullRequests, c.Debug.Enabled)
+	}
 	setModelFilter(c.Models.Blocklist, c.Models.Allowlist)
 	_ = setModelAccountFilter(c.Models.Accounts)
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)

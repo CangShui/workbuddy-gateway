@@ -135,6 +135,99 @@ func TestStatsValidFileRestores(t *testing.T) {
 	}
 }
 
+func TestAggregateModelStatsWindow(t *testing.T) {
+	resetStatsState(t)
+	now := time.Now()
+	tokensA, tokensB := int64(100), int64(50)
+	ttft := 800.0
+	requestStats.Lock()
+	requestStats.document.Requests = []statsRequest{
+		{Account: "a", Model: "m1", At: now.Add(-time.Hour).UnixMilli(), Status: 200, Complete: true,
+			TotalTokens: &tokensA, LatencyMS: 2000, TTFTMS: &ttft, TTFTMetric: ttftMetric},
+		{Account: "a", Model: "m1", At: now.Add(-2 * time.Hour).UnixMilli(), Status: 200, Complete: true,
+			TotalTokens: &tokensA, LatencyMS: 4000, TTFTMS: &ttft, TTFTMetric: ttftMetric},
+		{Account: "a", Model: "m1", At: now.Add(-6 * time.Hour).UnixMilli(), Status: 200, Complete: true,
+			TotalTokens: &tokensB, LatencyMS: 9000},
+		{Account: "a", Model: "m2", At: now.Add(-time.Hour).UnixMilli(), Status: 500, Complete: false,
+			LatencyMS: 1000},
+	}
+	requestStats.Unlock()
+
+	window := aggregateModelStatsWindow(now.Add(-5*time.Hour), now)
+	m1, ok := window["m1"]
+	if !ok || m1.Requests != 2 || m1.Success != 2 || m1.Failed != 0 || m1.Tokens != 200 {
+		t.Fatalf("m1 窗口聚合错误: %+v", m1)
+	}
+	if m1.AvgTTFTMS == nil || *m1.AvgTTFTMS != 800 {
+		t.Fatalf("m1 首Token均值错误: %+v", m1.AvgTTFTMS)
+	}
+	if m1.AvgLatencyMS == nil || *m1.AvgLatencyMS != 3000 {
+		t.Fatalf("m1 总耗时均值错误: %+v", m1.AvgLatencyMS)
+	}
+	m2, ok := window["m2"]
+	if !ok || m2.Requests != 1 || m2.Failed != 1 || m2.AvgTTFTMS != nil {
+		t.Fatalf("m2 失败请求不应计入首Token: %+v", m2)
+	}
+}
+
+func TestHandleWebUIModelsRange5hUsesPersistedStats(t *testing.T) {
+	isolatedGatewayConfig(t)
+	resetStatsState(t)
+	now := time.Now()
+	snap := statusSnapshot{UpdatedAt: now.Unix(), ModelCatalog: []modelStatSnapshot{
+		{ID: "m1", Requests: 999, Tokens: 999999, HasTTFT: true, AvgTTFTMs: 9999, HasLatency: true, AvgLatencyMs: 9999},
+		{ID: "m2", Requests: 0},
+	}}
+	raw, _ := json.Marshal(snap)
+	if err := os.WriteFile(statusSnapshotFile, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	tokens := int64(100)
+	ttft := 800.0
+	requestStats.Lock()
+	requestStats.document.Requests = []statsRequest{
+		{Account: "a", Model: "m1", At: now.Add(-time.Hour).UnixMilli(), Status: 200, Complete: true,
+			TotalTokens: &tokens, LatencyMS: 2000, TTFTMS: &ttft, TTFTMetric: ttftMetric},
+		{Account: "a", Model: "m1", At: now.Add(-6 * time.Hour).UnixMilli(), Status: 200, Complete: true,
+			TotalTokens: &tokens, LatencyMS: 9000},
+	}
+	requestStats.Unlock()
+
+	rec := httptest.NewRecorder()
+	handleWebUIModels(rec, httptest.NewRequest(http.MethodGet, "/admin/api/models?range=5h", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("range=5h 状态码=%d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Range  string              `json:"range"`
+		Models []modelStatSnapshot `json:"models"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Range != "5h" {
+		t.Fatalf("响应未标注统计窗口: %#v", body.Range)
+	}
+	byID := map[string]modelStatSnapshot{}
+	for _, m := range body.Models {
+		byID[m.ID] = m
+	}
+	m1 := byID["m1"]
+	if m1.Requests != 1 || m1.Tokens != 100 || m1.AvgTTFTMs != 800 || !m1.HasTTFT ||
+		m1.AvgLatencyMs != 2000 || !m1.HasLatency {
+		t.Fatalf("模型列表没有复用 stats.json 窗口: %+v", m1)
+	}
+	if m2 := byID["m2"]; m2.Requests != 0 || m2.HasTTFT || m2.HasLatency {
+		t.Fatalf("窗口内无调用的模型应显示空统计: %+v", m2)
+	}
+
+	rec = httptest.NewRecorder()
+	handleWebUIModels(rec, httptest.NewRequest(http.MethodGet, "/admin/api/models?range=24h", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("非法 range 应返回 400: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 // 每次实际账号调用记一次，失败重试分开；未选号的拒绝不记。
 func TestStatsRecordsAttemptWithUsageAndTiming(t *testing.T) {
 	chdirTemp(t)

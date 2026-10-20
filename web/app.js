@@ -1458,7 +1458,7 @@
         if (state.activeTab === "accounts") pollAddAccount();
       });
     } else if (state.activeTab === "models") {
-      pending = api("/admin/api/models").then(function (data) {
+      pending = api("/admin/api/models?range=5h").then(function (data) {
         if (!state.togglePending && policyVersion === state.policyVersion) renderModels(data);
       }).catch(onErr);
     } else if (state.activeTab === "logs") {

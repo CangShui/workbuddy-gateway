@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.20"
+	version = "1.14.21"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -177,7 +177,9 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 				traceID, reqID, acc.Path, try, retries, safeDebugError(lastErr))
 		}
 
+		debugFullUpstreamRequest(r, req, upstreamBytes, try)
 		resp, err := cfg.HttpClient.Do(req)
+		debugFullUpstreamResponse(r, req, resp, try, headersWritten.Load(), bodyWritten.Load(), err)
 		if err == nil {
 			return resp, upstreamCancel, nil
 		}
@@ -3445,6 +3447,7 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 				"message": "请求已进入网关，准备执行中间件与路由处理",
 			})
 		}
+		debugFullIncomingHeaders(r)
 		aw := &auditResponseWriter{ResponseWriter: w}
 		log.Printf("[请求到达] traceId=%s 方法=%s 路径=%s 来源=%s 说明=请求已进入网关", traceID, r.Method, r.URL.Path, r.RemoteAddr)
 		next.ServeHTTP(aw, r)
@@ -3641,6 +3644,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			resp.Body.Close()
 			upstreamCancel()
 			errStr := string(errBody)
+			debugFullUpstreamError(r, resp, errBody)
 			debugEvent(r, "warn", "upstream_response_rejected", map[string]any{
 				"upstream_host": prof.Base,
 				"status_code":   resp.StatusCode,
@@ -3787,7 +3791,9 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	applyThinkingRules(reqObj, modelName)
 
 	// 模板净化：改写 Claude Code 等框架被腾讯官方逐字拉黑的固定 prompt 语句
-	sanitizeMessages(reqObj)
+	if modified := sanitizeMessages(reqObj); modified > 0 {
+		logSystemPrefixSanitized(r, reqID, modified)
+	}
 
 	// 会话结构归一化：保证首条消息为 system，修复部分非 harness 客户端
 	//（以 assistant / tool 续写或回传工具结果）触发的上游 11128 错误
@@ -4044,11 +4050,12 @@ func applyThinkingRules(obj map[string]any, modelName string) {
 	obj["reasoning_summary"] = "auto"
 }
 
-func sanitizeMessages(obj map[string]any) {
+func sanitizeMessages(obj map[string]any) int {
 	messages, ok := obj["messages"].([]any)
 	if !ok {
-		return
+		return 0
 	}
+	modified := 0
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -4074,7 +4081,14 @@ func sanitizeMessages(obj map[string]any) {
 				}
 			}
 		}
+		if roleOfMessage(msg) == "system" {
+			if content, changed := sanitizeSystemMessageContent(msg["content"]); changed {
+				msg["content"] = content
+				modified++
+			}
+		}
 	}
+	return modified
 }
 
 // ensureLeadingSystemMessage 保证 messages 的首条消息符合腾讯上游的会话结构校验。
