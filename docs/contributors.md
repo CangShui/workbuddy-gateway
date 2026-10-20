@@ -46,6 +46,19 @@
   未直接合并 PR 分支，也未采纳其中改变启动方式、请求边界或凭据文件替换方式的改动。
 - 关联版本: v1.13.15 起（源码版本）
 
+## MoRanYue
+
+- GitHub: https://github.com/MoRanYue
+- 提议: https://github.com/CangShui/workbuddy-gateway/issues/21
+- 标题: `国际站 429 回退国内站后偶发 400/11128「Illegal API invocation from an unapproved channel」`
+- 采纳内容: 通过真实出站请求抓包与二分定位，确认上游会对 system 消息开头的
+  `You are an AI agent powered by DeepSeek Harness` 做渠道校验并返回 11128；
+  同时验证了前导空白、正文中段和 user 消息不会触发。
+- 落地方式: 新增 `sanitizeprefix.go`，在三个协议入口统一将 system 开头的该身份句
+  等义改写为中性前缀，正文其余部分逐字保留；补充边界、数组 content、
+  `developer` 归一化和三协议入口测试。
+- 关联版本: v1.14.21 起
+
 ## 说明
 
 - 以上改动均以本仓库当时代码为基线应用，未直接合并原分支，但保留了作者署名与来源链接。
