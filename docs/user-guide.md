@@ -4,6 +4,9 @@
 >
 > 本文是完整使用手册。以下源码构建和测试命令均在项目根目录执行，而不是在 `docs/` 内执行。
 
+<img width="2836" height="1858" alt="image" src="https://github.com/user-attachments/assets/ed6a66cf-9e3d-47f9-bfe8-ec4895a10a07" />
+
+
 <img width="917" height="754" alt="image" src="https://github.com/user-attachments/assets/7dcfc461-1357-4991-9565-279047687898" />
 
 
