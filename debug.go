@@ -85,6 +85,11 @@ type runtimeFileConfig struct {
 		// TransientRetries：请求体发送阶段遇到瞬时网络错误的额外重试次数。
 		// 用指针区分「未配置」（用默认值）与「显式设为 0」（禁用重试）。
 		TransientRetries *int `json:"transientRetries"`
+		// StreamKeepaliveSeconds：流式响应中的心跳间隔（持续无数据时的保活）。<=0 或省略表示用默认值。
+		StreamKeepaliveSeconds int `json:"streamKeepaliveSeconds"`
+		// EnableFirstByteRetry：是否允许在「已收到响应头但首个有效字节未到」时安全重放一次
+		// （防边缘节点静默期误杀）。指针区分未配置（默认开启）与显式 false（关闭）。
+		EnableFirstByteRetry *bool `json:"enableFirstByteRetry"`
 	} `json:"upstream"`
 	// Models 段可选，用于按模型名做黑白名单控制（大小写不敏感）。
 	Models struct {

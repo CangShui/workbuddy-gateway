@@ -76,6 +76,15 @@ const (
 
 	// upstreamRetryBackoff 是两次重试之间的等待，给上游边缘节点留出恢复时间。
 	upstreamRetryBackoffDefault = 300 * time.Millisecond
+
+	// streamKeepaliveDefault 是流式响应心跳间隔。腾讯边缘节点对「响应头已发出但长时间
+	// 无任何 SSE 数据」的连接有低静默容忍（实测 6-132s 即 RST），向客户端周期性
+	// 注入心跳事件可保活整条链路，避免客户端因空闲误判而取消。默认 15s。
+	streamKeepaliveDefault = 15 * time.Second
+	// enableFirstByteRetryDefault 允许在「上游已响应但首个字节迟迟不来即被 RST」时
+	// 安全重放一次。由于尚未下发任何内容给客户端，重放不产生重复输出；仅重复消耗
+	// 一次上游额度，换取边缘节点误杀时请求仍能成功。默认开启。
+	enableFirstByteRetryDefault = true
 )
 
 var errModelAccountPolicy = errors.New("model account policy rejected all accounts")
@@ -94,6 +103,10 @@ var (
 	upstreamTransientRetries = upstreamTransientRetriesDefault
 	// upstreamRetryBackoff 为生效的重试间隔（测试可调小）。
 	upstreamRetryBackoff = upstreamRetryBackoffDefault
+	// streamKeepalive 为生效的心跳间隔（0 表示关闭心跳）。
+	streamKeepalive = streamKeepaliveDefault
+	// enableFirstByteRetry 为生效的首字节前重放开关。
+	enableFirstByteRetry = enableFirstByteRetryDefault
 )
 
 // isTransientNetworkError 判断错误是否为「瞬时网络故障」，这类错误值得重试。
@@ -3823,7 +3836,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isStream {
-		streamChatResponse(w, r, resp, modelName, reqID, acc, prof, startTime)
+		streamChatResponseResilient(w, r, resp, modelName, reqID, acc, prof, startTime, upstreamBytes)
 	} else {
 		writeChatAggregate(w, r, resp, modelName, reqID, acc, prof, startTime)
 	}

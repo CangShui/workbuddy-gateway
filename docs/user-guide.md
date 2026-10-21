@@ -513,10 +513,29 @@ workbuddy-gateway serve -models-refresh 0
   "upstream": {
     "headerTimeoutSeconds": 300,
     "idleTimeoutSeconds": 120,
-    "transientRetries": 2
+    "transientRetries": 2,
+    "streamKeepaliveSeconds": 15,
+    "enableFirstByteRetry": true
   }
 }
 ```
+
+**流式韧性（心跳 + 首字节前安全重放）**
+
+腾讯边缘节点对「响应头已发出、但长时间没有首个有效字节」的 SSE 连接静默容忍度较低（实测 6~132 秒的静默期即可能 RST，且集中在部分边缘 IP）。这类中断发生在**首个 token 之前**，客户端此时什么都没收到。网关提供两层缓解：
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| 流式心跳 | 15s | `upstream.streamKeepaliveSeconds` 可覆盖。等待上游首字节期间，周期性向下游写 SSE 注释行 `: keepalive`（OpenAI 兼容客户端会忽略注释行，不产生伪 token）。首个 `data` 事件写出后自动停止 |
+| 首字节前重放 | 开启 | `upstream.enableFirstByteRetry` 可覆盖。若上游在**任何有效内容下发之前**发生 RST/EOF/超时，网关会重建连接并重新走账号池重发一次请求。由于客户端尚未收到任何内容，重放不会产生重复输出（仅重复消耗一次上游额度） |
+| 重放上限 | 1 次 | 只对首字节前的瞬时网络错误生效；已下发过内容、客户端主动取消、或非网络错误一律不重放 |
+
+重放与心跳都会留下日志：
+
+```text
+[首字节前重放] traceId=... requestId=... 模型=deepseek-v4.1-flash 账号=workbuddy1.json 原因=首个有效字节前上游连接中断（...connection reset by peer）... 第1次
+```
+
 
 **瞬时网络错误重试**
 

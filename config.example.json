@@ -20,7 +20,9 @@
   "upstream": {
     "headerTimeoutSeconds": 300,
     "idleTimeoutSeconds": 120,
-    "transientRetries": 2
+    "transientRetries": 2,
+    "streamKeepaliveSeconds": 15,
+    "enableFirstByteRetry": true
   },
   "models": {
     "blocklist": [],
