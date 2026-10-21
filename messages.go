@@ -133,6 +133,19 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Normalize each text block before conversion joins system/assistant text;
+	// a prefix at the start of a later block would otherwise be lost.
+	compatMessages, _ := msgReq["messages"].([]any)
+	var systemMessage map[string]any
+	if system, exists := msgReq["system"]; exists {
+		systemMessage = map[string]any{"role": "system", "content": system}
+		compatMessages = append([]any{systemMessage}, compatMessages...)
+	}
+	logDSHPromptCompatibility(r, reqID, map[string]any{"messages": compatMessages})
+	if systemMessage != nil {
+		msgReq["system"] = systemMessage["content"]
+	}
+
 	chatReq, err := anthropicToChatRequest(msgReq, modelName)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -145,6 +158,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		logSystemPrefixSanitized(r, reqID, modified)
 	}
 	prepareSystemPromptForUpstream(chatReq, r, reqID, w.Header().Get("X-Trace-ID"))
+	logDSHPromptCompatibility(r, reqID, chatReq)
 	// 输出预算归一化：客户端未声明 max_tokens 时补模型输出上限，
 	// 避免上游默认预留 384000 导致长会话在远未到窗口上限时被 11133 拒绝
 	ensureUpstreamMaxTokens(chatReq, r, reqID, w.Header().Get("X-Trace-ID"), modelName)

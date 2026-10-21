@@ -3798,6 +3798,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 会话结构归一化：保证首条消息为 system，修复部分非 harness 客户端
 	//（以 assistant / tool 续写或回传工具结果）触发的上游 11128 错误
 	prepareSystemPromptForUpstream(reqObj, r, reqID, w.Header().Get("X-Trace-ID"))
+	logDSHPromptCompatibility(r, reqID, reqObj)
 	// 输出预算归一化：客户端未声明 max_tokens 时补模型输出上限，
 	// 避免上游默认预留 384000 导致长会话在远未到窗口上限时被 11133 拒绝
 	ensureUpstreamMaxTokens(reqObj, r, reqID, w.Header().Get("X-Trace-ID"), modelName)
