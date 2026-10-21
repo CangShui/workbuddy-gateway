@@ -143,12 +143,22 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	if n := c.Upstream.TransientRetries; n != nil && *n >= 0 {
 		retries = *n
 	}
+	keepalive := streamKeepaliveDefault
+	if n := c.Upstream.StreamKeepaliveSeconds; n > 0 {
+		keepalive = time.Duration(n) * time.Second
+	}
+	firstByteRetry := enableFirstByteRetryDefault
+	if n := c.Upstream.EnableFirstByteRetry; n != nil {
+		firstByteRetry = *n
+	}
 	upstreamConfigMu.Lock()
 	upstreamHeaderTimeout, upstreamIdleTimeout, upstreamTransientRetries = header, idle, retries
+	streamKeepalive = keepalive
+	enableFirstByteRetry = firstByteRetry
 	upstreamConfigMu.Unlock()
 	if hot {
-		log.Printf("[配置热加载] traceId=%s 结果=成功 模型黑名单=%d 模型白名单=%d 账号规则=%d 调试日志=%t 日志保留天数=%d 响应头超时=%v 流空闲超时=%v 重试次数=%d 说明=后续请求使用新配置，凭据及历史账本保留，端口变更需重启",
-			trace, len(c.Models.Blocklist), len(c.Models.Allowlist), len(c.Models.Accounts), c.Debug.Enabled, c.Logs.RetentionDays, header, idle, retries)
+		log.Printf("[配置热加载] traceId=%s 结果=成功 模型黑名单=%d 模型白名单=%d 账号规则=%d 调试日志=%t 日志保留天数=%d 响应头超时=%v 流空闲超时=%v 重试次数=%d 流心跳=%v 首字节重放=%t 说明=后续请求使用新配置，凭据及历史账本保留，端口变更需重启",
+			trace, len(c.Models.Blocklist), len(c.Models.Allowlist), len(c.Models.Accounts), c.Debug.Enabled, c.Logs.RetentionDays, header, idle, retries, keepalive, firstByteRetry)
 	}
 	return nil
 }
@@ -162,6 +172,20 @@ func upstreamSettings() (time.Duration, time.Duration, int) {
 func currentIdleTimeout() time.Duration {
 	_, idle, _ := upstreamSettings()
 	return idle
+}
+
+// currentStreamKeepalive 返回当前流式心跳间隔（0 表示关闭）。
+func currentStreamKeepalive() time.Duration {
+	upstreamConfigMu.RLock()
+	defer upstreamConfigMu.RUnlock()
+	return streamKeepalive
+}
+
+// currentFirstByteRetry 返回当前首字节前重放开关。
+func currentFirstByteRetry() bool {
+	upstreamConfigMu.RLock()
+	defer upstreamConfigMu.RUnlock()
+	return enableFirstByteRetry
 }
 
 func switchDebugLogging(enabled bool) error {

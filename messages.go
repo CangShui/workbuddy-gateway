@@ -133,6 +133,19 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Messages 会在转换时合并 system 文本块。先逐块处理，避免第二块开头的
+	// 已知前缀在 join 后落到正文中段而漏掉；后续共享步骤会再次幂等检查。
+	compatMessages, _ := msgReq["messages"].([]any)
+	var compatSystem map[string]any
+	if system, exists := msgReq["system"]; exists {
+		compatSystem = map[string]any{"role": "system", "content": system}
+		compatMessages = append([]any{compatSystem}, compatMessages...)
+	}
+	logDSHPromptCompatibility(r, reqID, map[string]any{"messages": compatMessages})
+	if compatSystem != nil {
+		msgReq["system"] = compatSystem["content"]
+	}
+
 	chatReq, err := anthropicToChatRequest(msgReq, modelName)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())

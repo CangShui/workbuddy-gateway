@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.23"
+	version = "1.14.24"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -76,6 +76,12 @@ const (
 
 	// upstreamRetryBackoff 是两次重试之间的等待，给上游边缘节点留出恢复时间。
 	upstreamRetryBackoffDefault = 300 * time.Millisecond
+
+	// streamKeepaliveDefault 是等待上游首个有效数据期间向下游发送 SSE 注释的间隔。
+	// 腾讯边缘节点对「响应头已发出但长时间无首个字节」的连接较敏感，默认 15s。
+	streamKeepaliveDefault = 15 * time.Second
+	// enableFirstByteRetryDefault 允许在客户端尚未收到任何有效数据时安全重放一次。
+	enableFirstByteRetryDefault = true
 )
 
 var errModelAccountPolicy = errors.New("model account policy rejected all accounts")
@@ -94,6 +100,10 @@ var (
 	upstreamTransientRetries = upstreamTransientRetriesDefault
 	// upstreamRetryBackoff 为生效的重试间隔（测试可调小）。
 	upstreamRetryBackoff = upstreamRetryBackoffDefault
+	// streamKeepalive 为生效的流式心跳间隔（0 表示关闭）。
+	streamKeepalive = streamKeepaliveDefault
+	// enableFirstByteRetry 为生效的首字节前重放开关。
+	enableFirstByteRetry = enableFirstByteRetryDefault
 )
 
 // isTransientNetworkError 判断错误是否为「瞬时网络故障」，这类错误值得重试。
@@ -3822,7 +3832,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isStream {
-		streamChatResponse(w, r, resp, modelName, reqID, acc, prof, startTime)
+		streamChatResponseResilient(w, r, resp, modelName, reqID, acc, prof, startTime, upstreamBytes)
 	} else {
 		writeChatAggregate(w, r, resp, modelName, reqID, acc, prof, startTime)
 	}
@@ -3830,7 +3840,21 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // streamChatResponse 将上游 SSE 逐行透传为 OpenAI Chat Completions 流式响应。
 func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
-	defer resp.Body.Close()
+	streamChatResponseWithReplay(w, r, resp, modelName, reqID, acc, prof, startTime, nil)
+}
+
+// streamChatResponseResilient 在流式空闲期发送 SSE 注释，并允许在首个有效
+// 数据下发前对瞬时网络中断安全重放一次。
+func streamChatResponseResilient(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time, upstreamBytes []byte) {
+	streamChatResponseWithReplay(w, r, resp, modelName, reqID, acc, prof, startTime, upstreamBytes)
+}
+
+func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time, upstreamBytes []byte) {
+	defer func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	}()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -3842,125 +3866,158 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		return
 	}
 
-	body := newTTFTReader(resp.Body, startTime)
-	defer finishFirstToken(r, modelName, reqID, body)
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	var usage map[string]any
-	finishReason := ""
-	sawDone := false
-	commentLines, metadataLines := 0, 0
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	guard := &streamWriteGuard{w: w, flusher: flusher}
+	heartbeat := startStreamHeartbeat(guard, currentStreamKeepalive())
+	defer heartbeat.Stop()
+
+	var finalBody *ttftReader
+	defer func() {
+		if finalBody != nil {
+			finishFirstToken(r, modelName, reqID, finalBody)
 		}
-		if strings.HasPrefix(line, ":") {
-			// SSE 注释是保活信号，不是 JSON。不能包装成 data: : heartbeat，
-			// 否则 CPA 的 JSON/SSE 解析器会拒绝首帧并取消整个请求。
-			commentLines++
-			_, _ = fmt.Fprintf(w, "%s\n\n", line)
-			flusher.Flush()
-			continue
-		}
-		if !strings.HasPrefix(line, "data:") && !strings.HasPrefix(line, "{") && line != "[DONE]" {
-			// event/id/retry 及未知 SSE 字段不属于 Chat Completions 的数据。
-			// 保留既有裸 JSON 和重复 data: 前缀的兼容性。
-			metadataLines++
-			continue
-		}
-		cleanData := stripDataPrefix(line)
-		if cleanData == "" {
-			continue
-		}
-		if cleanData == "[DONE]" {
-			// 先记住，等确认有真实 finish_reason 再转发。
-			// 没有结束原因时转发 [DONE]，等于告诉客户端这次是正常结束。
-			sawDone = true
-			break
-		}
-		var chunk map[string]any
-		if json.Unmarshal([]byte(cleanData), &chunk) == nil {
-			observeFirstToken(body, chunk)
-			if u, ok := chunk["usage"].(map[string]any); ok {
-				usage = u
+	}()
+
+	replayBudget := 0
+	if upstreamBytes != nil && currentFirstByteRetry() {
+		replayBudget = 1
+	}
+	replays := 0
+
+	for attempt := 0; ; attempt++ {
+		body := newTTFTReader(resp.Body, startTime)
+		finalBody = body
+		scanner := bufio.NewScanner(body)
+		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		var usage map[string]any
+		finishReason := ""
+		sawDone := false
+		commentLines, metadataLines := 0, 0
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
 			}
-			finishReason = noteFinishReason(finishReason, chunk)
+			if strings.HasPrefix(line, ":") {
+				// SSE 注释是保活信号，不是 JSON。不能包装成 data: : heartbeat，
+				// 否则 CPA 的 JSON/SSE 解析器会拒绝首帧并取消整个请求。
+				commentLines++
+				guard.writeUpstreamComment(line)
+				continue
+			}
+			if !strings.HasPrefix(line, "data:") && !strings.HasPrefix(line, "{") && line != "[DONE]" {
+				// event/id/retry 及未知 SSE 字段不属于 Chat Completions 的数据。
+				// 保留既有裸 JSON 和重复 data: 前缀的兼容性。
+				metadataLines++
+				continue
+			}
+			cleanData := stripDataPrefix(line)
+			if cleanData == "" {
+				continue
+			}
+			if cleanData == "[DONE]" {
+				// 先记住，等确认有真实 finish_reason 再转发。
+				sawDone = true
+				break
+			}
+			var chunk map[string]any
+			if json.Unmarshal([]byte(cleanData), &chunk) == nil {
+				observeFirstToken(body, chunk)
+				if u, ok := chunk["usage"].(map[string]any); ok {
+					usage = u
+				}
+				finishReason = noteFinishReason(finishReason, chunk)
+			}
+			if cleanedChunk := cleanChunkJSON(cleanData); cleanedChunk != "" {
+				guard.writeData(cleanedChunk)
+			}
 		}
-		if cleanedChunk := cleanChunkJSON(cleanData); cleanedChunk != "" {
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", cleanedChunk)
-			flusher.Flush()
+		scanErr := scanner.Err()
+		if commentLines > 0 || metadataLines > 0 {
+			debugEvent(r, "debug", "stream_sse_framing_checked", map[string]any{
+				"comment_lines": commentLines, "metadata_lines": metadataLines,
+				"business_impact": "心跳按SSE注释转发，元数据不包装为JSON数据帧，避免CPA拒绝首包",
+			})
+			log.Printf("[流式协议] traceId=%s requestId=%d 阶段=Chat流转发 心跳注释数=%d 忽略元数据行数=%d 结果=已按SSE字段区分 业务影响=心跳不混入JSON数据帧；不记录正文",
+				debugTraceID(r), reqID, commentLines, metadataLines)
 		}
-	}
-	scanErr := scanner.Err()
-	if commentLines > 0 || metadataLines > 0 {
-		debugEvent(r, "debug", "stream_sse_framing_checked", map[string]any{
-			"comment_lines": commentLines, "metadata_lines": metadataLines,
-			"business_impact": "心跳按SSE注释转发，元数据不包装为JSON数据帧，避免CPA拒绝首包",
-		})
-		log.Printf("[流式协议] traceId=%s requestId=%d 阶段=Chat流转发 心跳注释数=%d 忽略元数据行数=%d 结果=已按SSE字段区分 业务影响=心跳不混入JSON数据帧；不记录正文",
-			debugTraceID(r), reqID, commentLines, metadataLines)
-	}
-	completeTokenStream(body, scanErr == nil && finishReason != "")
-	if scanErr != nil {
-		// 流被中断（上游卡死 / 超时 / 客户端取消）时，绝不补发 [DONE]：
-		// 补发等于告诉下游「正常结束」，会让残缺的工具调用被当成完整结果执行。
-		// 改为下发一条标准错误事件，让 CPA / 客户端明确知道这次响应不完整。
-		debugEvent(r, "error", "stream_response_failed", map[string]any{
-			"error_type": debugErrorType(scanErr),
-			"error":      safeDebugError(scanErr),
-		})
-		reason := "上游流式响应中断，本次回复不完整"
-		if errors.Is(scanErr, context.DeadlineExceeded) {
-			reason = fmt.Sprintf("上游超过 %v 无数据，判定连接卡死并中断，本次回复不完整", currentIdleTimeout())
+
+		if canReplayStream(scanErr, guard.hasData(), replays < replayBudget, r.Context().Err() != nil) {
+			replays++
+			log.Printf("[首字节前重放] traceId=%s requestId=%d 模型=%s 账号=%s 原因=首个有效字节前上游连接中断（%v），客户端尚未收到内容，安全重放 第%d次",
+				debugTraceID(r), reqID, modelName, acc.Path, safeDebugError(scanErr), replays)
+			debugEvent(r, "warn", "stream_first_byte_replay", map[string]any{
+				"reason":          safeDebugError(scanErr),
+				"attempt":         attempt + 1,
+				"business_impact": "客户端未收到任何有效内容，重放可规避边缘节点静默期误杀；会额外消耗一次上游额度",
+			})
+			_ = resp.Body.Close()
+			resp = nil
+			newResp, newAcc, newProf, ok := replayUpstreamChat(w, r, reqID, modelName, upstreamBytes, startTime, guard)
+			if !ok {
+				return
+			}
+			resp, acc, prof = newResp, newAcc, newProf
+			continue
 		}
-		errPayload, _ := json.Marshal(map[string]any{
-			"error": map[string]any{
-				"message": reason,
-				"type":    "upstream_stream_interrupted",
-				"code":    "stream_interrupted",
-			},
-		})
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", errPayload)
-		flusher.Flush()
-		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流式读取 账号=%s 异常=%v 业务影响=本次响应不完整，已向客户端下发中断错误而非伪造结束", debugTraceID(r), reqID, acc.Path, scanErr)
-	} else if finishReason == "" {
-		// 连接是正常关掉的（没有读错误），但整段流没有非空 finish_reason。
-		// 这不是成功：不能补 [DONE]，也不能记成 stream_response_completed。
-		debugEvent(r, "error", "stream_closed_without_finish", map[string]any{
-			"error_type":      "stream_closed_without_finish",
-			"finish_reason":   "",
-			"saw_done":        sawDone,
-			"business_impact": "上游干净结束但没有 finish_reason，已拒绝当成成功，未补发 [DONE]",
-		})
-		errPayload, _ := json.Marshal(map[string]any{
-			"error": map[string]any{
-				"message": errStreamClosedWithoutFinish.Error(),
-				"type":    "upstream_stream_incomplete",
-				"code":    "stream_closed_without_finish",
-			},
-		})
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", errPayload)
-		flusher.Flush()
-		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流结束 账号=%s 结果=拒绝当成成功 原因=连接正常关闭但没有非空 finish_reason 是否看到DONE=%t 业务影响=不补发 [DONE]，客户端收到 stream_closed_without_finish 是否已处理=是",
-			debugTraceID(r), reqID, acc.Path, sawDone)
-	} else {
-		if sawDone {
-			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+
+		completeTokenStream(body, scanErr == nil && finishReason != "")
+		if scanErr != nil {
+			// 流被中断（上游卡死 / 超时 / 客户端取消）时，绝不补发 [DONE]：
+			// 补发等于告诉下游「正常结束」，会让残缺的工具调用被当成完整结果执行。
+			debugEvent(r, "error", "stream_response_failed", map[string]any{
+				"error_type": debugErrorType(scanErr),
+				"error":      safeDebugError(scanErr),
+			})
+			reason := "上游流式响应中断，本次回复不完整"
+			if errors.Is(scanErr, context.DeadlineExceeded) {
+				reason = fmt.Sprintf("上游超过 %v 无数据，判定连接卡死并中断，本次回复不完整", currentIdleTimeout())
+			}
+			errPayload, _ := json.Marshal(map[string]any{
+				"error": map[string]any{
+					"message": reason,
+					"type":    "upstream_stream_interrupted",
+					"code":    "stream_interrupted",
+				},
+			})
+			guard.writeData(string(errPayload))
+			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流式读取 账号=%s 异常=%v 业务影响=本次响应不完整，已向客户端下发中断错误而非伪造结束", debugTraceID(r), reqID, acc.Path, scanErr)
+		} else if finishReason == "" {
+			// 连接是正常关掉的（没有读错误），但整段流没有非空 finish_reason。
+			// 这不是成功：不能补 [DONE]，也不能记成 stream_response_completed。
+			debugEvent(r, "error", "stream_closed_without_finish", map[string]any{
+				"error_type":      "stream_closed_without_finish",
+				"finish_reason":   "",
+				"saw_done":        sawDone,
+				"business_impact": "上游干净结束但没有 finish_reason，已拒绝当成成功，未补发 [DONE]",
+			})
+			errPayload, _ := json.Marshal(map[string]any{
+				"error": map[string]any{
+					"message": errStreamClosedWithoutFinish.Error(),
+					"type":    "upstream_stream_incomplete",
+					"code":    "stream_closed_without_finish",
+				},
+			})
+			guard.writeData(string(errPayload))
+			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流结束 账号=%s 结果=拒绝当成成功 原因=连接正常关闭但没有非空 finish_reason 是否看到DONE=%t 业务影响=不补发 [DONE]，客户端收到 stream_closed_without_finish 是否已处理=是",
+				debugTraceID(r), reqID, acc.Path, sawDone)
+		} else {
+			if sawDone {
+				guard.writeData("[DONE]")
+			}
+			debugEvent(r, "info", "stream_response_completed", map[string]any{
+				"status_code":   http.StatusOK,
+				"finish_reason": finishReason,
+				"saw_done":      sawDone,
+			})
 		}
-		debugEvent(r, "info", "stream_response_completed", map[string]any{
-			"status_code":   http.StatusOK,
-			"finish_reason": finishReason,
-			"saw_done":      sawDone,
-		})
-	}
-	observeModelCredit(acc, modelName, usage, reqID)
-	statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
-	recordModelTokens(modelName, usage, reqID)
-	recordModelLatency(modelName, time.Since(startTime))
-	if scanErr == nil && finishReason != "" {
-		log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 结束原因=%s, 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, finishReason, time.Since(startTime), body.text())
+		observeModelCredit(acc, modelName, usage, reqID)
+		statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
+		recordModelTokens(modelName, usage, reqID)
+		recordModelLatency(modelName, time.Since(startTime))
+		if scanErr == nil && finishReason != "" {
+			log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 结束原因=%s, 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, finishReason, time.Since(startTime), body.text())
+		}
+		return
 	}
 }
 

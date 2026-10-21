@@ -16,6 +16,8 @@
 
 **v1.14.1**：网页凭据页已移除，新增只读定时任务时间页；执行记录来自现有后端日志，无新增调度模块。高频任务日志按分钟汇总，状态变化即时记录。
 
+**v1.14.24**：Chat 流式响应增加首字节前 SSE 心跳与最多一次安全重放；DSH 身份句和 GUI 环境说明扩展覆盖 assistant 历史、后续文本块及配置注入提示词。默认开启，可通过 `upstream` 配置关闭重放。
+
 **同时支持两个上游站点**（同一套 `/v2/plugin/*` 协议，凭据按站点隔离，账号池可混挂轮询）：
 
 | 站点 | 上游 | 登录方式 | 登录命令 |
@@ -515,12 +517,30 @@ workbuddy-gateway serve -models-refresh 0
 ```json
 {
   "upstream": {
+    "requestProfile": "official",
     "headerTimeoutSeconds": 300,
     "idleTimeoutSeconds": 120,
-    "transientRetries": 2
+    "transientRetries": 2,
+    "streamKeepaliveSeconds": 15,
+    "enableFirstByteRetry": true
   }
 }
 ```
+
+**流式心跳与首字节前重放（v1.14.24）**
+
+腾讯边缘节点可能在响应头已经返回、但首个有效 token 尚未到达时重置 SSE 连接。
+此时客户端还没有收到任何模型内容。Chat 流式入口提供两层缓解：
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| SSE 心跳 | 15 秒 | `upstream.streamKeepaliveSeconds` 可覆盖；省略或非正数使用默认值。等待首个有效 data 期间发送 `: keepalive` 注释，首个有效 data 后停止 |
+| 首字节前重放 | 开启 | `upstream.enableFirstByteRetry` 可显式设为 `false` 关闭。仅在客户端未收到任何有效 data、错误属于瞬时网络故障或上游空闲超时、且重放预算未用尽时，重新走账号池发一次 |
+| 重放上限 | 1 次 | 已下发任何有效 data、客户端主动取消、扫描器错误或非网络错误一律不重放 |
+
+心跳是标准 SSE 注释，不会产生伪 token。重放可能额外消耗一次上游额度，但不会向客户端
+重复输出已生成的内容。重放与心跳都会写入现有 TraceID 日志；重放失败时沿用已建立的
+SSE 响应，以流内错误事件结束，不伪造 `[DONE]`。
 
 **瞬时网络错误重试**
 

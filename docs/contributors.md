@@ -60,6 +60,33 @@
 - 关联版本: v1.14.21 起
 - 贡献者图: 通过 GitHub noreply 署名提交记录
 
+## Ricardowindoy
+
+- GitHub: https://github.com/Ricardowindoy
+- 提议: https://github.com/CangShui/workbuddy-gateway/pull/23
+- 标题: `fix(stream): 流式心跳 + 首字节前安全重放，缓解边缘节点静默期 RST`
+- 采纳内容: 提出在等待上游首个有效 token 期间发送 SSE 注释心跳，并在客户端尚未收到
+  内容时对首字节前 RST/EOF 做有限重放；同时给出静默期实测数据、配置项和重放边界。
+- 落地方式: 按当前 `streamChatResponse` 结构重新实现，保留默认 15 秒心跳与最多一次
+  重放。补齐响应体关闭、客户端取消区分、扫描器非网络错误拒绝重放，以及心跳已发送后
+  重放失败只能以 SSE 错误事件收尾的处理；新增并发安全心跳和真实 HTTP 重放回归测试。
+- 关联版本: v1.14.24 起
+- 贡献者图: 通过 GitHub noreply Co-authored-by 署名提交记录
+
+## GMagisk9527
+
+- GitHub: https://github.com/GMagisk9527
+- 提议: https://github.com/CangShui/workbuddy-gateway/pull/25
+- 标题: `fix(compat): 补齐 DSH 历史、GUI 与配置提示词的 11128 兼容`
+- 采纳内容: 将已知 DSH 身份前缀的净化扩展到 system/assistant 的每个标准文本块、
+  配置 fallback/force 注入内容，并精确中性化 DSH GUI 环境句；跳过围栏、缩进和行内代码，
+  不修改用户正文、工具参数、工具结果、reasoning 或图片。
+- 落地方式: 接入当前三协议共用的 `prepareUpstreamChatRequest` 出站准备链，在文本块合并前
+  和配置提示词注入后各执行一次幂等处理；保留 Messages 协议转换前的逐块处理。沿用
+  PR 提供的回归测试并适配当前公共预处理结构。
+- 关联版本: v1.14.24 起
+- 贡献者图: 通过 GitHub noreply Co-authored-by 署名提交记录
+
 ## 说明
 
 - 以上改动均以本仓库当时代码为基线应用，未直接合并原分支，但保留了作者署名与来源链接。

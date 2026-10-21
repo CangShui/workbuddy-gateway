@@ -29,6 +29,7 @@ Windows 可使用 `.\workbuddy-gateway.exe`。管理端口默认 `8316`，模型
 | 贡献者及方案署名 | [docs/contributors.md](docs/contributors.md) |
 | 测试入口与说明 | [tests/README.md](tests/README.md) |
 | 多 Harness 出站对齐、协议参数与兼容边界 | [docs/outbound-compatibility.md](docs/outbound-compatibility.md) |
+| DSH 历史回放、GUI 环境句与 11128 兼容说明 | [docs/11128-dsh-history.md](docs/11128-dsh-history.md) |
 
 ## 构建与测试
 

@@ -64,10 +64,14 @@ func prepareUpstreamChatRequest(obj map[string]any, r *http.Request, requestID u
 	if modified := sanitizeMessages(obj); modified > 0 {
 		logSystemPrefixSanitized(r, requestID, modified)
 	}
+	// 三个协议都可能在这里合并文本块。先在合并前处理每个块的开头，
+	// 再在 fallback/force 注入后补一次，避免后续块的前缀因拼接而丢失。
+	logDSHPromptCompatibility(r, requestID, obj)
 	if profile == requestProfileOfficial {
 		mergeLeadingInstructionMessages(obj, r, requestID)
 	}
 	prepareSystemPromptForUpstream(obj, r, requestID, trace)
+	logDSHPromptCompatibility(r, requestID, obj)
 	ensureUpstreamMaxTokens(obj, r, requestID, trace, model)
 	if profile == requestProfileOfficial {
 		applyOfficialBodyDefaults(obj, r, requestID, model)
