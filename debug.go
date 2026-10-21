@@ -78,6 +78,8 @@ type runtimeFileConfig struct {
 	} `json:"logs"`
 	// Upstream 段可选，用于按网络状况调整上游超时（单位秒，<=0 或省略表示用默认值）。
 	Upstream struct {
+		// RequestProfile: legacy（省略/空值）保留旧行为；official 使用已抓取的国内桌面兼容参数。
+		RequestProfile string `json:"requestProfile"`
 		// HeaderTimeoutSeconds：请求发送完成 → 收到响应头的等待上限。
 		HeaderTimeoutSeconds int `json:"headerTimeoutSeconds"`
 		// IdleTimeoutSeconds：流式响应体的空闲读超时（持续有数据则不超时）。

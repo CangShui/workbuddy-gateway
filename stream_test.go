@@ -171,3 +171,65 @@ func TestStreamChatResponseKeepsToolCallFinishReason(t *testing.T) {
 		t.Fatalf("缺少 [DONE] 结束标记")
 	}
 }
+
+// 官方上游首帧是 SSE 注释；CPA 必须看到注释而不是 data: : heartbeat。
+// 同时确保 event/id/retry 元数据不会变成非 JSON 数据帧。
+func TestStreamChatResponsePreservesHeartbeatFraming(t *testing.T) {
+	upstreamSSE := ": heartbeat\r\n\r\nevent: message\r\nid: 123\r\nretry: 1000\r\nx-extension: ignored\r\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\r\n\r\n" +
+		"data: [DONE]\r\n\r\n"
+	code, out := runStreamCase(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(upstreamSSE))
+	})
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	if !strings.HasPrefix(out, ": heartbeat\n\n") {
+		t.Fatalf("heartbeat must remain an SSE comment, got %q", out)
+	}
+	var dataFrames int
+	for _, frame := range strings.Split(out, "\n\n") {
+		if frame == "" || strings.HasPrefix(frame, ":") {
+			continue
+		}
+		if !strings.HasPrefix(frame, "data: ") {
+			t.Fatalf("unexpected frame: %q", frame)
+		}
+		data := strings.TrimPrefix(frame, "data: ")
+		if data != "[DONE]" && !json.Valid([]byte(data)) {
+			t.Fatalf("CPA would reject non-JSON data frame: %q", data)
+		}
+		dataFrames++
+	}
+	if dataFrames != 2 || !strings.HasSuffix(out, "data: [DONE]\n\n") {
+		t.Fatalf("completion frames must be preserved: %q", out)
+	}
+}
+
+func TestStreamChatHeartbeatOnlyIsNotSuccessfulCompletion(t *testing.T) {
+	code, out := runStreamCase(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(": heartbeat\n\n"))
+	})
+	if code != http.StatusOK || !strings.HasPrefix(out, ": heartbeat\n\n") {
+		t.Fatalf("expected a streaming comment, got status=%d body=%q", code, out)
+	}
+	if strings.Contains(out, "[DONE]") || !strings.Contains(out, `"code":"stream_closed_without_finish"`) {
+		t.Fatalf("heartbeat followed by EOF must remain a failed stream: %q", out)
+	}
+}
+
+func TestStreamChatPreservesLegacyDataFraming(t *testing.T) {
+	for _, prefix := range []string{"", "data: ", "data: data: "} {
+		t.Run(prefix, func(t *testing.T) {
+			code, out := runStreamCase(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(prefix + "{\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\n[DONE]\n\n"))
+			})
+			if code != http.StatusOK || !strings.Contains(out, `"content":"OK"`) || !strings.HasSuffix(out, "data: [DONE]\n\n") {
+				t.Fatalf("legacy data framing must remain supported: %q", out)
+			}
+		})
+	}
+}

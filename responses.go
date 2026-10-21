@@ -86,19 +86,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	chatReq["stream"] = true // 上游强制流式，非流式由网关本地聚合
 
-	applyThinkingRules(chatReq, modelName)
-	if modified := sanitizeMessages(chatReq); modified > 0 {
-		logSystemPrefixSanitized(r, reqID, modified)
-	}
-	prepareSystemPromptForUpstream(chatReq, r, reqID, w.Header().Get("X-Trace-ID"))
-	// 输出预算归一化：客户端未声明 max_tokens 时补模型输出上限，
-	// 避免上游默认预留 384000 导致长会话在远未到窗口上限时被 11133 拒绝
-	ensureUpstreamMaxTokens(chatReq, r, reqID, w.Header().Get("X-Trace-ID"), modelName)
-	repairReport := repairToolMessageSequence(chatReq)
-	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
+	prepareUpstreamChatRequest(chatReq, r, reqID, modelName)
 	logResponsesToolOutputConversion(r, reqID, respReq)
-	// 与 Chat 原生入口共用同一套 DeepSeek 多轮推理历史回填规则。
-	logReasoningHistoryRepair(r, reqID, modelName, repairReasoningHistory(chatReq))
 
 	upstreamBytes, err := json.Marshal(chatReq)
 	if err != nil {
@@ -205,6 +194,14 @@ func responsesToChatRequest(respReq map[string]any, modelName string) (map[strin
 	}
 	if v, ok := respReq["top_p"]; ok && v != nil {
 		chat["top_p"] = v
+	}
+	if v, ok := respReq["parallel_tool_calls"].(bool); ok {
+		chat["parallel_tool_calls"] = v
+	}
+	if text, ok := respReq["text"].(map[string]any); ok {
+		if verbosity, ok := text["verbosity"].(string); ok && verbosity != "" {
+			chat["verbosity"] = verbosity
+		}
 	}
 	if v, ok := respReq["max_output_tokens"]; ok && v != nil {
 		chat["max_tokens"] = v

@@ -192,6 +192,9 @@ func debugFullUpstreamRequest(r, req *http.Request, raw []byte, attempt int) {
 	}
 	fields := fullRequestBody(raw)
 	fields["request"], fields["attempt"], fields["upstream_request_id"] = fullRequestEnvelope(req), attempt, req.Header.Get("X-Request-ID")
+	fields["content_encoding"] = req.Header.Get("Content-Encoding")
+	fields["wire_body_bytes"] = req.ContentLength
+	fields["body_representation"] = "decoded_json_before_content_encoding"
 	fields["message"] = "协议转换和全部修复之后、HTTP发送之前的完整请求；不是TLS原始抓包；不改变上游请求"
 	debugEvent(r, "info", "full_request_upstream", fields)
 }

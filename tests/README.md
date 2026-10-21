@@ -22,11 +22,14 @@
 go vet ./...
 go test ./...
 go test -run '^TestConfigEditor' -count=1
+go test -run 'TestOfficial|TestRequestProfile|TestHarnessProtocol' -count=1
 ```
 
 `*_test.go` 直接使用 `package main` 私有实现，不搬进普通子目录。Go 在 `go build .` 时会排除这些文件，标准测试命令仍运行完整测试，不需要额外加载器。
 
 测试进程使用临时工作目录，配置、凭据和上游响应均为合成数据，避免污染真实文件。
+出站兼容测试覆盖三协议 × 流式/聚合、gzip、显式参数保留、热加载及请求身份。
+可选历史采集离线重放见[出站兼容说明](../docs/outbound-compatibility.md#验证与边界)，默认不会读取私有材料。
 
 ## 网页
 

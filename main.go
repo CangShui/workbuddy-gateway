@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.21"
+	version = "1.14.23"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -146,6 +146,13 @@ func isTransientNetworkError(err error) bool {
 func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, upstreamBytes []byte, reqID uint64, traceID string) (*http.Response, context.CancelFunc, error) {
 	// 兼容直接调用与测试；正常入口已经在协议转换前准备完成。只生成一次，不能在 try 循环里重建。
 	prepareConversationContext(r, nil)
+	profile := requestProfileFor(r)
+	wireBytes, encodeErr := encodeModelRequest(upstreamBytes, profile, prof)
+	if encodeErr != nil {
+		log.Printf("[出站兼容] traceId=%s requestId=%d 阶段=请求编码 结果=失败 业务影响=未发送上游", traceID, reqID)
+		debugEvent(r, "error", "upstream_body_encode_failed", map[string]any{"status_code": 502})
+		return nil, nil, encodeErr
+	}
 	var lastErr error
 	_, _, retries := upstreamSettings()
 	for try := 0; try <= retries; try++ {
@@ -159,12 +166,21 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 				}
 			},
 		}
-		req, err := http.NewRequestWithContext(httptrace.WithClientTrace(upstreamCtx, trace), http.MethodPost, prof.chatURL(), bytes.NewReader(upstreamBytes))
+		req, err := http.NewRequestWithContext(httptrace.WithClientTrace(upstreamCtx, trace), http.MethodPost, prof.chatURL(), bytes.NewReader(wireBytes))
 		if err != nil {
 			upstreamCancel()
 			return nil, nil, err
 		}
 		backendHeaders(req, acc.Auth, prof)
+		applyObservedDesktopHeaders(req, prof, profile)
+		if usesObservedDesktopHeaders(profile, prof) {
+			req.Header.Set("Content-Encoding", "gzip")
+		}
+		debugEvent(r, "debug", "upstream_request_profile_applied", map[string]any{
+			"profile": profile, "desktop_headers": usesObservedDesktopHeaders(profile, prof),
+			"decoded_body_bytes": len(upstreamBytes), "wire_body_bytes": len(wireBytes),
+			"site": prof.Key, "business_impact": "仅模型出站；国际站沿用原请求头，不记录认证或正文",
+		})
 		if debugLoggingEnabled() {
 			req.Header.Set("X-Trace-ID", debugTraceID(r))
 			req.Header.Set("X-Parent-Request-ID", strconv.FormatUint(reqID, 10))
@@ -3787,24 +3803,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 腾讯上游强制要求 stream 必须为 true，非流式会被拦截 (code 11101)
 	reqObj["stream"] = true
 
-	// 深度思考 (Thinking) 自动适配：混元系列如果未关闭思考，自动赋予 high 档位保证深度思考输出
-	applyThinkingRules(reqObj, modelName)
-
-	// 模板净化：改写 Claude Code 等框架被腾讯官方逐字拉黑的固定 prompt 语句
-	if modified := sanitizeMessages(reqObj); modified > 0 {
-		logSystemPrefixSanitized(r, reqID, modified)
-	}
-
-	// 会话结构归一化：保证首条消息为 system，修复部分非 harness 客户端
-	//（以 assistant / tool 续写或回传工具结果）触发的上游 11128 错误
-	prepareSystemPromptForUpstream(reqObj, r, reqID, w.Header().Get("X-Trace-ID"))
-	// 输出预算归一化：客户端未声明 max_tokens 时补模型输出上限，
-	// 避免上游默认预留 384000 导致长会话在远未到窗口上限时被 11133 拒绝
-	ensureUpstreamMaxTokens(reqObj, r, reqID, w.Header().Get("X-Trace-ID"), modelName)
-	repairReport := repairToolMessageSequence(reqObj)
-	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
-	// 11155 防护：与 Responses 入口共用出站推理历史回填，不伪造思维链正文。
-	logReasoningHistoryRepair(r, reqID, modelName, repairReasoningHistory(reqObj))
+	prepareUpstreamChatRequest(reqObj, r, reqID, modelName)
 
 	upstreamBytes, err := json.Marshal(reqObj)
 	if err != nil {
@@ -3850,8 +3849,27 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	var usage map[string]any
 	finishReason := ""
 	sawDone := false
+	commentLines, metadataLines := 0, 0
 	for scanner.Scan() {
-		cleanData := stripDataPrefix(scanner.Text())
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			// SSE 注释是保活信号，不是 JSON。不能包装成 data: : heartbeat，
+			// 否则 CPA 的 JSON/SSE 解析器会拒绝首帧并取消整个请求。
+			commentLines++
+			_, _ = fmt.Fprintf(w, "%s\n\n", line)
+			flusher.Flush()
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") && !strings.HasPrefix(line, "{") && line != "[DONE]" {
+			// event/id/retry 及未知 SSE 字段不属于 Chat Completions 的数据。
+			// 保留既有裸 JSON 和重复 data: 前缀的兼容性。
+			metadataLines++
+			continue
+		}
+		cleanData := stripDataPrefix(line)
 		if cleanData == "" {
 			continue
 		}
@@ -3875,6 +3893,14 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		}
 	}
 	scanErr := scanner.Err()
+	if commentLines > 0 || metadataLines > 0 {
+		debugEvent(r, "debug", "stream_sse_framing_checked", map[string]any{
+			"comment_lines": commentLines, "metadata_lines": metadataLines,
+			"business_impact": "心跳按SSE注释转发，元数据不包装为JSON数据帧，避免CPA拒绝首包",
+		})
+		log.Printf("[流式协议] traceId=%s requestId=%d 阶段=Chat流转发 心跳注释数=%d 忽略元数据行数=%d 结果=已按SSE字段区分 业务影响=心跳不混入JSON数据帧；不记录正文",
+			debugTraceID(r), reqID, commentLines, metadataLines)
+	}
 	completeTokenStream(body, scanErr == nil && finishReason != "")
 	if scanErr != nil {
 		// 流被中断（上游卡死 / 超时 / 客户端取消）时，绝不补发 [DONE]：

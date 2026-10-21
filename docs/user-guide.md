@@ -65,6 +65,7 @@
 - **工具调用序列自愈**：出站前按 `tool_call_id` 修复并行调用中夹入 message 的历史结构，合并 Responses API 拆散的并行调用，并删除无配对调用、孤儿或重复结果，避免国际站返回 `11148 tool_call_sequence_broken`。
 - **OpenAI 兼容协议**：`/v1/chat/completions`（SSE 流式 + 非流式聚合）、`/v1/responses`（Responses API）、`/v1/models`、`/health`。
 - **Anthropic 协议原生入口**：`/v1/messages`（SSE 流式 + 非流式聚合）与 `/v1/messages/count_tokens`，Claude Code 等 Anthropic 客户端免外部翻译层直连，鉴权兼容 `x-api-key` 头。
+- **可选官方出站兼容**：`upstream.requestProfile="official"` 让三个协议入口共用参数、指令结构和出站逻辑；国内模型请求使用已采集桌面版本的静态头及 gzip。旧配置缺省为 `legacy`，不提升 user 角色、不强改思考档位、不替换原工具。详见[出站兼容说明](outbound-compatibility.md)。
 
 ---
 

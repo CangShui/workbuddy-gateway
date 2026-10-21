@@ -63,6 +63,9 @@ func parseRuntimeConfig(data []byte) (runtimeFileConfig, error) {
 	if c.Logs.RetentionDays < 0 || c.Logs.RetentionDays > 36500 {
 		return c, gatewayValidationError("logs.retentionDays 必须为 0～36500 的整数；0 表示不自动清理")
 	}
+	if _, err := normalizeRequestProfile(c.Upstream.RequestProfile); err != nil {
+		return c, err
+	}
 	return c, nil
 }
 
@@ -97,6 +100,10 @@ func loadRuntimeConfig(path string) error {
 
 // 调用前已完整校验。热加载不修改监听端口，不中断正在输出的流。
 func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
+	profile, err := normalizeRequestProfile(c.Upstream.RequestProfile)
+	if err != nil {
+		return err
+	}
 	if hot {
 		if err := switchDebugLogging(c.Debug.Enabled); err != nil {
 			return err // 日志文件不可写时，整份配置仍保留上一版本。
@@ -120,6 +127,11 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	setModelFilter(c.Models.Blocklist, c.Models.Allowlist)
 	_ = setModelAccountFilter(c.Models.Accounts)
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)
+	previousProfile := officialRequests.Load()
+	setRequestProfile(profile)
+	if previousProfile != officialRequests.Load() {
+		log.Printf("[出站兼容配置] traceId=%s profile=%s 结果=已应用 说明=只影响后续模型请求，正在执行的请求沿用原快照，不修改登录和凭据", trace, profile)
+	}
 	logRetentionDays.Store(int64(c.Logs.RetentionDays))
 	header, idle, retries := upstreamHeaderTimeoutDefault, upstreamIdleTimeoutDefault, upstreamTransientRetriesDefault
 	if n := c.Upstream.HeaderTimeoutSeconds; n > 0 {

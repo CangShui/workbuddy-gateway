@@ -17,12 +17,13 @@ import (
 
 // 瞬时网络错误必须被识别（可重试），非瞬时错误不得误判。
 func TestIsTransientNetworkError(t *testing.T) {
+	// 地址仅用于合成错误文本，使用文档示例网段，不包含真实客户端或上游 IP。
 	transient := []error{
 		io.EOF,
-		errors.New(`Post "https://x": write tcp 1.2.3.4:1->5.6.7.8:443: write: connection reset by peer`),
+		errors.New(`Post "https://x": write tcp 192.0.2.1:1->198.51.100.2:443: write: connection reset by peer`),
 		errors.New("write: broken pipe"),
 		errors.New("use of closed network connection"),
-		errors.New("dial tcp 1.2.3.4:443: connect: connection refused"),
+		errors.New("dial tcp 192.0.2.1:443: connect: connection refused"),
 		errors.New(`http2: server sent GOAWAY and closed the connection`),
 		errors.New("unexpected EOF"),
 	}
