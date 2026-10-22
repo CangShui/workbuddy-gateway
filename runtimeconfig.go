@@ -129,7 +129,17 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)
 	previousProfile := officialRequests.Load()
 	setRequestProfile(profile)
-	if previousProfile != officialRequests.Load() {
+	// 未配置 upstream.requestProfile 时会回退 legacy，出站请求体因此不压缩。
+	// 该回退此前是静默的：升级后只能从「请求体没变小」间接推断，故启动时无条件打印一次。
+	profileSource := "config.json upstream.requestProfile"
+	if c.Upstream.RequestProfile == "" {
+		profileSource = "缺省：config.json 未提供 upstream.requestProfile"
+	}
+	switch {
+	case !hot:
+		log.Printf("[出站兼容配置] traceId=%s profile=%s 来源=%s 结果=已应用 说明=legacy 不压缩出站请求体，official 启用出站 gzip 与桌面端指纹；只影响后续模型请求，不修改登录与凭据",
+			trace, profile, profileSource)
+	case previousProfile != officialRequests.Load():
 		log.Printf("[出站兼容配置] traceId=%s profile=%s 结果=已应用 说明=只影响后续模型请求，正在执行的请求沿用原快照，不修改登录和凭据", trace, profile)
 	}
 	logRetentionDays.Store(int64(c.Logs.RetentionDays))

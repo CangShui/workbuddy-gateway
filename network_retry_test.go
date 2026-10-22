@@ -26,6 +26,10 @@ func TestIsTransientNetworkError(t *testing.T) {
 		errors.New("dial tcp 192.0.2.1:443: connect: connection refused"),
 		errors.New(`http2: server sent GOAWAY and closed the connection`),
 		errors.New("unexpected EOF"),
+		// Windows Winsock 的 RST 文案，不含 POSIX 的 "connection reset by peer"。
+		errors.New(`Post "https://x": write tcp 192.0.2.1:1->198.51.100.2:443: wsasend: An existing connection was forcibly closed by the remote host.`),
+		errors.New(`read tcp 192.0.2.1:1->198.51.100.2:443: wsarecv: An existing connection was forcibly closed by the remote host.`),
+		errors.New(`write tcp 192.0.2.1:1->198.51.100.2:443: wsasend: An established connection was aborted by the software in your host machine.`),
 	}
 	for _, err := range transient {
 		if !isTransientNetworkError(err) {

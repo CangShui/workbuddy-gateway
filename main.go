@@ -112,6 +112,13 @@ var (
 // 以及 Go 在复用 keep-alive 连接时常见的 "server closed idle connection"。
 // 注意：context.Canceled 与 DeadlineExceeded 不属于此类——前者是客户端主动断开，
 // 后者是明确超时，重试都无意义甚至有害。
+//
+// Windows 上同一类故障的文案与 POSIX 不同：Winsock 的发送/接收失败表现为
+// "An existing connection was forcibly closed by the remote host"（WSAECONNRESET，
+// 常带 wsasend:/wsarecv: 前缀）或 "An established connection was aborted by the
+// software in your host machine"（WSAECONNABORTED），都不包含 "connection reset
+// by peer"。两套文案必须同时匹配，否则 Windows 上的 RST 会被当成永久错误：
+// doUpstreamRequest 不会重试，canReplayStream 也会因此拒绝首字节前重放。
 func isTransientNetworkError(err error) bool {
 	if err == nil {
 		return false
@@ -139,6 +146,10 @@ func isTransientNetworkError(err error) bool {
 		"unexpected eof",
 		"http2: server sent goaway",
 		"stream error",
+		// Windows Winsock：WSAECONNRESET / WSAECONNABORTED 的文案与 POSIX 不同，
+		// 不含 "connection reset by peer"。msg 已转小写，此处必须小写。
+		"forcibly closed",
+		"an established connection was aborted",
 	} {
 		if strings.Contains(msg, marker) {
 			return true
@@ -146,6 +157,14 @@ func isTransientNetworkError(err error) bool {
 	}
 	return false
 }
+
+// legacyLargeBodyWarnBytes 是提示「未压缩大请求体」的阈值。
+// 出站请求体在 legacy profile 下不压缩，其上传耗时随体积线性增长，
+// 上行抖动时被对端中断的概率随之升高，因此超过该阈值时提示一次配置项。
+const legacyLargeBodyWarnBytes = 512 * 1024
+
+// legacyLargeBodyWarned 保证该提示在一个进程内只输出一次，避免逐请求刷屏。
+var legacyLargeBodyWarned atomic.Bool
 
 // doUpstreamRequest 发送上游请求，并对瞬时网络错误做有界重试。
 //
@@ -162,6 +181,14 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 		log.Printf("[出站兼容] traceId=%s requestId=%d 阶段=请求编码 结果=失败 业务影响=未发送上游", traceID, reqID)
 		debugEvent(r, "error", "upstream_body_encode_failed", map[string]any{"status_code": 502})
 		return nil, nil, encodeErr
+	}
+	if profile == requestProfileLegacy && len(wireBytes) >= legacyLargeBodyWarnBytes && legacyLargeBodyWarned.CompareAndSwap(false, true) {
+		log.Printf("[出站兼容] traceId=%s requestId=%d 请求体=%d字节 profile=legacy 未压缩 说明=出站请求体未压缩，上传耗时随体积线性增长，上行抖动时更容易被对端中断；如需启用出站 gzip 请在 config.json 设置 upstream.requestProfile=official",
+			traceID, reqID, len(wireBytes))
+		debugEvent(r, "info", "outbound_body_uncompressed_large", map[string]any{
+			"wire_body_bytes": len(wireBytes), "profile": profile,
+			"business_impact": "仅提示配置项，不改变出站行为",
+		})
 	}
 	var lastErr error
 	_, _, retries := upstreamSettings()

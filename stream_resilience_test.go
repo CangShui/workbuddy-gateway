@@ -17,6 +17,8 @@ import (
 
 func TestCanReplayStream(t *testing.T) {
 	rstErr := errors.New(`read tcp 192.0.2.10:59360->198.51.100.20:443: read: connection reset by peer`)
+	// Windows 上同一次 RST 的地址与端口完全相同，仅文案不同；必须同样允许重放。
+	windowsRstErr := errors.New(`read tcp 192.0.2.10:59360->198.51.100.20:443: wsarecv: An existing connection was forcibly closed by the remote host.`)
 	cases := []struct {
 		name           string
 		err            error
@@ -26,6 +28,8 @@ func TestCanReplayStream(t *testing.T) {
 		want           bool
 	}{
 		{"RST before data", rstErr, false, true, false, true},
+		{"Windows wsasend RST before data", windowsRstErr, false, true, false, true},
+		{"Windows wsasend RST after data", windowsRstErr, true, true, false, false},
 		{"already sent data", rstErr, true, true, false, false},
 		{"budget exhausted", rstErr, false, false, false, false},
 		{"client canceled", context.Canceled, false, true, true, false},
