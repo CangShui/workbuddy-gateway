@@ -106,6 +106,16 @@ type runtimeFileConfig struct {
 		// Accounts：all 控制全局调度，其余键限定各模型的凭据文件名。
 		Accounts map[string]modelAccountFileConfig `json:"accounts"`
 	} `json:"models"`
+	// Growth 段可选：成长任务（成长中心）定时领取。
+	// ⚠️ 默认关闭 —— 它会向腾讯上游发真实写请求（接取任务 / 领奖），
+	// 属于「会改变账号状态」的动作，须由用户显式开启，不能默认代跑。
+	Growth struct {
+		// ⚠️ 刻意不加 omitempty：config.example.json 的门控
+		// （TestConfigExampleCoversEveryRuntimeField）会双向比对「结构体序列化出的
+		// 字段集合」与「示例文件的字段集合」，加了 omitempty 会让 nil 指针
+		// 序列化成 `{}`，示例里的 enabled 反而变成"未定义配置项"。
+		Enabled *bool `json:"enabled"` // 指针区分「未配置」（默认关）与显式 false
+	} `json:"growth"`
 }
 
 // debugFileConfig 对缺少 debug、null、空对象、空字符串、0/1、true/false 和

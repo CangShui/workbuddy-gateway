@@ -38,7 +38,10 @@ func TestTaskLogAggregationNoFalseSuccessOrCrossProcess(t *testing.T) {
 		{Task: "daily_checkin", Phase: "scheduled", PID: pid, At: at - 30000, NextAt: at - 1000},
 	}
 	rows := aggregateTaskViews(events, now, pid, at-60000)
-	if len(rows) != 11 {
+	// ⚠️ 12 = taskViewDefinitions() 的任务条数（新增的 growth_tasks 计入）。
+	//    在 taskViewDefinitions() 里增删任务时必须同步改这个数字 —— 这是
+	//    「定时任务页展示」与「定义清单」不会静默漂移的唯一守卫。
+	if len(rows) != 12 {
 		t.Fatalf("任务数=%d", len(rows))
 	}
 	quota := taskByID(t, rows, "quota_scan")

@@ -3318,6 +3318,7 @@ func runServe() {
 	go keepaliveLoop()
 	go backgroundQuotaRefresher()
 	go backgroundDailyCheckin()
+	go backgroundGrowthTasks()
 	if cfg.ModelsRefresh > 0 {
 		go modelsRefreshLoop(time.Duration(cfg.ModelsRefresh) * time.Minute)
 	} else {
