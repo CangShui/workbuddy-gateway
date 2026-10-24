@@ -275,6 +275,9 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 		log.Printf("[出站兼容配置] traceId=%s profile=%s 结果=已应用 说明=只影响后续模型请求，正在执行的请求沿用原快照，不修改登录和凭据", trace, profile)
 	}
 	logRetentionDays.Store(int64(c.Logs.RetentionDays))
+	// 成长任务默认关闭：未配置（nil）按 false，只有显式 true 才跑。
+	// 与 debug.enabled 同款指针语义，但缺省值相反（会发真实写请求）。
+	growthTasksEnabled.Store(c.Growth.Enabled != nil && *c.Growth.Enabled)
 	header, idle, retries := upstreamHeaderTimeoutDefault, upstreamIdleTimeoutDefault, upstreamTransientRetriesDefault
 	if n := c.Upstream.HeaderTimeoutSeconds; n > 0 {
 		header = time.Duration(n) * time.Second

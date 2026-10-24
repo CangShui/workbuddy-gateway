@@ -76,6 +76,8 @@ func registerWebUIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/account-add", handleWebUIAccountAdd)
 	mux.HandleFunc("/admin/api/account-cancel", handleWebUIAccountCancel)
 	mux.HandleFunc("/admin/api/account-delete", handleWebUIAccountDelete)
+	mux.HandleFunc("/admin/api/growth-run", handleWebUIGrowthRun)
+	mux.HandleFunc("/admin/api/growth-toggle", handleWebUIGrowthToggle)
 }
 
 // 只读日志视图：无额外调度器、任务状态文件或内存任务登记表。
@@ -125,6 +127,13 @@ func taskViewDefinitions() []scheduledTaskView {
 		{ID: "keepalive_catchup", Name: "启动续期补跑", Schedule: "启动后90秒；只处理久未续期账号", Enabled: keepaliveEnabled, OneShot: true},
 		{ID: "quota_scan", Name: "额度及套餐查询", Schedule: "每5分钟；启动/事件可能提前触发", Enabled: true, IntervalSeconds: 300},
 		{ID: "daily_checkin", Name: "每日签到", Schedule: "北京时间09:00；启动/事件可能提前触发", Enabled: true},
+		{
+			ID:              "growth_tasks",
+			Name:            "成长任务领取",
+			Schedule:        "每6小时；默认关闭，需在配置 growth.enabled 显式开启",
+			Enabled:         growthTasksEnabled.Load(),
+			IntervalSeconds: 6 * 60 * 60,
+		},
 		{ID: "model_catalog", Name: "模型目录刷新", Schedule: fmt.Sprintf("每%d分钟；启动/事件可能提前触发", cfg.ModelsRefresh), Enabled: cfg.ModelsRefresh > 0, IntervalSeconds: int64(cfg.ModelsRefresh) * 60},
 		{ID: "price_probe", Name: "模型价格探测", Schedule: "仅-allow-price-probes开启；启动后20秒；随后2或30分钟；单模型12小时限制", Enabled: cfg.automaticPriceProbesAllowed()},
 		{ID: "log_cleanup", Name: "过期日志清理", Schedule: fmt.Sprintf("每小时；保留%d天，规则变化会提前执行", logRetentionDays.Load()), Enabled: logRetentionDays.Load() > 0, IntervalSeconds: 3600},
