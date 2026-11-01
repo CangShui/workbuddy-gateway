@@ -184,6 +184,23 @@ func TestMessagesStreamingAndAggregate(t *testing.T) {
 		if stream {
 			streamMessagesResponse(rec, req, resp, "messages-test", 1, acc, &profileCN, time.Now(), true)
 			out := rec.Body.String()
+			var thinkingStarts int
+			for _, line := range strings.Split(out, "\n") {
+				if !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				event := decodeObject(t, []byte(strings.TrimPrefix(line, "data: ")))
+				block, _ := event["content_block"].(map[string]any)
+				if event["type"] == "content_block_start" && block["type"] == "thinking" {
+					thinkingStarts++
+					if signature, ok := block["signature"].(string); !ok || signature != "" {
+						t.Fatalf("thinking start must contain an empty string signature: %#v", block)
+					}
+				}
+			}
+			if thinkingStarts != 1 {
+				t.Fatalf("thinking starts = %d, want 1", thinkingStarts)
+			}
 			for _, event := range []string{"message_start", "thinking_delta", "signature_delta", "text_delta", "input_json_delta", "message_delta", "message_stop"} {
 				if !strings.Contains(out, `"type":"`+event+`"`) {
 					t.Errorf("missing SSE event %s: %s", event, out)

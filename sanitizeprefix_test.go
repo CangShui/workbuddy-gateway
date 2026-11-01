@@ -121,8 +121,10 @@ func TestPrefixSanitizedOnAllProtocolEntrypoints(t *testing.T) {
 				if err := json.Unmarshal(raw, &captured); err != nil {
 					t.Fatal(err)
 				}
-				return &http.Response{StatusCode: 200, Header: make(http.Header), Request: req,
-					Body: io.NopCloser(strings.NewReader(conversationFixtureSSE(false)))}, nil
+				return &http.Response{
+					StatusCode: 200, Header: make(http.Header), Request: req,
+					Body: io.NopCloser(strings.NewReader(conversationFixtureSSE(false))),
+				}, nil
 			})}
 			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
 			req.Header.Set("Content-Type", "application/json")
@@ -172,6 +174,9 @@ func TestAssistantIdentityBrandReplacement(t *testing.T) {
 		{"You are an AI agent powered by DeepSeek Harness. Keep rules.", "You are WorkBuddy. Keep rules."},
 		{"You are Claude Code, Anthropic's official CLI tool for Claude.", "You are WorkBuddy, Anthropic's official CLI tool for WorkBuddy."},
 		{"You are ZCode. Keep rules.", "You are WorkBuddy. Keep rules."},
+		{"You are Grok released by xAI. Keep rules.", "You are WorkBuddy. Keep rules."},
+		{"You are a coding agent running in the Grok Build CLI, a terminal-based coding assistant.", "You are a coding agent running in the WorkBuddy CLI, a terminal-based coding assistant."},
+		{"You are a Grok Build subagent. Keep delegated task.", "You are a WorkBuddy subagent. Keep delegated task."},
 	}
 	for _, tc := range cases {
 		got, changed := normalizeAssistantIdentityText(tc.input)

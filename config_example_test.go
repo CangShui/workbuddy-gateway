@@ -74,6 +74,7 @@ func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 	exampleSchema.Identity = runtimeIdentityConfig{Enabled: &identityEnabled, Target: "WorkBuddy", Replacements: map[string]string{
 		"Claude Code": "WorkBuddy", "Claude": "WorkBuddy", "DeepSeek Harness": "WorkBuddy",
 		"Codex": "WorkBuddy", "ZCode": "WorkBuddy", "workspace root": "workspace base",
+		"Grok Build": "WorkBuddy", "Grok": "WorkBuddy", "Grok released by xAI": "WorkBuddy",
 		"are paths the user": "are paths that the user",
 	}}
 	schema, err := json.Marshal(exampleSchema)
@@ -118,7 +119,7 @@ func TestConfigExampleStartsFreshDeployment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(runtimeConfigFile, raw, 0600); err != nil {
+	if err := os.WriteFile(runtimeConfigFile, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg.PortExplicit = false
@@ -145,12 +146,12 @@ func TestConfigExampleIncludesIdentityCompatibilityDefaults(t *testing.T) {
 	if len(c.DeprecatedPromptCompatibility) != 0 {
 		t.Fatal("example must not contain the removed compatibility field")
 	}
-	if len(c.Identity.Replacements) != 7 {
-		t.Fatalf("example identity rules=%d want=7", len(c.Identity.Replacements))
-	}
 	for old, want := range map[string]string{
-		"workspace root":     "workspace base",
-		"are paths the user": "are paths that the user",
+		"workspace root":       "workspace base",
+		"are paths the user":   "are paths that the user",
+		"Grok Build":           "WorkBuddy",
+		"Grok":                 "WorkBuddy",
+		"Grok released by xAI": "WorkBuddy",
 	} {
 		if c.Identity.Replacements[old] != want {
 			t.Fatalf("config.example identity replacement %q=%q want %q",
@@ -169,7 +170,7 @@ func TestConfigEmptyValuesFallBackToDefaults(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			isolatedGatewayConfig(t)
-			if err := os.WriteFile(runtimeConfigFile, []byte(content), 0600); err != nil {
+			if err := os.WriteFile(runtimeConfigFile, []byte(content), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			cfg.PortExplicit = false
@@ -211,7 +212,7 @@ func freeTCPPort(t *testing.T) int {
 func TestConfigBlankKeysAreTreatedAsUnset(t *testing.T) {
 	isolatedGatewayConfig(t)
 	content := `{"gateway":{"apiPort":8317,"webPort":8316,"adminKey":"","apiKeyEnabled":false,"apiKey":""}}`
-	if err := os.WriteFile(runtimeConfigFile, []byte(content), 0600); err != nil {
+	if err := os.WriteFile(runtimeConfigFile, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := loadRuntimeConfig(runtimeConfigFile); err != nil {

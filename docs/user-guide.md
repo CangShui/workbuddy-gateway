@@ -24,6 +24,8 @@
 
 **v1.14.41**：移除重复的 `promptCompatibility` 替换模块，文本替换统一使用 `identity.replacements`，七条默认规则和热加载保持不变。旧配置若仍有该字段，仅兼容读取并提示已忽略，不会阻止启动或继续执行旧规则。
 
+**Grok Build 兼容**：`identity` 支持主会话、CLI、subagent 及按模型配置的身份标签；请求 `model` 保持原样。
+
 **v1.14.24**：Chat 流式响应增加首字节前 SSE 心跳与最多一次安全重放；DSH 身份句和 GUI 环境说明扩展覆盖 assistant 历史、后续文本块及配置注入提示词。默认开启，可通过 `upstream` 配置关闭重放。
 
 **v1.14.25**：Responses 的 namespace 子工具、custom 工具（如 `apply_patch`）和 web_search 不再被静默丢弃；恢复 `custom_tool_call` 与 namespace 输出形状。出站头补齐已采集的 WorkBuddy 桌面静态身份；system/developer/assistant 中的 Codex、DeepSeek Harness、Claude Code、ZCode 展示名统一为 `Assistant`。实测 `/v2/responses` 返回 404，上游路径仍为 `/v2/chat/completions`。
@@ -230,6 +232,9 @@ workbuddy-gateway serve -webui -allow-price-probes
       "DeepSeek Harness": "WorkBuddy",
       "Codex": "WorkBuddy",
       "ZCode": "WorkBuddy",
+      "Grok Build": "WorkBuddy",
+      "Grok": "WorkBuddy",
+      "Grok released by xAI": "WorkBuddy",
       "workspace root": "workspace base",
       "are paths the user": "are paths that the user"
     }
@@ -238,6 +243,8 @@ workbuddy-gateway serve -webui -allow-price-probes
 ```
 
 - 省略 `identity` 时默认把已知 Harness 名称替换成 `WorkBuddy`，并补齐 `workspace root → workspace base`、`are paths the user → are paths that the user` 两条等义兼容替换。
+- Grok Build 在每个文本块开头识别 `You are <label> released by xAI.`，按 `Grok released by xAI` 的目标改写；完整身份的自定义映射优先。`Grok Build` 和 `Grok` 名称沿用普通替换，模型选择及请求 `model` 保持原样。
+- 自定义映射缺少 `Grok released by xAI` 或将其映射为自身时，通用标签处理关闭。启动时补充缺失默认词条，热加载使用配置中的映射。真实上游接受情况尚未验证。
 - `target` 可选 `Assistant` 或 `WorkBuddy`；想更接近官方文案可用 `WorkBuddy`。
 - `enabled:false` 关闭替换。
 - 需要逐词控制时加 `replacements`，例如：
