@@ -174,6 +174,14 @@ Grok Build 的 `You are <label> released by xAI.` 按原始文本块处理，支
 - Claude Code 等使用 Messages 时，可以原样提交 system、thinking、output_config 和 Anthropic 工具。
 - 原生 Chat 客户端保留 system/developer 与 user 的区别。
 
+### 流式字段与历史回传
+
+- Chat 的 `delta.tool_calls` 省略值为 `""` 的 `id`、`type`、`function.name`；保留 `index`、`function.arguments` 与扩展字段。客户端按 `index` 累计参数。处理逐片完成，适用于全部模型与客户端。字段定义见 [OpenAI 流式工具调用说明](https://developers.openai.com/api/docs/guides/function-calling#streaming)。
+- Messages 的 thinking 开始事件包含 `thinking:""` 和 `signature:""`，随后发送 `thinking_delta`、`signature_delta` 和 `content_block_stop`，遵循 [Anthropic 流式事件示例](https://platform.claude.com/docs/en/build-with-claude/streaming#streaming-request-with-thinking)。当前结束签名由网关生成，仅用于本项目的兼容输出，不具备 Anthropic 服务端签名验证能力。
+- Chat 的非空 `reasoning_content` 原样传递；客户端在下一轮请求中完整回传推理历史。DeepSeek 带工具请求的要求见 [Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/)。已经丢失的工具名称或推理文本无法由输出清理恢复，更新后使用新会话验证。
+
+本地回归覆盖交错工具分片、参数拼接、推理文本与工具结果回传。2026-11-01 使用 `deepseek-v4.1-flash` 完成合成 `echo` 请求验证：现有网关的响应经过修复后的转发函数，保留工具名称及推理内容，回传工具结果后得到正确回答。该验证在隔离进程中进行，未替换正在运行的网关，也未运行 Grok CLI 的完整会话。
+
 当前 Responses 工具转译支持 function、namespace 子工具、custom 和 web_search
 的请求/响应保真映射。托管搜索的实际搜索结果仍由客户端执行；不能把本模式当作
 全量 OpenAI API 等价实现。

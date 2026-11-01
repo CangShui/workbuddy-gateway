@@ -672,7 +672,7 @@ func (s *anthropicStreamState) appendThinking(rc string) []byte {
 		s.blockIndex++
 		out = append(out, s.emit("content_block_start", map[string]any{
 			"index":         s.thinking.index,
-			"content_block": map[string]any{"type": "thinking", "thinking": ""},
+			"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
 		})...)
 	}
 	s.thinking.buf.WriteString(rc)

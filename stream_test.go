@@ -87,6 +87,108 @@ func TestCleanChunkJSONRemovesEmptyDeltaFields(t *testing.T) {
 	}
 }
 
+func TestCleanChunkJSONPreservesToolDeltas(t *testing.T) {
+	for _, tc := range []struct{ name, input, want string }{
+		{"empty_metadata", `{"index":0,"id":"","type":"","function":{"name":"","arguments":""}}`, `{"index":0,"function":{"arguments":""}}`},
+		{"argument_fragment", `{"index":1,"function":{"name":"","arguments":"{\"city\":"}}`, `{"index":1,"function":{"arguments":"{\"city\":"}}`},
+		{"valid_metadata", `{"index":0,"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{}"}}`, `{"index":0,"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{}"}}`},
+		{"extension_fields", `{"index":0,"extension":"","function":{"name":"","arguments":" ","extension":0}}`, `{"index":0,"extension":"","function":{"arguments":" ","extension":0}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := `{"choices":[{"index":0,"delta":{"tool_calls":[` + tc.input + `]},"finish_reason":null}]}`
+			got := decodeObject(t, []byte(cleanChunkJSON(input)))
+			delta := got["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)
+			call := delta["tool_calls"].([]any)[0]
+			actual, err := json.Marshal(call)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := json.Marshal(decodeObject(t, []byte(tc.want)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(actual) != string(want) {
+				t.Fatalf("tool delta = %s, want %s", actual, want)
+			}
+		})
+	}
+}
+
+func TestStreamChatToolAndReasoningRoundTrip(t *testing.T) {
+	upstreamSSE := strings.Join([]string{
+		`data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"检查 ","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{\"city\":"}}]},"finish_reason":null}]}`,
+		`data: {"choices":[{"index":0,"delta":{"reasoning_content":"两个城市。\n","tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"lookup","arguments":"{\"city\":"}}]},"finish_reason":null}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"","type":"","function":{"name":"","arguments":"\"上海\"}"}},{"index":0,"id":"","type":"","function":{"name":"","arguments":"\"北京\"}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+	}, "\n\n") + "\n\n"
+	code, out := runStreamCase(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(upstreamSSE))
+	})
+	if code != http.StatusOK {
+		t.Fatalf("stream status = %d: %s", code, out)
+	}
+	if strings.Contains(out, `"name":""`) || strings.Contains(out, `"id":""`) || strings.Contains(out, `"type":""`) {
+		t.Fatalf("empty metadata would overwrite client tool state: %s", out)
+	}
+	completion, err := aggregateCompletion(strings.NewReader(out), "deepseek-v4.1-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	choice := decodeObject(t, completion)["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != "tool_calls" {
+		t.Fatalf("tool completion = %#v", choice)
+	}
+	assistant := choice["message"].(map[string]any)
+	trace := "检查 两个城市。\n"
+	if assistant["reasoning_content"] != trace {
+		t.Fatalf("stream changed reasoning: %#v", assistant)
+	}
+	calls := assistant["tool_calls"].([]any)
+	if len(calls) != 2 {
+		t.Fatalf("tool calls = %#v", calls)
+	}
+	for i, want := range []struct{ id, arguments string }{{"call_a", `{"city":"北京"}`}, {"call_b", `{"city":"上海"}`}} {
+		call := calls[i].(map[string]any)
+		function := call["function"].(map[string]any)
+		if call["id"] != want.id || call["type"] != "function" || function["name"] != "lookup" || function["arguments"] != want.arguments {
+			t.Fatalf("tool %d = %#v", i, call)
+		}
+	}
+	body, err := json.Marshal(map[string]any{
+		"model": "deepseek-v4.1-flash", "stream": true, "reasoning_effort": "high",
+		"messages": []any{
+			map[string]any{"role": "system", "content": "Use tools to answer."},
+			map[string]any{"role": "user", "content": "查询两个城市"},
+			assistant,
+			map[string]any{"role": "tool", "tool_call_id": "call_a", "content": "晴天"},
+			map[string]any{"role": "tool", "tool_call_id": "call_b", "content": "多云"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed := captureUpstreamMessages(t, "/v1/chat/completions", string(body))
+	if len(replayed) != 5 {
+		t.Fatalf("replayed messages = %#v", replayed)
+	}
+	history := replayed[2].(map[string]any)
+	if history["reasoning_content"] != trace || history["reasoning"] != trace {
+		t.Fatalf("replay changed reasoning: %#v", history)
+	}
+	wantCalls, _ := json.Marshal(calls)
+	gotCalls, _ := json.Marshal(history["tool_calls"])
+	if string(gotCalls) != string(wantCalls) {
+		t.Fatalf("replay changed tool calls: got %s, want %s", gotCalls, wantCalls)
+	}
+	for i, want := range []struct{ id, content string }{{"call_a", "晴天"}, {"call_b", "多云"}} {
+		result := replayed[i+3].(map[string]any)
+		if result["role"] != "tool" || result["tool_call_id"] != want.id || result["content"] != want.content {
+			t.Fatalf("tool result %d changed: %#v", i, result)
+		}
+	}
+}
+
 // runStreamCase 用假账号 + 假上游跑通真实 handleChatCompletions 链路，
 // 返回客户端最终收到的状态码与 SSE 字节。
 func runStreamCase(t *testing.T, upstream http.HandlerFunc) (int, string) {
