@@ -150,7 +150,10 @@ system、developer 和 assistant 历史中的展示身份替换可在 `config.js
       "Claude": "WorkBuddy",
       "DeepSeek Harness": "WorkBuddy",
       "Codex": "WorkBuddy",
-      "ZCode": "WorkBuddy"
+      "ZCode": "WorkBuddy",
+      "Grok Build": "WorkBuddy",
+      "Grok": "WorkBuddy",
+      "Grok released by xAI": "WorkBuddy"
     }
   }
 }
@@ -161,7 +164,9 @@ user、tool、reasoning 实测值、工具参数和工具结果不参与。官�
 所以官方直连请求的原文不会被这套规则改写。
 当前实现是文本级替换，正文中的产品名和技能说明也会被替换；不是只改开头身份句。
 
-## Codex、dsh、Claude Code 接入建议
+Grok Build 的 `You are <label> released by xAI.` 按原始文本块处理，支持按模型配置的标签，保留请求 `model`。配置规则见使用指南的身份改写说明；本地验证范围见测试说明。真实上游接受情况尚未验证。
+
+## Codex、dsh、Claude Code、Grok Build 接入建议
 
 尽量让客户端直接连接网关对应的原生协议入口，避免先经过另一个 Responses→Chat 或 Messages→Chat 翻译层。
 
