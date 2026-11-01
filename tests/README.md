@@ -30,7 +30,7 @@ go test -run 'TestOfficial|TestRequestProfile|TestHarnessProtocol' -count=1
 测试进程使用临时工作目录，配置、凭据和上游响应均为合成数据，避免污染真实文件。
 跨编译后的测试程序若在另一台机器运行，应提供同一提交的源码目录，并用 `WORKBUDDY_TEST_SOURCE_ROOT` 指定其绝对路径；这样即使使用 `-trimpath`，示例配置等文件测试也能正确定位，不必跳过这些测试。
 出站兼容测试覆盖三协议 × 流式/聚合、gzip、显式参数保留、热加载及请求身份。
-`identity_request_test.go` 验证文本替换仅由 `identity` 控制，新装/升级及热加载保持有效；旧 `promptCompatibility` 字段只兼容读取并告警，不执行规则，不影响用户/工具内容，也不会放宽其他未知字段的校验。Grok Build 的标签、开关、自定义映射和正文保护由表格用例覆盖；本地 HTTP 验证三个入口 × 两种出站模式 × 流式/聚合，共 12 组，覆盖后续 system/assistant 文本块、模型字段及 user/tool 内容保护。配置迁移复用 `identity_config_file_test.go` 中的现有用例。真实上游渠道校验尚未验证。
+`identity_request_test.go` 验证文本替换仅由 `identity` 控制，新装/升级及热加载保持有效；旧 `promptCompatibility` 字段只兼容读取并告警，不执行规则，不影响用户/工具内容，也不会放宽其他未知字段的校验。Grok Build 只按静态词条替换，不按 `You are <任意标签> released by xAI.` 自动猜测身份；开关、自定义映射和正文保护由表格用例覆盖；本地 HTTP 验证三个入口 × 两种出站模式 × 流式/聚合，共 12 组，覆盖后续 system/assistant 文本块、模型字段及 user/tool 内容保护。配置迁移复用 `identity_config_file_test.go` 中的现有用例。真实上游渠道校验尚未验证。
 `stream_test.go` 覆盖空工具身份字段、参数片段和扩展字段保护，以及交错工具分片与多段推理文本经 Chat 请求回传；`messages_test.go` 验证 thinking 开始事件包含字符串 `signature`，并保持签名增量与结束事件顺序。测试使用本地合成上游，实际服务验证范围见出站兼容说明。
 可选历史采集离线重放见[出站兼容说明](../docs/outbound-compatibility.md#验证与边界)，默认不会读取私有材料。
 

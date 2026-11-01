@@ -135,39 +135,8 @@ func normalizeAssistantIdentityText(text string) (string, bool) {
 			break
 		}
 	}
-	text = normalizeGrokBuildIdentityPrefix(text, settings.replacements)
 	for _, replacement := range settings.replacements {
 		text = strings.ReplaceAll(text, replacement.Old, replacement.New)
 	}
 	return text, text != original
-}
-
-// Grok Build 可按模型设置身份标签；固定来源句和配置规则共同限定匹配范围。
-func normalizeGrokBuildIdentityPrefix(text string, replacements []identityReplacement) string {
-	body, ok := strings.CutPrefix(text, "You are ")
-	if !ok {
-		return text
-	}
-	label, suffix, ok := strings.Cut(body, " released by xAI.")
-	if !ok || strings.TrimSpace(label) == "" || strings.ContainsAny(label, "\r\n!?") ||
-		strings.Contains(label, ". ") || strings.Contains(label, ".\t") {
-		return text
-	}
-	if suffix != "" && !strings.ContainsRune(" \t\r\n", rune(suffix[0])) {
-		return text
-	}
-	identity := body[:len(label)+len(" released by xAI")]
-	target, enabled := "", false
-	for _, replacement := range replacements {
-		if replacement.Old == identity {
-			return text // 完整身份词条交给现有替换流程，保留用户配置的优先级。
-		}
-		if replacement.Old == "Grok released by xAI" {
-			target, enabled = replacement.New, replacement.New != replacement.Old
-		}
-	}
-	if enabled {
-		return "You are " + target + "." + suffix
-	}
-	return text
 }

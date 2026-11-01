@@ -24,7 +24,9 @@
 
 **v1.14.41**：移除重复的 `promptCompatibility` 替换模块，文本替换统一使用 `identity.replacements`，七条默认规则和热加载保持不变。旧配置若仍有该字段，仅兼容读取并提示已忽略，不会阻止启动或继续执行旧规则。
 
-**Grok Build 兼容**：`identity` 支持主会话、CLI、subagent 及按模型配置的身份标签；请求 `model` 保持原样。
+**v1.14.42**：移除 Grok Build 对 `You are <任意标签> released by xAI.` 的通用自动身份改写；文本替换恢复为仅按 `identity.replacements` 明确词条执行。保留 Grok 静态默认规则、Chat 流式工具字段修复和 Messages thinking 起始字段修复。
+
+**Grok Build 兼容**：`identity` 可按明确配置替换 Grok Build、Grok 及完整模型标签词条；请求 `model` 保持原样。
 
 **v1.14.24**：Chat 流式响应增加首字节前 SSE 心跳与最多一次安全重放；DSH 身份句和 GUI 环境说明扩展覆盖 assistant 历史、后续文本块及配置注入提示词。默认开启，可通过 `upstream` 配置关闭重放。
 
@@ -243,8 +245,8 @@ workbuddy-gateway serve -webui -allow-price-probes
 ```
 
 - 省略 `identity` 时默认把已知 Harness 名称替换成 `WorkBuddy`，并补齐 `workspace root → workspace base`、`are paths the user → are paths that the user` 两条等义兼容替换。
-- Grok Build 在每个文本块开头识别 `You are <label> released by xAI.`，按 `Grok released by xAI` 的目标改写；完整身份的自定义映射优先。`Grok Build` 和 `Grok` 名称沿用普通替换，模型选择及请求 `model` 保持原样。
-- 自定义映射缺少 `Grok released by xAI` 或将其映射为自身时，通用标签处理关闭。启动时补充缺失默认词条，热加载使用配置中的映射。真实上游接受情况尚未验证。
+- Grok Build 和 Grok 只按 `identity.replacements` 的明确词条替换，不再自动识别 `You are <任意标签> released by xAI.`。模型选择及请求 `model` 保持原样。
+- 如需改写其他模型标签，请在 `identity.replacements` 中显式添加完整词条；网关不会按句式猜测身份。启动时补充缺失默认词条，热加载使用配置中的映射。真实上游接受情况尚未验证。
 - `target` 可选 `Assistant` 或 `WorkBuddy`；想更接近官方文案可用 `WorkBuddy`。
 - `enabled:false` 关闭替换。
 - 需要逐词控制时加 `replacements`，例如：

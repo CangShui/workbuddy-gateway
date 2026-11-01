@@ -164,7 +164,7 @@ user、tool、reasoning 实测值、工具参数和工具结果不参与。官�
 所以官方直连请求的原文不会被这套规则改写。
 当前实现是文本级替换，正文中的产品名和技能说明也会被替换；不是只改开头身份句。
 
-Grok Build 的 `You are <label> released by xAI.` 按原始文本块处理，支持按模型配置的标签，保留请求 `model`。配置规则见使用指南的身份改写说明；本地验证范围见测试说明。真实上游接受情况尚未验证。
+Grok Build 和 Grok 仅按 `identity.replacements` 中明确配置的词条替换，保留请求 `model`。网关不再按 `You are <任意标签> released by xAI.` 句式自动猜测身份；其他模型标签如需改写，必须显式添加完整词条。真实上游接受情况尚未验证。
 
 ## Codex、dsh、Claude Code、Grok Build 接入建议
 

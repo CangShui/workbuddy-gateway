@@ -234,19 +234,20 @@ func TestRetiredCompatibilityWarningAndIdentityHotReload(t *testing.T) {
 	}
 }
 
-func TestGrokBuildModelLabelIdentity(t *testing.T) {
+func TestGrokBuildUsesStaticRulesOnly(t *testing.T) {
 	t.Cleanup(func() { setIdentityConfig(runtimeIdentityConfig{}) })
 	const original = "You are Gemini 2.5 Pro released by xAI. Keep the task instructions."
 	for _, tc := range []struct {
 		name, config, input, want string
 	}{
-		{"default", `{}`, original, "You are WorkBuddy. Keep the task instructions."},
-		{"versioned_label", `{}`, "You are GPT-5.2 released by xAI. Keep tools.", "You are WorkBuddy. Keep tools."},
-		{"custom_target", `{"identity":{"target":"Assistant"}}`, original, "You are Assistant. Keep the task instructions."},
+		{"exact_grok_identity", `{}`, "You are Grok released by xAI. Keep rules.", "You are WorkBuddy. Keep rules."},
+		{"arbitrary_label_untouched", `{}`, original, original},
+		{"versioned_label_untouched", `{}`, "You are GPT-5.2 released by xAI. Keep tools.", "You are GPT-5.2 released by xAI. Keep tools."},
+		{"custom_target_does_not_generalize", `{"identity":{"target":"Assistant"}}`, original, original},
 		{"disabled", `{"identity":{"enabled":false}}`, original, original},
 		{"custom_rules_only", `{"identity":{"replacements":{"keep":"retain"}}}`, original, original},
-		{"custom_identity_rule", `{"identity":{"replacements":{"Grok released by xAI":"Local Assistant"}}}`, original, "You are Local Assistant. Keep the task instructions."},
-		{"explicit_noop", `{"identity":{"replacements":{"Grok released by xAI":"Grok released by xAI"}}}`, original, original},
+		{"custom_exact_grok_rule", `{"identity":{"replacements":{"Grok released by xAI":"Local Assistant"}}}`, "You are Grok released by xAI. Keep rules.", "You are Local Assistant. Keep rules."},
+		{"explicit_noop", `{"identity":{"replacements":{"Grok released by xAI":"Grok released by xAI"}}}`, "You are Grok released by xAI. Keep rules.", "You are Grok released by xAI. Keep rules."},
 		{"exact_label_override", `{"identity":{"replacements":{"Grok released by xAI":"WorkBuddy","Gemini 2.5 Pro released by xAI":"Local Assistant"}}}`, original, "You are Local Assistant. Keep the task instructions."},
 		{"body_mention", `{}`, "Example: " + original, "Example: " + original},
 		{"later_sentence", `{}`, "You are helpful. A tool was released by xAI.", "You are helpful. A tool was released by xAI."},
@@ -270,8 +271,31 @@ func TestGrokBuildModelLabelIdentity(t *testing.T) {
 	}
 }
 
+func TestArbitraryXAIReleaseSentenceIsNotIdentity(t *testing.T) {
+	isolatedGatewayConfig(t)
+	t.Cleanup(func() { setIdentityConfig(runtimeIdentityConfig{}) })
+	const original = "You are reviewing software released by xAI. Report compatibility issues."
+	for _, profile := range []string{"legacy", "official"} {
+		t.Run(profile, func(t *testing.T) {
+			setRequestProfile(profile)
+			setIdentityConfig(runtimeIdentityConfig{})
+			obj := map[string]any{
+				"model": "deepseek-v4.1-flash", "max_tokens": 16,
+				"messages": []any{map[string]any{"role": "system", "content": original}},
+			}
+			request := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			request.Header.Set("X-Trace-ID", "grok-static-identity-test")
+			prepareUpstreamChatRequest(obj, request, 1, "deepseek-v4.1-flash")
+			got := obj["messages"].([]any)[0].(map[string]any)["content"]
+			if got != original {
+				t.Fatalf("ordinary xAI-related task was rewritten: got %q want %q", got, original)
+			}
+		})
+	}
+}
+
 func TestGrokBuildThroughHTTP(t *testing.T) {
-	const primary = "You are Gemini 2.5 Pro released by xAI. Keep tools."
+	const primary = "You are Grok released by xAI. Keep tools."
 	const protected = primary + " Grok Build."
 	for _, profile := range []string{"legacy", "official"} {
 		for _, route := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
