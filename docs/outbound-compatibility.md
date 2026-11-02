@@ -164,7 +164,9 @@ user、tool、reasoning 实测值、工具参数和工具结果不参与。官�
 所以官方直连请求的原文不会被这套规则改写。
 当前实现是文本级替换，正文中的产品名和技能说明也会被替换；不是只改开头身份句。
 
-Grok Build 和 Grok 仅按 `identity.replacements` 中明确配置的词条替换，保留请求 `model`。网关不再按 `You are <任意标签> released by xAI.` 句式自动猜测身份；其他模型标签如需改写，必须显式添加完整词条。真实上游接受情况尚未验证。
+Grok Build 和其他模型标签按 `identity.replacements` 配置处理，保留请求 `model`。本版默认包含 `"You are(.*)released by xAI": "You are WorkBuddy"`，新装生成、旧配置升级启动自动补齐缺失项，已有自定义值及关闭开关保留。它仅匹配每个文本块开头，不跨行，动态部分最多 256 个 Unicode 字符，且必须有非空首尾固定文本；不判断客户端来源或句子语义，符合句式的普通任务说明也可能命中。
+
+旧 DSH 身份句、GUI 完整开头和两条固定模板改写已全部迁入默认配置词条；关闭 `identity.enabled` 后，这些文字改写也停止。普通键统一按大小写敏感的全局字面替换执行，不再单独保护 GUI 句子所在的代码片段；user/tool、工具参数和 reasoning 内容保持不参与。省略或空映射仍使用默认规则，完整默认项以 `config.example.json` 为准。真实上游接受情况尚未验证。
 
 ## Codex、dsh、Claude Code、Grok Build 接入建议
 

@@ -1507,7 +1507,7 @@ func TestSanitizeMessagesNormalizesDeveloperRole(t *testing.T) {
 		msg("developer", "Be terse."),
 		msg("user", "hi"),
 	}}
-	sanitizeMessages(obj)
+	normalizeDeveloperRoles(obj, httptest.NewRequest("POST", "/v1/chat/completions", nil), 1)
 	roles := rolesOf(obj)
 	for _, r := range roles {
 		if r == "developer" {

@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+const testIdentityTargetPrefix = "You are WorkBuddy"
+
 const testDSHPrefix = "You are an AI agent powered by DeepSeek Harness"
 const testDSHGUI = "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to \"this page\", \"this GUI\", or \"this app\" without naming another target, they mean this GUI."
 
@@ -146,7 +148,7 @@ func dshTestText(content any) string {
 
 func TestConfiguredDSHPromptsThroughHTTP(t *testing.T) {
 	identity := testDSHPrefix + ". config-identity-sentinel"
-	neutralIdentity := blockedSystemPromptPrefixReplacement + ". config-identity-sentinel"
+	neutralIdentity := testIdentityTargetPrefix + ". config-identity-sentinel"
 	gui := testDSHGUI + " Keep config-tail-sentinel."
 	neutralGUI := testDSHNeutralGUI() + " Keep config-tail-sentinel."
 	user := identity + "\n\n" + gui + " private-user-sentinel"
@@ -181,10 +183,8 @@ func TestConfiguredDSHPromptsThroughHTTP(t *testing.T) {
 							body["system"] = tc.clientSystem
 						}
 						if tc.name == "force_block" {
-							// Messages joins system blocks before appending force; the
-							// prefix rule does not apply mid-string, but the display-name
-							// replacement still removes the harness brand.
-							want = "Client instruction.\n\n" + strings.ReplaceAll(identity, "DeepSeek Harness", "WorkBuddy") + "\n\n" + neutralGUI
+							// Configured literal replacements apply to the appended text too.
+							want = "Client instruction.\n\n" + neutralIdentity + "\n\n" + neutralGUI
 						}
 					}
 					raw, err := json.Marshal(body)
@@ -203,7 +203,7 @@ func TestConfiguredDSHPromptsThroughHTTP(t *testing.T) {
 
 func TestDSHHistoryThroughHTTP(t *testing.T) {
 	identity := testDSHPrefix + ". Preserve history-tail-sentinel."
-	neutralIdentity := blockedSystemPromptPrefixReplacement + ". Preserve history-tail-sentinel."
+	neutralIdentity := testIdentityTargetPrefix + ". Preserve history-tail-sentinel."
 	gui := "Previous context: " + testDSHGUI + " Keep custom GUI instructions."
 	neutralGUI := "Previous context: " + testDSHNeutralGUI() + " Keep custom GUI instructions."
 	for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {

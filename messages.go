@@ -133,15 +133,15 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Messages 会在转换时合并 system 文本块。先逐块处理，避免第二块开头的
-	// 已知前缀在 join 后落到正文中段而漏掉；后续共享步骤会再次幂等检查。
+	// Messages 会合并文本块。首位通配必须在原始块上处理，
+	// 共享步骤不能在合并结果上重新执行通配，避免跨块吞掉正文。
 	compatMessages, _ := msgReq["messages"].([]any)
 	var compatSystem map[string]any
 	if system, exists := msgReq["system"]; exists {
 		compatSystem = map[string]any{"role": "system", "content": system}
 		compatMessages = append([]any{compatSystem}, compatMessages...)
 	}
-	logDSHPromptCompatibility(r, reqID, map[string]any{"messages": compatMessages})
+	applyOriginalIdentityReplacements(map[string]any{"messages": compatMessages}, r, reqID)
 	if compatSystem != nil {
 		msgReq["system"] = compatSystem["content"]
 	}

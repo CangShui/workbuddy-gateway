@@ -26,6 +26,8 @@
 
 **v1.14.42**：移除 Grok Build 对 `You are <任意标签> released by xAI.` 的通用自动身份改写；文本替换恢复为仅按 `identity.replacements` 明确词条执行。保留 Grok 静态默认规则、Chat 流式工具字段修复和 Messages thinking 起始字段修复。
 
+**v1.14.43**：把旧 DSH 身份句、GUI 环境句及两条固定模板改写统一迁入 `identity.replacements`，不再存在独立文字改写旁路。默认配置新增 `"You are(.*)released by xAI": "You are WorkBuddy"`，新装生成、旧配置升级启动自动补齐缺失项，已有自定义值及 `enabled:false` 保留。通配仅一个、首尾固定文本不能为空、不跨行、动态部分最多 256 个 Unicode 字符。`identity.enabled:false` 关闭全部这些文字替换；不影响消息角色等协议结构处理。
+
 **Grok Build 兼容**：`identity` 可按明确配置替换 Grok Build、Grok 及完整模型标签词条；请求 `model` 保持原样。
 
 **v1.14.24**：Chat 流式响应增加首字节前 SSE 心跳与最多一次安全重放；DSH 身份句和 GUI 环境说明扩展覆盖 assistant 历史、后续文本块及配置注入提示词。默认开启，可通过 `upstream` 配置关闭重放。
@@ -238,15 +240,20 @@ workbuddy-gateway serve -webui -allow-price-probes
       "Grok": "WorkBuddy",
       "Grok released by xAI": "WorkBuddy",
       "workspace root": "workspace base",
-      "are paths the user": "are paths that the user"
+      "are paths the user": "are paths that the user",
+      "You are an AI agent powered by DeepSeek Harness": "You are WorkBuddy",
+      "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to \"this page\", \"this GUI\", or \"this app\" without naming another target, they mean this GUI.": "You are interacting with the user through a Web GUI whose URL the runtime context names. When the user refers to \"this page\", \"this GUI\", or \"this app\" without naming another target, they mean this GUI.",
+      "You are Claude Code, Anthropic's official CLI for Claude.": "You are Claude Code, Anthropic's official CLI tool for Claude.",
+      "Main branch (you will usually use this for PRs)": "Default branch (you will usually use this for PRs)",
+      "You are(.*)released by xAI": "You are WorkBuddy"
     }
   }
 }
 ```
 
 - 省略 `identity` 时默认把已知 Harness 名称替换成 `WorkBuddy`，并补齐 `workspace root → workspace base`、`are paths the user → are paths that the user` 两条等义兼容替换。
-- Grok Build 和 Grok 只按 `identity.replacements` 的明确词条替换，不再自动识别 `You are <任意标签> released by xAI.`。模型选择及请求 `model` 保持原样。
-- 如需改写其他模型标签，请在 `identity.replacements` 中显式添加完整词条；网关不会按句式猜测身份。启动时补充缺失默认词条，热加载使用配置中的映射。真实上游接受情况尚未验证。
+- Grok Build 和其他模型标签均按 `identity.replacements` 中的配置处理；默认首位通配处理 `You are … released by xAI`，不由独立客户端识别代码猜测身份。模型选择及请求 `model` 保持原样。
+- 如需不同的改写结果，可修改完整词条或下述受限首位通配规则。启动时补充缺失默认词条，热加载使用配置中的映射。真实上游接受情况尚未验证。
 - `target` 可选 `Assistant` 或 `WorkBuddy`；想更接近官方文案可用 `WorkBuddy`。
 - `enabled:false` 关闭替换。
 - 需要逐词控制时加 `replacements`，例如：
@@ -254,6 +261,35 @@ workbuddy-gateway serve -webui -allow-price-probes
   {"identity":{"enabled":true,"target":"WorkBuddy","replacements":{"Codex":"WorkBuddy","DeepSeek Harness":"WorkBuddy"}}}
   ```
 - 只处理 system/developer/assistant 文本；user、tool、reasoning 和工具参数不改。官方版不经过网关，原文不会被改写。
+
+#### 配置文字替换与受限首位通配
+
+当前完整默认配置见 `config.example.json`，共 **15 条规则：14 条普通字面规则及 1 条受限首位通配**。旧 DSH 身份长句、GUI 的已知完整两句开头、Claude CLI 模板及 Main branch 模板都已成为可编辑的普通词条；匹配引擎不再识别特定客户端或写死这些句子。新用户首次启动生成全部规则；旧配置升级启动时补齐缺失项，已有自定义值、通配映射及关闭开关保留，不覆盖其他配置。
+
+普通词条仍区分大小写、按原文全局字面匹配，包括 system/assistant 正文及其中的代码示例；旧 DSH 专用的大小写忽略、偏移零检查和 GUI 代码区域判定不再作为特殊旁路存在。若只允许开头匹配，使用下面的显式通配规则。用户消息和工具数据始终不参与。
+
+本版默认生成并为升级用户自动补齐下面这一项。也可以在现有 `identity.replacements` 中调整它；不要用片段覆盖自己的完整配置或 Key：
+
+```json
+{
+  "You are(.*)released by xAI": "You are WorkBuddy"
+}
+```
+
+例如 `You are Gemini 2.5 Pro released by xAI. Keep tools.` 变为 `You are WorkBuddy. Keep tools.`。匹配后面的句号、换行、正文逐字保留。该规则不判断客户端来源或句子语义：本版默认启用后，任何允许角色中符合句式的文字都可能命中，包括某些正常任务说明。若要更精确地区分句号与域名后缀，可把固定后缀写成 `released by xAI.`，并相应在替换值中保留句号。
+
+安全边界：
+
+- 只有精确的 `(.*)` 具有通配含义，其余字符全部按字面处理，不支持完整正则、捕获引用或 `$1` 展开。
+- 一条键中最多一个 `(.*)`；前后固定文本必须各自包含非空白字符，键本身不能跨行。裸 `(.*)`、`(.*)后缀`、`前缀(.*)` 和多个通配符会被忽略并告警，不影响其他有效规则。
+- 只从每个标准文本块的第一个字符匹配，不自动跳过空白，也不搜索中间或第二行；前后缀区分大小写。
+- 动态部分不跨 CR/LF，最多 256 个 Unicode 字符；匹配第一个固定后缀即结束，不向后贪婪吞掉后续段落。显式前后缀覆盖整个短文本时仍会替换该段，这是规则本身要求的结果。
+- 按固定文本长度从长到短执行，同长度字面规则优先；每轮对一个文本块最多命中一条通配规则。普通词条仍可能继续处理前面规则产生的文本。
+- 保存配置后支持热加载；非法规则会记录数量与原因，不把规则或提示词正文写入普通日志。
+
+省略或清空 `replacements` 仍按原配置设计使用默认规则；若要完全不做文字替换，请用 `identity.enabled:false`。运行中删除词条会在热加载后移除该规则，但启动迁移仍会补回缺失的内置词条；要跨重启停用某条内置规则，可将它映射为自身（包括通配键，匹配到的原始文本会保留，不会插入字面的 `(.*)`），并检查其他较短词条是否也能命中同一文本。
+
+`systemPrompt.fallback/force` 仍是独立的显式配置功能；`developer → system`、缺少 system 时补保底、official 模式合并连续 system 等是协议结构兼容，不属于词条替换，也不会随 identity 开关关闭。
 
 > **实验功能风险自负：** `force` 后置于 system 末尾（紧贴用户消息），因此比客户端自带指令更"新近"，冲突时通常更有影响力——这正是人设类、风格类指令希望达到的效果，但也可能与客户端的 system 指令冲突、改变模型行为、增加 token 消耗，或触发上游内容/参数校验。需要回退时将 `force` 改回 `""` 并保存；建议先在测试会话验证，切勿在配置中写入密码、密钥或个人隐私。`config.json` 已被 Git 忽略，不要将真实配置提交到仓库。
 

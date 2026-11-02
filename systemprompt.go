@@ -53,6 +53,14 @@ func prepareSystemPromptForUpstream(obj map[string]any, r *http.Request, request
 	forced := strings.TrimSpace(force) != ""
 	kind := "未修改"
 	messages, _ := obj["messages"].([]any)
+	if injected && len(messages) > 0 {
+		applyIdentityReplacements(map[string]any{"messages": []any{messages[0]}}, r, requestID)
+	}
+	if forced {
+		forceMessage := map[string]any{"role": "system", "content": force}
+		applyIdentityReplacements(map[string]any{"messages": []any{forceMessage}}, r, requestID)
+		force, _ = forceMessage["content"].(string)
+	}
 	if forced && len(messages) > 0 {
 		if first, ok := messages[0].(map[string]any); ok {
 			old := first["content"]

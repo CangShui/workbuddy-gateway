@@ -1,5 +1,7 @@
 # DSH 历史回放与 GUI 环境说明兼容
 
+> **历史实现记录：** 下文描述早期 DSH 专用处理。自 v1.14.43 起，身份句和 GUI 完整开头均迁入 `identity.replacements`，不再有专用硬编码改写；普通词条统一按大小写敏感的字面替换执行，代码区域也遵循同一规则。当前配置与受限首位通配边界见[使用指南](user-guide.md#配置文字替换与受限首位通配)。
+
 关联 [Issue #24](https://github.com/CangShui/workbuddy-gateway/issues/24)
 和 [Issue #21](https://github.com/CangShui/workbuddy-gateway/issues/21)。
 

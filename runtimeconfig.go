@@ -203,8 +203,18 @@ func ensureIdentityDefaultReplacements(doc map[string]json.RawMessage) (bool, er
 		return false, nil
 	}
 	var identity map[string]json.RawMessage
-	if json.Unmarshal(doc[identityKey], &identity) != nil || identity == nil {
+	if json.Unmarshal(doc[identityKey], &identity) != nil {
 		return false, nil
+	}
+	if identity == nil {
+		// A legacy null section already used runtime defaults; persist the same
+		// effective defaults so the upgraded configuration is editable as well.
+		encoded, err := json.Marshal(defaultIdentityConfig())
+		if err != nil {
+			return false, err
+		}
+		doc[identityKey] = encoded
+		return true, nil
 	}
 	target := "WorkBuddy"
 	for key, raw := range identity {
@@ -237,6 +247,11 @@ func ensureIdentityDefaultReplacements(doc map[string]json.RawMessage) (bool, er
 		// A non-empty custom map disables runtime defaults, so merge every missing
 		// built-in rule while never overwriting an explicitly customized value.
 		defaults := defaultIdentityReplacements(target)
+		// Preserve the former configured DSH destination during migration,
+		// but persist it as an ordinary editable rule rather than a runtime special case.
+		if dshTarget := strings.TrimSpace(replacements["DeepSeek Harness"]); dshTarget != "" {
+			defaults[defaultDSHIdentityText] = "You are " + replacements["DeepSeek Harness"]
+		}
 		if replacements == nil {
 			replacements = make(map[string]string, len(defaults))
 		}
@@ -396,8 +411,13 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 // 不记录替换词正文，避免把旧配置中的私密文本写入普通日志。
 func logIdentityRuntimeConfig(trace string) {
 	enabled, target, rules := identitySettingsSummary()
-	log.Printf("[身份替换配置] traceId=%s 启用=%t 目标=%s 规则数=%d 说明=文本替换统一由 identity 控制；仅处理 system/developer/assistant 文本；热加载只影响后续请求",
-		trace, enabled, target, rules)
+	literal, wildcard, invalid := identityRuleDetails()
+	log.Printf("[身份替换配置] traceId=%s 启用=%t 目标=%s 规则数=%d 字面规则=%d 首位通配规则=%d 忽略非法规则=%d 说明=所有文字替换均按identity.replacements执行；仅处理system/developer/assistant文本；热加载只影响后续请求",
+		trace, enabled, target, rules, literal, wildcard, invalid)
+	if invalid > 0 {
+		log.Printf("[替换规则告警] traceId=%s 忽略条数=%d 原因=空键或非法通配边界 说明=通配仅支持一个(.*)，必须有非空首尾文本且不得跨行；其他有效规则仍生效，未记录规则正文",
+			trace, invalid)
+	}
 	if deprecatedPromptCompatibilityPresent.Load() {
 		log.Printf("[废弃配置] traceId=%s 字段=promptCompatibility 结果=已忽略 说明=重复替换模块已移除；请将需要保留的规则配置在 identity.replacements 中，确认后可删除旧字段；未记录旧规则正文",
 			trace)

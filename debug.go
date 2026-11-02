@@ -72,7 +72,7 @@ type runtimeFileConfig struct {
 		Fallback string `json:"fallback"`
 		Force    string `json:"force"`
 	} `json:"systemPrompt"`
-	// Identity 控制 system/developer/assistant 中的展示身份替换。
+	// Identity 控制 system/developer/assistant 中所有配置文字替换。
 	// 省略时使用内置 WorkBuddy 展示名及默认文本规则。
 	Identity runtimeIdentityConfig `json:"identity"`
 	// 仅接受 v1.14.40 曾写入的旧字段，避免升级时因未知字段无法启动。

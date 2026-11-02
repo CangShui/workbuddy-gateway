@@ -234,25 +234,26 @@ func TestRetiredCompatibilityWarningAndIdentityHotReload(t *testing.T) {
 	}
 }
 
-func TestGrokBuildUsesStaticRulesOnly(t *testing.T) {
+func TestGrokBuildConfiguredDefaultWildcard(t *testing.T) {
 	t.Cleanup(func() { setIdentityConfig(runtimeIdentityConfig{}) })
 	const original = "You are Gemini 2.5 Pro released by xAI. Keep the task instructions."
 	for _, tc := range []struct {
 		name, config, input, want string
 	}{
 		{"exact_grok_identity", `{}`, "You are Grok released by xAI. Keep rules.", "You are WorkBuddy. Keep rules."},
-		{"arbitrary_label_untouched", `{}`, original, original},
-		{"versioned_label_untouched", `{}`, "You are GPT-5.2 released by xAI. Keep tools.", "You are GPT-5.2 released by xAI. Keep tools."},
-		{"custom_target_does_not_generalize", `{"identity":{"target":"Assistant"}}`, original, original},
+		{"default_wildcard_label", `{}`, original, "You are WorkBuddy. Keep the task instructions."},
+		{"default_wildcard_version", `{}`, "You are GPT-5.2 released by xAI. Keep tools.", "You are WorkBuddy. Keep tools."},
+		{"default_wildcard_custom_target", `{"identity":{"target":"Assistant"}}`, original, "You are Assistant. Keep the task instructions."},
 		{"disabled", `{"identity":{"enabled":false}}`, original, original},
 		{"custom_rules_only", `{"identity":{"replacements":{"keep":"retain"}}}`, original, original},
 		{"custom_exact_grok_rule", `{"identity":{"replacements":{"Grok released by xAI":"Local Assistant"}}}`, "You are Grok released by xAI. Keep rules.", "You are Local Assistant. Keep rules."},
 		{"explicit_noop", `{"identity":{"replacements":{"Grok released by xAI":"Grok released by xAI"}}}`, "You are Grok released by xAI. Keep rules.", "You are Grok released by xAI. Keep rules."},
+		{"wildcard_noop", `{"identity":{"replacements":{"You are(.*)released by xAI":"You are(.*)released by xAI"}}}`, original, original},
 		{"exact_label_override", `{"identity":{"replacements":{"Grok released by xAI":"WorkBuddy","Gemini 2.5 Pro released by xAI":"Local Assistant"}}}`, original, "You are Local Assistant. Keep the task instructions."},
 		{"body_mention", `{}`, "Example: " + original, "Example: " + original},
-		{"later_sentence", `{}`, "You are helpful. A tool was released by xAI.", "You are helpful. A tool was released by xAI."},
+		{"literal_suffix_first_occurrence", `{}`, "You are helpful. A tool was released by xAI.", "You are WorkBuddy."},
 		{"later_line", `{}`, "You are helpful.\nGemini released by xAI.", "You are helpful.\nGemini released by xAI."},
-		{"domain_suffix", `{}`, "You are using tools released by xAI.example.", "You are using tools released by xAI.example."},
+		{"unmatched_tail_preserved", `{}`, "You are using tools released by xAI.example.", "You are WorkBuddy.example."},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, err := parseRuntimeConfig([]byte(tc.config))
@@ -271,14 +272,16 @@ func TestGrokBuildUsesStaticRulesOnly(t *testing.T) {
 	}
 }
 
-func TestArbitraryXAIReleaseSentenceIsNotIdentity(t *testing.T) {
+func TestNoImplicitXAIRewriteWithoutConfiguredWildcard(t *testing.T) {
 	isolatedGatewayConfig(t)
 	t.Cleanup(func() { setIdentityConfig(runtimeIdentityConfig{}) })
 	const original = "You are reviewing software released by xAI. Report compatibility issues."
 	for _, profile := range []string{"legacy", "official"} {
 		t.Run(profile, func(t *testing.T) {
 			setRequestProfile(profile)
-			setIdentityConfig(runtimeIdentityConfig{})
+			rules := defaultIdentityReplacements("WorkBuddy")
+			delete(rules, "You are(.*)released by xAI")
+			setIdentityConfig(runtimeIdentityConfig{Replacements: rules})
 			obj := map[string]any{
 				"model": "deepseek-v4.1-flash", "max_tokens": 16,
 				"messages": []any{map[string]any{"role": "system", "content": original}},
@@ -295,127 +298,137 @@ func TestArbitraryXAIReleaseSentenceIsNotIdentity(t *testing.T) {
 }
 
 func TestGrokBuildThroughHTTP(t *testing.T) {
-	const primary = "You are Grok released by xAI. Keep tools."
-	const protected = primary + " Grok Build."
-	for _, profile := range []string{"legacy", "official"} {
-		for _, route := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
-			for _, stream := range []bool{false, true} {
-				t.Run(fmt.Sprintf("%s/%s/stream=%t", profile, route, stream), func(t *testing.T) {
-					isolatePolicies(t)
-					resetStatsState(t)
-					withRequestProfile(t, profile)
-					withSystemPrompts(t, "", "")
-					setIdentityConfig(runtimeIdentityConfig{})
-					t.Cleanup(func() { setIdentityConfig(runtimeIdentityConfig{}) })
-					captured := make(chan map[string]any, 1)
-					upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						var reader io.Reader = r.Body
-						if r.Header.Get("Content-Encoding") == "gzip" {
-							compressed, err := gzip.NewReader(r.Body)
-							if err != nil {
+	disabled := false
+	for _, tc := range []struct {
+		name, input, want string
+		identity          runtimeIdentityConfig
+	}{
+		{name: "literal", input: "You are Grok released by xAI. Keep tools.", want: "You are WorkBuddy. Keep tools."},
+		{name: "explicit_wildcard", input: "You are Gemini 2.5 Pro released by xAI. Keep tools.", want: "You are WorkBuddy. Keep tools.", identity: runtimeIdentityConfig{Replacements: map[string]string{"You are(.*)released by xAI": "You are WorkBuddy"}}},
+		{name: "wildcard_disabled", input: "You are Grok released by xAI. Keep tools.", want: "You are Grok released by xAI. Keep tools.", identity: runtimeIdentityConfig{Enabled: &disabled, Replacements: map[string]string{"You are(.*)released by xAI": "You are WorkBuddy"}}},
+		{name: "wildcard_not_at_start", input: "Example: You are Gemini released by xAI. Keep tools.", want: "Example: You are Gemini released by xAI. Keep tools.", identity: runtimeIdentityConfig{Replacements: map[string]string{"You are(.*)released by xAI": "You are WorkBuddy"}}},
+	} {
+		primary, protected := tc.input, tc.input+" Grok Build."
+		for _, profile := range []string{"legacy", "official"} {
+			for _, route := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+				for _, stream := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/%s/%s/stream=%t", tc.name, profile, route, stream), func(t *testing.T) {
+						isolatePolicies(t)
+						resetStatsState(t)
+						withRequestProfile(t, profile)
+						withSystemPrompts(t, "", "")
+						setIdentityConfig(tc.identity)
+						t.Cleanup(func() { setIdentityConfig(runtimeIdentityConfig{}) })
+						captured := make(chan map[string]any, 1)
+						upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							var reader io.Reader = r.Body
+							if r.Header.Get("Content-Encoding") == "gzip" {
+								compressed, err := gzip.NewReader(r.Body)
+								if err != nil {
+									t.Error(err)
+									w.WriteHeader(http.StatusBadRequest)
+									return
+								}
+								defer compressed.Close()
+								reader = compressed
+							}
+							var request map[string]any
+							if err := json.NewDecoder(reader).Decode(&request); err != nil {
 								t.Error(err)
 								w.WriteHeader(http.StatusBadRequest)
 								return
 							}
-							defer compressed.Close()
-							reader = compressed
-						}
-						var request map[string]any
-						if err := json.NewDecoder(reader).Decode(&request); err != nil {
-							t.Error(err)
-							w.WriteHeader(http.StatusBadRequest)
-							return
-						}
-						captured <- request
-						w.Header().Set("Content-Type", "text/event-stream")
-						_, _ = io.WriteString(w, conversationFixtureSSE(false))
-					}))
-					defer upstream.Close()
-					oldBase, oldClient := profileCN.Base, cfg.HttpClient
-					profileCN.Base = upstream.URL
-					cfg.HttpClient = &http.Client{Timeout: 5 * time.Second}
-					t.Cleanup(func() { profileCN.Base, cfg.HttpClient = oldBase, oldClient })
-					accountMu.Lock()
-					accounts = []*Account{{Path: "synthetic-grok.json", Auth: &StoredAuth{
-						Edition: "cn", Auth: StoredTokens{AccessToken: "synthetic", ExpiresAt: time.Now().Add(time.Hour).Unix()},
-					}}}
-					accountMu.Unlock()
-					system := []any{
-						map[string]any{"type": "text", "text": "Keep rules."},
-						map[string]any{"type": "text", "text": primary},
-					}
-					conversation := []any{
-						msg("user", "Start task."),
-						map[string]any{"role": "assistant", "content": []any{
+							captured <- request
+							w.Header().Set("Content-Type", "text/event-stream")
+							_, _ = io.WriteString(w, conversationFixtureSSE(false))
+						}))
+						defer upstream.Close()
+						oldBase, oldClient := profileCN.Base, cfg.HttpClient
+						profileCN.Base = upstream.URL
+						cfg.HttpClient = &http.Client{Timeout: 5 * time.Second}
+						t.Cleanup(func() { profileCN.Base, cfg.HttpClient = oldBase, oldClient })
+						accountMu.Lock()
+						accounts = []*Account{{Path: "synthetic-grok.json", Auth: &StoredAuth{
+							Edition: "cn", Auth: StoredTokens{AccessToken: "synthetic", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+						}}}
+						accountMu.Unlock()
+						system := []any{
 							map[string]any{"type": "text", "text": "Keep rules."},
 							map[string]any{"type": "text", "text": primary},
-						}},
-						msg("user", protected),
-					}
-					body := map[string]any{"model": "gemini-test", "stream": stream, "max_tokens": 64}
-					switch route {
-					case "/v1/responses":
-						body["input"] = append([]any{map[string]any{"role": "developer", "content": system}}, conversation...)
-						body["store"] = false
-					case "/v1/messages":
-						assistant := conversation[1].(map[string]any)
-						assistant["content"] = append(assistant["content"].([]any), map[string]any{
-							"type": "tool_use", "id": "call_grok", "name": "echo", "input": map[string]any{"text": protected},
-						})
-						conversation[2] = map[string]any{"role": "user", "content": []any{
-							map[string]any{"type": "tool_result", "tool_use_id": "call_grok", "content": []any{map[string]any{"type": "text", "text": protected}}},
-							map[string]any{"type": "text", "text": protected},
-						}}
-						body["system"], body["messages"] = system, conversation
-					default:
-						body["messages"] = append([]any{map[string]any{"role": "system", "content": system}}, conversation...)
-					}
-					raw, err := json.Marshal(body)
-					if err != nil {
-						t.Fatal(err)
-					}
-					gateway := httptest.NewServer(newAPIHandler())
-					defer gateway.Close()
-					client := &http.Client{Timeout: 10 * time.Second}
-					response, err := client.Post(gateway.URL+route, "application/json", bytes.NewReader(raw))
-					if err != nil {
-						t.Fatal(err)
-					}
-					defer response.Body.Close()
-					responseBody, err := io.ReadAll(response.Body)
-					if err != nil || response.StatusCode != http.StatusOK {
-						t.Fatalf("gateway HTTP %d: %s error=%v", response.StatusCode, responseBody, err)
-					}
-					select {
-					case request := <-captured:
-						if request["model"] != body["model"] {
-							t.Fatalf("model changed: %v", request["model"])
 						}
-						messages := request["messages"].([]any)
-						for _, index := range []int{0, 2} {
-							text := dshTestText(messages[index].(map[string]any)["content"])
-							if strings.ReplaceAll(text, "\n", "") != "Keep rules.You are WorkBuddy. Keep tools." {
-								t.Fatalf("identity message %d=%q", index, text)
+						conversation := []any{
+							msg("user", "Start task."),
+							map[string]any{"role": "assistant", "content": []any{
+								map[string]any{"type": "text", "text": "Keep rules."},
+								map[string]any{"type": "text", "text": primary},
+							}},
+							msg("user", protected),
+						}
+						body := map[string]any{"model": "gemini-test", "stream": stream, "max_tokens": 64}
+						switch route {
+						case "/v1/responses":
+							body["input"] = append([]any{map[string]any{"role": "developer", "content": system}}, conversation...)
+							body["store"] = false
+						case "/v1/messages":
+							assistant := conversation[1].(map[string]any)
+							assistant["content"] = append(assistant["content"].([]any), map[string]any{
+								"type": "tool_use", "id": "call_grok", "name": "echo", "input": map[string]any{"text": protected},
+							})
+							conversation[2] = map[string]any{"role": "user", "content": []any{
+								map[string]any{"type": "tool_result", "tool_use_id": "call_grok", "content": []any{map[string]any{"type": "text", "text": protected}}},
+								map[string]any{"type": "text", "text": protected},
+							}}
+							body["system"], body["messages"] = system, conversation
+						default:
+							body["messages"] = append([]any{map[string]any{"role": "system", "content": system}}, conversation...)
+						}
+						raw, err := json.Marshal(body)
+						if err != nil {
+							t.Fatal(err)
+						}
+						gateway := httptest.NewServer(newAPIHandler())
+						defer gateway.Close()
+						client := &http.Client{Timeout: 10 * time.Second}
+						response, err := client.Post(gateway.URL+route, "application/json", bytes.NewReader(raw))
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer response.Body.Close()
+						responseBody, err := io.ReadAll(response.Body)
+						if err != nil || response.StatusCode != http.StatusOK {
+							t.Fatalf("gateway HTTP %d: %s error=%v", response.StatusCode, responseBody, err)
+						}
+						select {
+						case request := <-captured:
+							if request["model"] != body["model"] {
+								t.Fatalf("model changed: %v", request["model"])
 							}
-						}
-						if got := dshTestText(messages[len(messages)-1].(map[string]any)["content"]); got != protected {
-							t.Fatalf("user text changed: %q", got)
-						}
-						if route == "/v1/messages" {
-							tool := messages[3].(map[string]any)
-							if tool["role"] != "tool" || tool["tool_call_id"] != "call_grok" || tool["content"] != protected {
-								t.Fatalf("tool result changed: %v", tool)
+							messages := request["messages"].([]any)
+							for _, index := range []int{0, 2} {
+								text := dshTestText(messages[index].(map[string]any)["content"])
+								if strings.ReplaceAll(text, "\n", "") != "Keep rules."+tc.want {
+									t.Fatalf("identity message %d=%q", index, text)
+								}
 							}
-							call := messages[2].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
-							var args map[string]any
-							if err := json.Unmarshal([]byte(call["arguments"].(string)), &args); err != nil || !reflect.DeepEqual(args, map[string]any{"text": protected}) {
-								t.Fatalf("tool arguments changed: %v error=%v", args, err)
+							if got := dshTestText(messages[len(messages)-1].(map[string]any)["content"]); got != protected {
+								t.Fatalf("user text changed: %q", got)
 							}
+							if route == "/v1/messages" {
+								tool := messages[3].(map[string]any)
+								if tool["role"] != "tool" || tool["tool_call_id"] != "call_grok" || tool["content"] != protected {
+									t.Fatalf("tool result changed: %v", tool)
+								}
+								call := messages[2].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+								var args map[string]any
+								if err := json.Unmarshal([]byte(call["arguments"].(string)), &args); err != nil || !reflect.DeepEqual(args, map[string]any{"text": protected}) {
+									t.Fatalf("tool arguments changed: %v error=%v", args, err)
+								}
+							}
+						case <-time.After(2 * time.Second):
+							t.Fatal("no upstream HTTP request")
 						}
-					case <-time.After(2 * time.Second):
-						t.Fatal("no upstream HTTP request")
-					}
-				})
+					})
+				}
 			}
 		}
 	}

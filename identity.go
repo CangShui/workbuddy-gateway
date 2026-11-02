@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/json"
+	"log"
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // runtimeIdentityConfig controls text replacements applied when normalizing
@@ -18,34 +21,53 @@ type runtimeIdentityConfig struct {
 type identityReplacement struct {
 	Old string
 	New string
+	// Only the exact token (.*) has wildcard meaning. All other bytes are literal.
+	Wildcard bool
+	Prefix   string
+	Suffix   string
 }
 
 type identitySettings struct {
 	enabled      bool
-	prefix       string
+	target       string
 	replacements []identityReplacement
+	invalidRules int
 }
 
 var (
-	defaultIdentityTerms = []string{"Claude Code", "Claude", "DeepSeek Harness", "Codex", "ZCode", "Grok Build", "Grok", "Grok released by xAI"}
-	identityConfigMu     sync.RWMutex
-	currentIdentity      = defaultIdentitySettings()
+	identityConfigMu sync.RWMutex
+	currentIdentity  = defaultIdentitySettings()
 )
 
 const (
-	defaultWorkspaceRootPhrase = "workspace root"
-	defaultWorkspaceBasePhrase = "workspace base"
-	defaultUserPathsPhrase     = "are paths the user"
-	defaultUserPathsNeutral    = "are paths that the user"
+	identityWildcardToken    = "(.*)"
+	identityWildcardMaxRunes = 256
 )
 
+// Used only by one-time default completion to preserve the old configured target.
+// This key has no special meaning in the request matching engine.
+const defaultDSHIdentityText = "You are an AI agent powered by DeepSeek Harness"
+
 func defaultIdentityReplacements(target string) map[string]string {
-	replacements := make(map[string]string, len(defaultIdentityTerms)+2)
-	for _, term := range defaultIdentityTerms {
-		replacements[term] = target
+	// config.example.json is the single source of default phrase data. Do not
+	// maintain a second client-specific rule list in Go matching functions.
+	var template struct {
+		Identity struct {
+			Target       string            `json:"target"`
+			Replacements map[string]string `json:"replacements"`
+		} `json:"identity"`
 	}
-	replacements[defaultWorkspaceRootPhrase] = defaultWorkspaceBasePhrase
-	replacements[defaultUserPathsPhrase] = defaultUserPathsNeutral
+	replacements := make(map[string]string)
+	if err := json.Unmarshal(embeddedDefaultRuntimeConfig, &template); err != nil {
+		log.Printf("[默认替换规则] 结果=未启用默认规则 原因=内置配置模板解析失败 说明=不记录模板正文")
+		return replacements
+	}
+	for old, newValue := range template.Identity.Replacements {
+		if template.Identity.Target != "" && target != template.Identity.Target {
+			newValue = strings.ReplaceAll(newValue, template.Identity.Target, target)
+		}
+		replacements[old] = newValue
+	}
 	return replacements
 }
 
@@ -77,32 +99,62 @@ func buildIdentitySettings(c runtimeIdentityConfig) identitySettings {
 	if target == "" {
 		target = "WorkBuddy"
 	}
-	prefixTarget := target
-	replacements := make([]identityReplacement, 0, len(c.Replacements))
-	if len(c.Replacements) > 0 {
-		for old, newValue := range c.Replacements {
-			if strings.TrimSpace(old) == "" {
-				continue
-			}
-			replacements = append(replacements, identityReplacement{Old: old, New: newValue})
-		}
-		if replacement, ok := c.Replacements["DeepSeek Harness"]; ok && strings.TrimSpace(replacement) != "" {
-			prefixTarget = replacement
-		}
-	} else {
-		for old, newValue := range defaultIdentityReplacements(target) {
-			replacements = append(replacements, identityReplacement{Old: old, New: newValue})
-		}
+	configured := c.Replacements
+	if len(configured) == 0 {
+		configured = defaultIdentityReplacements(target)
 	}
-	// Longest first avoids splitting "Claude Code" into "Assistant Code".
-	sort.SliceStable(replacements, func(i, j int) bool {
-		if len(replacements[i].Old) != len(replacements[j].Old) {
-			return len(replacements[i].Old) > len(replacements[j].Old)
+	replacements := make([]identityReplacement, 0, len(configured))
+	invalid := 0
+	for old, newValue := range configured {
+		rule, ok := compileIdentityReplacement(old, newValue)
+		if !ok {
+			invalid++
+			continue
 		}
-		return replacements[i].Old < replacements[j].Old
+		replacements = append(replacements, rule)
+	}
+	// More fixed text first; exact literals win ties. Deterministic ordering
+	// also retains the existing longest-first behavior for literal rules.
+	sort.SliceStable(replacements, func(i, j int) bool {
+		a, b := replacements[i], replacements[j]
+		an, bn := len(a.Old), len(b.Old)
+		if a.Wildcard {
+			an -= len(identityWildcardToken)
+		}
+		if b.Wildcard {
+			bn -= len(identityWildcardToken)
+		}
+		if an != bn {
+			return an > bn
+		}
+		if a.Wildcard != b.Wildcard {
+			return !a.Wildcard
+		}
+		return a.Old < b.Old
 	})
 	return identitySettings{
-		enabled: enabled, prefix: "You are " + prefixTarget, replacements: replacements,
+		enabled: enabled, target: target, replacements: replacements, invalidRules: invalid,
+	}
+}
+
+func compileIdentityReplacement(old, newValue string) (identityReplacement, bool) {
+	rule := identityReplacement{Old: old, New: newValue}
+	if strings.TrimSpace(old) == "" {
+		return rule, false
+	}
+	switch strings.Count(old, identityWildcardToken) {
+	case 0:
+		return rule, true
+	case 1:
+		rule.Prefix, rule.Suffix, _ = strings.Cut(old, identityWildcardToken)
+		if strings.TrimSpace(rule.Prefix) == "" || strings.TrimSpace(rule.Suffix) == "" ||
+			strings.ContainsAny(old, "\r\n") {
+			return rule, false
+		}
+		rule.Wildcard = true
+		return rule, true
+	default:
+		return rule, false
 	}
 }
 
@@ -116,27 +168,92 @@ func identitySnapshot() identitySettings {
 
 func identitySettingsSummary() (bool, string, int) {
 	settings := identitySnapshot()
-	target := strings.TrimPrefix(settings.prefix, "You are ")
-	return settings.enabled, target, len(settings.replacements)
+	return settings.enabled, settings.target, len(settings.replacements)
+}
+
+func identityRuleDetails() (literal, wildcard, invalid int) {
+	settings := identitySnapshot()
+	for _, rule := range settings.replacements {
+		if rule.Wildcard {
+			wildcard++
+		} else {
+			literal++
+		}
+	}
+	return literal, wildcard, settings.invalidRules
+}
+
+// Limited anchored matching, not a regular expression. The first suffix wins,
+// the dynamic part cannot cross a line or exceed 256 Unicode characters, and
+// everything after the matched suffix is preserved byte for byte.
+func (rule identityReplacement) replace(text string) (string, int) {
+	if !rule.Wildcard {
+		count := strings.Count(text, rule.Old)
+		if count == 0 {
+			return text, 0
+		}
+		return strings.ReplaceAll(text, rule.Old, rule.New), count
+	}
+	if !strings.HasPrefix(text, rule.Prefix) {
+		return text, 0
+	}
+	remainder := text[len(rule.Prefix):]
+	limit := 4*identityWildcardMaxRunes + len(rule.Suffix)
+	if len(remainder) > limit {
+		remainder = remainder[:limit]
+	}
+	if newline := strings.IndexAny(remainder, "\r\n"); newline >= 0 {
+		remainder = remainder[:newline]
+	}
+	end := strings.Index(remainder, rule.Suffix)
+	if end < 0 || utf8.RuneCountInString(remainder[:end]) > identityWildcardMaxRunes {
+		return text, 0
+	}
+	if rule.New == rule.Old {
+		// Mapping an automatically completed default to itself disables that
+		// rule without reinserting the literal wildcard token into the prompt.
+		return text, 1
+	}
+	return rule.New + text[len(rule.Prefix)+end+len(rule.Suffix):], 1
+}
+
+func (settings identitySettings) normalize(text string, allowWildcard bool) (string, int, int) {
+	if !settings.enabled {
+		return text, 0, 0
+	}
+	literal, wildcard := 0, 0
+	if allowWildcard {
+		// Choose at most one wildcard against the ORIGINAL block. Never run it
+		// against a literal rule's output, where a later suffix could eat prose.
+		original := text
+		for _, rule := range settings.replacements {
+			if !rule.Wildcard {
+				if strings.HasPrefix(original, rule.Old) {
+					break // A more specific exact prefix, including a no-op, wins.
+				}
+				continue
+			}
+			if rewritten, n := rule.replace(original); n > 0 {
+				text, wildcard = rewritten, n
+				break
+			}
+		}
+	}
+	for _, rule := range settings.replacements {
+		if !rule.Wildcard {
+			var n int
+			text, n = rule.replace(text)
+			literal += n
+		}
+	}
+	return text, literal, wildcard
 }
 
 // normalizeAssistantIdentityText applies the configurable prefix and
 // display-name replacements. It is called only for system/developer/assistant
 // text; user/tool content is intentionally outside this function.
 func normalizeAssistantIdentityText(text string) (string, bool) {
-	settings := identitySnapshot()
-	if !settings.enabled {
-		return text, false
-	}
 	original := text
-	for _, prefix := range blockedSystemPromptPrefixes {
-		if len(text) >= len(prefix) && strings.EqualFold(text[:len(prefix)], prefix) {
-			text = settings.prefix + text[len(prefix):]
-			break
-		}
-	}
-	for _, replacement := range settings.replacements {
-		text = strings.ReplaceAll(text, replacement.Old, replacement.New)
-	}
+	text, _, _ = identitySnapshot().normalize(text, true)
 	return text, text != original
 }

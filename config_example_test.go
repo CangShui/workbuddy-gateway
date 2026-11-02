@@ -71,12 +71,8 @@ func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 	exampleSchema := runtimeFileConfig{}
 	exampleSchema.Models.Accounts = map[string]modelAccountFileConfig{"all": {}}
 	identityEnabled := true
-	exampleSchema.Identity = runtimeIdentityConfig{Enabled: &identityEnabled, Target: "WorkBuddy", Replacements: map[string]string{
-		"Claude Code": "WorkBuddy", "Claude": "WorkBuddy", "DeepSeek Harness": "WorkBuddy",
-		"Codex": "WorkBuddy", "ZCode": "WorkBuddy", "workspace root": "workspace base",
-		"Grok Build": "WorkBuddy", "Grok": "WorkBuddy", "Grok released by xAI": "WorkBuddy",
-		"are paths the user": "are paths that the user",
-	}}
+	exampleSchema.Identity = runtimeIdentityConfig{Enabled: &identityEnabled, Target: "WorkBuddy",
+		Replacements: defaultIdentityReplacements("WorkBuddy")}
 	schema, err := json.Marshal(exampleSchema)
 	if err != nil {
 		t.Fatal(err)

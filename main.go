@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.42"
+	version = "1.14.43"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -4088,47 +4088,6 @@ func applyThinkingRules(obj map[string]any, modelName string) {
 	}
 }
 
-func sanitizeMessages(obj map[string]any) int {
-	messages, ok := obj["messages"].([]any)
-	if !ok {
-		return 0
-	}
-	modified := 0
-	for _, m := range messages {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		// OpenAI 新版 developer 角色（GPT-5 系客户端/Codex）不被腾讯上游接受，
-		// 会返回 11128 "Illegal API invocation from an unapproved channel"，
-		// 统一归一化为 system（语义等价）。
-		if roleOfMessage(msg) == "developer" {
-			msg["role"] = "system"
-		}
-		switch c := msg["content"].(type) {
-		case string:
-			msg["content"] = sanitizeBlockedTemplates(c)
-		case []any:
-			for _, partAny := range c {
-				part, ok := partAny.(map[string]any)
-				if !ok {
-					continue
-				}
-				if t, ok := part["text"].(string); ok {
-					part["text"] = sanitizeBlockedTemplates(t)
-				}
-			}
-		}
-		if roleOfMessage(msg) == "system" {
-			if content, changed := sanitizeSystemMessageContent(msg["content"]); changed {
-				msg["content"] = content
-				modified++
-			}
-		}
-	}
-	return modified
-}
-
 // ensureLeadingSystemMessage 保证 messages 的首条消息符合腾讯上游的会话结构校验。
 //
 // 上游要求首条消息为 system prompt，否则返回 HTTP 400
@@ -4190,16 +4149,6 @@ func roleOfMessage(m any) string {
 	}
 	role, _ := msg["role"].(string)
 	return strings.ToLower(strings.TrimSpace(role))
-}
-
-func sanitizeBlockedTemplates(s string) string {
-	s = strings.ReplaceAll(s,
-		"You are Claude Code, Anthropic's official CLI for Claude.",
-		"You are Claude Code, Anthropic's official CLI tool for Claude.")
-	s = strings.ReplaceAll(s,
-		"Main branch (you will usually use this for PRs)",
-		"Default branch (you will usually use this for PRs)")
-	return s
 }
 
 // backendHeaders 设置 CodeBuddy 上游专用指纹与鉴权 Header（按站点 Profile 生成）

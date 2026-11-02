@@ -23,7 +23,12 @@
       "Grok": "WorkBuddy",
       "Grok released by xAI": "WorkBuddy",
       "workspace root": "workspace base",
-      "are paths the user": "are paths that the user"
+      "are paths the user": "are paths that the user",
+      "You are an AI agent powered by DeepSeek Harness": "You are WorkBuddy",
+      "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to \"this page\", \"this GUI\", or \"this app\" without naming another target, they mean this GUI.": "You are interacting with the user through a Web GUI whose URL the runtime context names. When the user refers to \"this page\", \"this GUI\", or \"this app\" without naming another target, they mean this GUI.",
+      "You are Claude Code, Anthropic's official CLI for Claude.": "You are Claude Code, Anthropic's official CLI tool for Claude.",
+      "Main branch (you will usually use this for PRs)": "Default branch (you will usually use this for PRs)",
+      "You are(.*)released by xAI": "You are WorkBuddy"
     }
   },
   "concurrent": {

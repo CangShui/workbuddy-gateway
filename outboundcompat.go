@@ -61,17 +61,14 @@ func prepareUpstreamChatRequest(obj map[string]any, r *http.Request, requestID u
 	profile := requestProfileFor(r)
 	trace := debugTraceID(r)
 	applyThinkingRules(obj, model)
-	if modified := sanitizeMessages(obj); modified > 0 {
-		logSystemPrefixSanitized(r, requestID, modified)
-	}
-	// 三个协议都可能在这里合并文本块。先在合并前处理每个块的开头，
-	// 再在 fallback/force 注入后补一次，避免后续块的前缀因拼接而丢失。
-	logDSHPromptCompatibility(r, requestID, obj)
+	normalizeDeveloperRoles(obj, r, requestID)
+	// 首位通配只在客户端原始块上执行一次，不跨协议合并后的文本块边界。
+	applyOriginalIdentityReplacements(obj, r, requestID)
 	if profile == requestProfileOfficial {
 		mergeLeadingInstructionMessages(obj, r, requestID)
 	}
 	prepareSystemPromptForUpstream(obj, r, requestID, trace)
-	logDSHPromptCompatibility(r, requestID, obj)
+	applyIdentityRulePass(obj, r, requestID, false)
 	ensureUpstreamMaxTokens(obj, r, requestID, trace, model)
 	if profile == requestProfileOfficial {
 		applyOfficialBodyDefaults(obj, r, requestID, model)
