@@ -138,8 +138,8 @@ func TestAggregateRateDetailsMatchesDisplayPriority(t *testing.T) {
 	if cn["hasLog"] != true {
 		t.Fatal("有记录时必须标记 hasLog")
 	}
-	if intlHy3 := rates["intl|hy3"]; intlHy3["source"] != "官方目录（实时接口）" || intlHy3["value"] != "0.50x" {
-		t.Fatalf("实测收费只作佐证，不应覆盖官方倍率: %+v", intlHy3)
+	if intlHy3 := rates["intl|hy3"]; intlHy3["source"] != "正常请求实测" || intlHy3["value"] != "实测收费" {
+		t.Fatalf("实际请求实测收费应覆盖缓存/官方结论: %+v", intlHy3)
 	}
 }
 
@@ -303,7 +303,7 @@ func TestAggregateRateDetailsDeduplicatesAndCapsOtherRecords(t *testing.T) {
 		Priority: ratePriorityLearnedPaid, UpdatedAt: now})
 	rates := aggregateRateDetails(records)
 	entry := rates["intl|hy4-preview"]
-	if entry["source"] != "价格探测（缓存结论）" {
+	if entry["source"] != "正常请求实测" {
 		t.Fatalf("取值优先级错误: %+v", entry)
 	}
 	others, ok := entry["others"].([]rateLogRecord)

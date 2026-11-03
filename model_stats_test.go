@@ -166,6 +166,57 @@ func TestMultiplierCellUsesFreeThenOfficial(t *testing.T) {
 	}
 }
 
+func TestModelRowPaidObservationOverridesCachedFreeProbe(t *testing.T) {
+	resetModelStats()
+	defer resetModelStats()
+	resetModelsStateT(t)
+	defer func() {
+		modelsMu.Lock()
+		modelProbes = map[string]modelPriceProbe{}
+		modelsMu.Unlock()
+	}()
+	modelsMu.Lock()
+	catalogModels = map[string][]catalogModel{
+		"intl": {{ID: "deepseek-v4.1-flash", Multiplier: 0, HasMultiplier: true, FromLive: true}},
+	}
+	modelProbes = map[string]modelPriceProbe{
+		probeKey("intl", "deepseek-v4.1-flash"): {Verdict: "free"},
+	}
+	modelsMu.Unlock()
+	defer resetModelsStateT(t)
+
+	accountMu.Lock()
+	oldAccounts := accounts
+	accounts = []*Account{{
+		Path: "workbuddy13.json",
+		Auth: &StoredAuth{Edition: "intl"},
+		ModelStates: map[string]*modelRuntimeState{
+			"deepseek-v4.1-flash": {CostClass: modelCostPaid, ObservedAt: time.Now()},
+		},
+	}}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+
+	rows := buildModelStatSnapshots(time.Now(), accounts)
+	var target *modelStatSnapshot
+	for i := range rows {
+		if rows[i].ID == "deepseek-v4.1-flash" {
+			target = &rows[i]
+			break
+		}
+	}
+	if target == nil {
+		t.Fatal("deepseek-v4.1-flash row not found")
+	}
+	if target.IntlMultiplier != "收费(倍率未知)" {
+		t.Fatalf("paid observation must not render as 0.00x, got %s", target.IntlMultiplier)
+	}
+}
+
 func TestModelTableHasEqualDisplayWidth(t *testing.T) {
 	resetModelStats()
 	recordModelRequest("glm-5.2")

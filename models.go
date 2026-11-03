@@ -45,6 +45,10 @@ const (
 	modelsMinCount    = 1
 	modelsMaxCount    = 500
 	modelsPath        = "/v2/enterprises/personal/models"
+	catalogV3Path     = "/v3/config"
+
+	catalogCNUserAgent   = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+	catalogINTLUserAgent = "WorkBuddy/5.8.3 WorkBuddy AI/5.8.3 CLI/2.63.2"
 
 	npmCatalogMaxBytes = 4 << 20
 	npmTarballMaxBytes = 80 << 20
@@ -188,7 +192,7 @@ type livePromotion struct {
 	Badge    struct {
 		Label string `json:"label"`
 	} `json:"badge"`
-	Discount struct {
+	Discount *struct {
 		Factor float64 `json:"factor"`
 	} `json:"discount"`
 	Schedule struct {
@@ -240,9 +244,86 @@ func fetchLiveCatalog(edition string) ([]catalogModel, int, error) {
 
 func fetchLiveCatalogByAuth(auth *StoredAuth) ([]catalogModel, int, error) {
 	prof := profileForEdition(auth.Edition)
+	type catalogSource struct {
+		path   string
+		models []catalogModel
+		promos int
+	}
+	var sources []catalogSource
+	var failures []string
+	for _, path := range []string{catalogV3Path, modelsPath} {
+		data, status, err := fetchCatalogJSON(auth, prof, path)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s HTTP %d: %v", path, status, err))
+			log.Printf("[Models] 目录源失败：站点=%s 路径=%s 原因=%v", prof.Key, path, err)
+			continue
+		}
+		models, promos, err := parseLiveCatalog(data)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", path, err))
+			log.Printf("[Models] 目录源解析失败：站点=%s 路径=%s 原因=%v", prof.Key, path, err)
+			continue
+		}
+		sources = append(sources, catalogSource{path: path, models: models, promos: promos})
+	}
+	if len(sources) == 0 {
+		return nil, 0, fmt.Errorf("实时模型目录全部失败：%s", strings.Join(failures, " | "))
+	}
+	merged := sources[0].models
+	active := sources[0].promos
+	for _, source := range sources[1:] {
+		merged = mergeCatalogs(merged, source.models)
+		if source.promos > active {
+			active = source.promos
+		}
+	}
+	return merged, active, nil
+}
+
+// fetchCatalogJSON 按目录端点补齐身份头。官方桌面端的真实目录 /v3/config
+// 对 User-Agent 和 X-IDE-* 有要求，企业窄表 /v2/enterprises/personal/models
+// 仍沿用原 CLI 头，避免改变既有兼容性。
+func fetchCatalogJSON(auth *StoredAuth, prof *upstreamProfile, path string) (json.RawMessage, int, error) {
 	headers := func(r *http.Request) {
 		commonHeaders(r, prof)
 		r.Header.Set("Authorization", "Bearer "+auth.Auth.AccessToken)
+		if path == catalogV3Path {
+			r.Header.Set("Accept", "application/json")
+			if prof.Key == "intl" {
+				r.Header.Set("User-Agent", catalogINTLUserAgent)
+			} else {
+				r.Header.Set("User-Agent", catalogCNUserAgent)
+			}
+			for name, value := range map[string]string{
+				"X-IDE-Type":          "WorkBuddy",
+				"X-IDE-Name":          "WorkBuddy",
+				"X-IDE-Version":       "5.8.3",
+				"X-Private-Data":      "true",
+				"X-Codebuddy-Request": "1",
+				"X-Agent-Intent":      "craft",
+				"X-Agent-Purpose":     "conversation",
+				"X-Agent-Type":        "main",
+				"X-Product":           "SaaS",
+			} {
+				r.Header.Set(name, value)
+			}
+			if auth.Account.UID != "" {
+				r.Header.Set("X-User-Id", auth.Account.UID)
+			} else {
+				r.Header.Set("X-No-User-Id", "1")
+			}
+			if auth.Account.EnterpriseID != "" && auth.Account.UID != "" {
+				r.Header.Set("X-Enterprise-Id", auth.Account.EnterpriseID)
+			} else {
+				r.Header.Set("X-No-Enterprise-Id", "1")
+			}
+			if auth.Auth.Domain != "" {
+				r.Header.Set("X-Domain", auth.Auth.Domain)
+			} else {
+				r.Header.Set("X-No-Department-Info", "1")
+			}
+			return
+		}
 		r.Header.Set("X-Client-ID", prof.ClientID)
 		r.Header.Set("X-Client-Version", prof.ClientVer)
 		r.Header.Set("X-Product", prof.Product)
@@ -256,11 +337,8 @@ func fetchLiveCatalogByAuth(auth *StoredAuth) ([]catalogModel, int, error) {
 			r.Header.Set("X-Domain", auth.Auth.Domain)
 		}
 	}
-	data, status, err := doJSON(cfg.HttpClient, http.MethodGet, prof.Base+modelsPath, headers, nil)
-	if err != nil {
-		return nil, 0, fmt.Errorf("HTTP %d: %w", status, err)
-	}
-	return parseLiveCatalog(data)
+	endpoint := strings.TrimRight(strings.TrimSpace(prof.Base), "/") + path
+	return doJSON(cfg.HttpClient, http.MethodGet, endpoint, headers, nil)
 }
 
 func promoActive(p livePromotion, now time.Time) bool {
@@ -299,6 +377,11 @@ func parseLiveCatalog(data []byte) ([]catalogModel, int, error) {
 	hits := map[string]hit{}
 	active := 0
 	for _, p := range doc.ModelPromotions {
+		// /v3/config 里还有只用于展示的“夜间折扣”徽章，可能没有 discount 数值；
+		// 这类促销不能当作 factor=0 的限免，否则会把官方基础倍率错误改成 0.00x。
+		if p.Discount == nil {
+			continue
+		}
 		on := promoActive(p, now)
 		if on {
 			active++
@@ -781,18 +864,29 @@ func collectModelIDs(includeDisabled bool) ([]string, string) {
 	ids := make([]string, 0, 64)
 	for _, site := range catalogSites {
 		for _, m := range catalogs[site] {
-			if seen[m.ID] {
+			displayID := catalogDisplayModelID(site, m.ID)
+			if seen[displayID] {
 				continue
 			}
 			// 被配置禁用的模型不出现在任何模型列表（/v1/models、monitor 统计表、health 计数）。
-			if disabled, _ := modelDisabled(m.ID); disabled && !includeDisabled {
+			if disabled, _ := modelDisabled(displayID); disabled && !includeDisabled {
 				continue
 			}
-			seen[m.ID] = true
-			ids = append(ids, m.ID)
+			seen[displayID] = true
+			ids = append(ids, displayID)
 		}
 	}
 	return ids, source
+}
+
+// catalogDisplayModelID maps international catalog variants back to the client model name.
+// Official /v3/config returns deepseek-v4.1-flash-sg, while clients send deepseek-v4.1-flash.
+func catalogDisplayModelID(site, modelID string) string {
+	id := normalizeModelName(modelID)
+	if site == "intl" && strings.HasSuffix(id, "-sg") {
+		return strings.TrimSuffix(id, "-sg")
+	}
+	return id
 }
 
 func modelEntry(site, modelID string) (catalogModel, bool) {
@@ -802,6 +896,13 @@ func modelEntry(site, modelID string) (catalogModel, bool) {
 	for _, m := range catalogModels[site] {
 		if m.ID == modelID {
 			return m, true
+		}
+	}
+	if site == "intl" && !strings.HasSuffix(modelID, "-sg") {
+		for _, m := range catalogModels[site] {
+			if m.ID == modelID+"-sg" {
+				return m, true
+			}
 		}
 	}
 	return catalogModel{}, false
@@ -958,6 +1059,15 @@ func modelDisplayMultiplier(site, modelID, freeLabel string) string {
 	if freeLabel == "是" {
 		return "0.00x"
 	}
+	// 实际请求已经学到过收费时，不能被缓存的价格探测“免费”结论覆盖；
+	// 否则会出现模型已被标记为收费、列表仍显示 0.00x 的矛盾。
+	if freeLabel == "否" || freeLabel == "混合" {
+		entry, ok := modelEntry(site, modelID)
+		if ok && entry.HasMultiplier && entry.Multiplier > 0 && !entry.PromoExpired {
+			return fmt.Sprintf("%.2fx", entry.Multiplier)
+		}
+		return "收费(倍率未知)"
+	}
 	switch modelProbeVerdict(site, modelID) {
 	case "free":
 		return "0.00x"
@@ -1083,6 +1193,7 @@ func refreshModelsOnce(schedule ...time.Time) {
 	prev, prevSource := catalogSnapshot()
 	fetched := map[string][]catalogModel{}
 	var failures []string
+	usedCache := false
 
 	for _, site := range catalogSites {
 		var live, npm []catalogModel
@@ -1116,6 +1227,7 @@ func refreshModelsOnce(schedule ...time.Time) {
 		default:
 			if cached, ok := prev[site]; ok && len(cached) > 0 {
 				fetched[site] = cached
+				usedCache = true
 				log.Printf("[Models] 站点=%s 两路来源均失败，沿用缓存（模型数=%d）", site, len(cached))
 			} else {
 				log.Printf("[Models] 站点=%s 两路来源均失败且无缓存，该站点本次不展示模型", site)
@@ -1151,15 +1263,8 @@ func refreshModelsOnce(schedule ...time.Time) {
 		return
 	}
 
-	allCached := true
-	for site := range fetched {
-		if _, ok := prev[site]; !ok || len(prev[site]) == 0 {
-			allCached = false
-		}
-	}
-
 	source := time.Now().Format("2006-01-02 15:04")
-	if allCached && prevSource != "" {
+	if usedCache && prevSource != "" {
 		source = prevSource
 	}
 

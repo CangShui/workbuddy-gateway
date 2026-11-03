@@ -105,7 +105,7 @@ func TestParseLiveCatalogRejectsEmpty(t *testing.T) {
 func TestFetchLiveCatalogFromServer(t *testing.T) {
 	chdirTemp(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != modelsPath {
+		if r.URL.Path != modelsPath && r.URL.Path != catalogV3Path {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
 		if r.Header.Get("Authorization") != "Bearer tok" {
@@ -247,7 +247,10 @@ func TestModelDisplayMultiplierWithProbeVerdict(t *testing.T) {
 	resetModelStats()
 	modelsMu.Lock()
 	catalogModels = map[string][]catalogModel{
-		"cn": {{ID: "x", Multiplier: 0.29, HasMultiplier: true, FromLive: true}},
+		"cn": {
+			{ID: "x", Multiplier: 0.29, HasMultiplier: true, FromLive: true},
+			{ID: "z", Multiplier: 0, HasMultiplier: true, FromLive: true},
+		},
 	}
 	modelProbes = map[string]modelPriceProbe{}
 	modelsMu.Unlock()
@@ -260,6 +263,12 @@ func TestModelDisplayMultiplierWithProbeVerdict(t *testing.T) {
 	if got := modelDisplayMultiplier("cn", "x", "-"); got != "0.29x" {
 		t.Fatalf("live price expected, got %s", got)
 	}
+	if got := modelDisplayMultiplier("cn", "x", "否"); got != "0.29x" {
+		t.Fatalf("learned paid should keep official multiplier, got %s", got)
+	}
+	if got := modelDisplayMultiplier("cn", "x", "混合"); got != "0.29x" {
+		t.Fatalf("mixed free/paid should keep official multiplier, got %s", got)
+	}
 	modelsMu.Lock()
 	modelProbes[probeKey("cn", "x")] = modelPriceProbe{Verdict: "paid"}
 	modelsMu.Unlock()
@@ -271,6 +280,12 @@ func TestModelDisplayMultiplierWithProbeVerdict(t *testing.T) {
 	modelsMu.Unlock()
 	if got := modelDisplayMultiplier("cn", "x", "-"); got != "0.00x" {
 		t.Fatalf("probed free should show 0.00x, got %s", got)
+	}
+	modelsMu.Lock()
+	modelProbes[probeKey("cn", "z")] = modelPriceProbe{Verdict: "free"}
+	modelsMu.Unlock()
+	if got := modelDisplayMultiplier("cn", "z", "否"); got != "收费(倍率未知)" {
+		t.Fatalf("learned paid must override cached free probe, got %s", got)
 	}
 }
 

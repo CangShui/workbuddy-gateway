@@ -143,23 +143,6 @@ func handleWebSearch(w http.ResponseWriter, r *http.Request) {
 	// 客户端若带了 X-Conversation-ID，会在这里被登记并复用。
 	prepareConversationContext(r, nil)
 
-	acc := webSearchAccount()
-	if acc == nil {
-		log.Printf("[联网搜索] traceId=%s 阶段=选择账号 结果=失败 原因=没有可用凭据", traceID)
-		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "没有可用的登录凭据，请先登录账号")
-		return
-	}
-	if err := ensureValidTokenFor(acc); err != nil {
-		log.Printf("[联网搜索] traceId=%s 阶段=凭据续期 结果=失败 原因=%s", traceID, safeDebugError(err))
-		writeOpenAIError(w, http.StatusBadGateway, "token_refresh_failed", "账号凭据续期失败")
-		return
-	}
-	auth, prof := webSearchAccountSnapshot(acc)
-	if auth == nil || prof == nil {
-		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "没有可用的登录凭据，请先登录账号")
-		return
-	}
-
 	payload, err := json.Marshal(workbuddyWebSearchRequest{
 		Query: req.Query, Type: "text2text", MaxResults: req.Count,
 	})
@@ -168,11 +151,16 @@ func handleWebSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	started := time.Now()
-	obj, callErr := requestWebSearch(r, payload, auth, prof, prof.agentToolBase())
-	if callErr == nil {
-		log.Printf("[联网搜索] traceId=%s 阶段=完成 账号=%s 结果=成功 耗时=%v", traceID, baseNameOf(acc), time.Since(started))
+	obj, acc, callErr := executeWebTool(traceID, "联网搜索", func(acc *Account, auth *StoredAuth, prof *upstreamProfile) (map[string]any, *webSearchSearchError) {
+		return requestWebSearch(r, payload, auth, prof, prof.agentToolBase())
+	})
+	if obj != nil && callErr == nil {
 		writeWebSearchSuccess(w, obj)
+		return
+	}
+	if callErr == nil {
+		log.Printf("[联网搜索] traceId=%s 阶段=选择账号 结果=失败 原因=没有可用凭据", traceID)
+		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "没有可用的登录凭据，请先登录账号")
 		return
 	}
 	status, errType, message := classifyWebSearchFailure(callErr.status, callErr)
@@ -226,22 +214,6 @@ func handleWebFetch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	prepareConversationContext(r, nil)
-	acc := webSearchAccount()
-	if acc == nil {
-		log.Printf("[网页抓取] traceId=%s 阶段=选择账号 结果=失败 原因=没有可用凭据", traceID)
-		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "没有可用的登录凭据，请先登录账号")
-		return
-	}
-	if err := ensureValidTokenFor(acc); err != nil {
-		log.Printf("[网页抓取] traceId=%s 阶段=凭据续期 结果=失败 原因=%s", traceID, safeDebugError(err))
-		writeOpenAIError(w, http.StatusBadGateway, "token_refresh_failed", "账号凭据续期失败")
-		return
-	}
-	auth, prof := webSearchAccountSnapshot(acc)
-	if auth == nil || prof == nil {
-		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "没有可用的登录凭据，请先登录账号")
-		return
-	}
 
 	payload, err := json.Marshal(map[string]any{
 		"url":        req.URL,
@@ -255,11 +227,16 @@ func handleWebFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	started := time.Now()
-	obj, callErr := requestWebFetch(r, payload, auth, prof, prof.agentToolBase())
-	if callErr == nil {
-		log.Printf("[网页抓取] traceId=%s 阶段=完成 账号=%s 结果=成功 耗时=%v", traceID, baseNameOf(acc), time.Since(started))
+	obj, acc, callErr := executeWebTool(traceID, "网页抓取", func(acc *Account, auth *StoredAuth, prof *upstreamProfile) (map[string]any, *webSearchSearchError) {
+		return requestWebFetch(r, payload, auth, prof, prof.agentToolBase())
+	})
+	if obj != nil && callErr == nil {
 		writeWebFetchSuccess(w, traceID, obj)
+		return
+	}
+	if callErr == nil {
+		log.Printf("[网页抓取] traceId=%s 阶段=选择账号 结果=失败 原因=没有可用凭据", traceID)
+		writeOpenAIError(w, http.StatusUnauthorized, "no_auth", "没有可用的登录凭据，请先登录账号")
 		return
 	}
 	status, errType, message := classifyWebSearchFailure(callErr.status, callErr)
@@ -283,7 +260,14 @@ func writeWebFetchSuccess(w http.ResponseWriter, traceID string, obj map[string]
 }
 
 func requestWebFetch(r *http.Request, payload []byte, auth *StoredAuth, prof *upstreamProfile, base string) (map[string]any, *webSearchSearchError) {
-	return postAgentTool(r, payload, auth, prof, base, webFetchAPIPath, webFetchUpstreamTimeout)
+	obj, callErr := postAgentTool(r, payload, auth, prof, base, webFetchAPIPath, webFetchUpstreamTimeout)
+	if callErr != nil {
+		return nil, callErr
+	}
+	if obj == nil {
+		return nil, newWebSearchError(http.StatusBadGateway, "上游返回空响应")
+	}
+	return obj, nil
 }
 
 // applyAgentToolHeaders 为国内站 /agenttool/* 补齐官方桌面身份头。
@@ -415,17 +399,97 @@ func normalizeWebSearchRequest(req *webSearchRequest) error {
 	return nil
 }
 
-func webSearchAccount() *Account {
+// nextWebSearchAccount 按常规账号池的轮询顺序取下一个可用于搜索/抓取的账号。
+// 搜索/抓取不经过模型路由，但同样使用 accounts 里的凭据和上游额度，因此复用
+// rrIndex 轮询，避免所有请求固定压到第一个账号。attempted 用于单次请求内的重试去重。
+func nextWebSearchAccount(attempted map[*Account]bool) *Account {
 	accountMu.Lock()
 	defer accountMu.Unlock()
+	if len(accounts) == 0 {
+		return nil
+	}
 	now := time.Now()
-	for _, acc := range accounts {
-		if acc == nil || acc.Disabled || acc.Auth == nil || strings.TrimSpace(acc.Auth.Auth.AccessToken) == "" || acc.CooldownUntil.After(now) {
+	for i := 0; i < len(accounts); i++ {
+		idx := (rrIndex + i) % len(accounts)
+		acc := accounts[idx]
+		if acc == nil || acc.Disabled || acc.Auth == nil || acc.CooldownUntil.After(now) {
 			continue
 		}
+		if attempted != nil && attempted[acc] {
+			continue
+		}
+		rrIndex = (idx + 1) % len(accounts)
 		return acc
 	}
 	return nil
+}
+
+func webSearchPoolSize() int {
+	accountMu.Lock()
+	defer accountMu.Unlock()
+	return len(accounts)
+}
+
+type webToolCall func(acc *Account, auth *StoredAuth, prof *upstreamProfile) (map[string]any, *webSearchSearchError)
+
+// executeWebTool 复用常规账号池的轮询与故障处理执行一次搜索/抓取。
+// 429 标记账号冷却后继续下一个账号；401 禁用账号后继续；403 只换账号不误禁用；
+// 其他错误保持原样返回，避免把请求参数错误当成账号故障反复重试。
+func executeWebTool(traceID, label string, call webToolCall) (map[string]any, *Account, *webSearchSearchError) {
+	poolSize := webSearchPoolSize()
+	if poolSize == 0 {
+		return nil, nil, nil
+	}
+	attempted := make(map[*Account]bool, poolSize)
+	var lastErr *webSearchSearchError
+	for attempt := 0; attempt < poolSize; attempt++ {
+		acc := nextWebSearchAccount(attempted)
+		if acc == nil {
+			break
+		}
+		attempted[acc] = true
+		if err := ensureValidTokenFor(acc); err != nil {
+			log.Printf("[%s] traceId=%s 阶段=凭据续期 账号=%s 结果=失败 原因=%s 业务影响=切换下一个账号", label, traceID, baseNameOf(acc), safeDebugError(err))
+			lastErr = newWebSearchError(http.StatusBadGateway, "账号凭据续期失败")
+			continue
+		}
+		auth, prof := webSearchAccountSnapshot(acc)
+		if auth == nil || prof == nil {
+			lastErr = newWebSearchError(http.StatusUnauthorized, "没有可用的登录凭据")
+			continue
+		}
+		started := time.Now()
+		obj, callErr := call(acc, auth, prof)
+		if callErr == nil {
+			log.Printf("[%s] traceId=%s 阶段=完成 账号=%s 结果=成功 耗时=%v", label, traceID, baseNameOf(acc), time.Since(started))
+			return obj, acc, nil
+		}
+		lastErr = callErr
+		switch {
+		case callErr.status == http.StatusTooManyRequests:
+			until, ok := parseResetTime(callErr.Error())
+			if !ok {
+				until = time.Now().Add(time.Minute)
+			}
+			markCooldown(acc, until, safeDebugError(callErr))
+			log.Printf("[%s] traceId=%s 阶段=上游调用 账号=%s 状态码=429 结果=冷却并切换 原因=%s", label, traceID, baseNameOf(acc), safeDebugError(callErr))
+			continue
+		case callErr.status == http.StatusUnauthorized:
+			disableAccount(acc, fmt.Sprintf("搜索接口鉴权失败 (HTTP %d): %s", callErr.status, safeDebugError(callErr)))
+			log.Printf("[%s] traceId=%s 阶段=上游调用 账号=%s 状态码=401 结果=禁用并切换 原因=%s", label, traceID, baseNameOf(acc), safeDebugError(callErr))
+			continue
+		case callErr.status == http.StatusForbidden:
+			log.Printf("[%s] traceId=%s 阶段=上游调用 账号=%s 状态码=403 结果=切换下一个账号 原因=%s", label, traceID, baseNameOf(acc), safeDebugError(callErr))
+			continue
+		case callErr.status == 0 || (callErr.status >= 500 && callErr.status < 600):
+			log.Printf("[%s] traceId=%s 阶段=上游调用 账号=%s 状态码=%d 结果=临时故障并切换 原因=%s", label, traceID, baseNameOf(acc), callErr.status, safeDebugError(callErr))
+			continue
+		default:
+			log.Printf("[%s] traceId=%s 阶段=上游调用 账号=%s 状态码=%d 结果=失败 原因=%s", label, traceID, baseNameOf(acc), callErr.status, safeDebugError(callErr))
+			return nil, acc, callErr
+		}
+	}
+	return nil, nil, lastErr
 }
 
 // webSearchAccountSnapshot 在锁内取一份凭据与站点参数的拷贝，避免并发调度期间读到半截状态。

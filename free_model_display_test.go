@@ -34,7 +34,10 @@ func TestFreeModelDisplaySnapshotKeepsMeasuredLedgerAndScheduling(t *testing.T) 
 	modelsMu.Lock()
 	oldCatalog, oldSource, oldProbes := catalogModels, dynamicSource, modelProbes
 	catalogModels = map[string][]catalogModel{
-		"cn":   {{ID: "catalog-free", HasMultiplier: true, Multiplier: 0}},
+		"cn": {
+			{ID: "catalog-free", HasMultiplier: true, Multiplier: 0},
+			{ID: "free-only", HasMultiplier: true, Multiplier: 0},
+		},
 		"intl": {{ID: "catalog-free", HasMultiplier: true, Multiplier: 0.5}},
 	}
 	dynamicSource = "display-test"
@@ -106,7 +109,7 @@ func TestFreeModelDisplaySnapshotKeepsMeasuredLedgerAndScheduling(t *testing.T) 
 		t.Fatal("display count changed scheduling eligibility")
 	}
 	// 全局禁用模型后，它从模型统计表消失，展示数量也应同步变化。
-	setModelFilter([]string{"catalog-free"}, nil)
+	setModelFilter([]string{"catalog-free", "free-only"}, nil)
 	writeStatusSnapshot()
 	raw, err = os.ReadFile(statusSnapshotFile)
 	if err != nil {

@@ -6,11 +6,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 func withWebSearchUpstream(t *testing.T, acc *Account, handler http.Handler) {
+	withWebSearchUpstreamAccounts(t, []*Account{acc}, handler)
+}
+
+func withWebSearchUpstreamAccounts(t *testing.T, accs []*Account, handler http.Handler) {
 	t.Helper()
 	chdirTemp(t)
 	server := httptest.NewServer(handler)
@@ -18,7 +23,7 @@ func withWebSearchUpstream(t *testing.T, acc *Account, handler http.Handler) {
 	oldClient := cfg.HttpClient
 	accountMu.Lock()
 	oldAccounts, oldRR := accounts, rrIndex
-	accounts, rrIndex = []*Account{acc}, 0
+	accounts, rrIndex = accs, 0
 	accountMu.Unlock()
 	profileCN.Base, profileCN.Origin = server.URL, server.URL
 	cfg.HttpClient = server.Client()
@@ -97,5 +102,112 @@ func TestHandleWebFetchReturnsDSHFormat(t *testing.T) {
 	}
 	if response["content"] != "# Go\n\nLanguage" || len(response) != 1 {
 		t.Fatalf("DSH fetch response=%v", response)
+	}
+}
+
+func TestHandleWebSearchFailsOverAfter429(t *testing.T) {
+	a := webSearchTestAccount()
+	a.Path = "workbuddy-a.json"
+	a.Auth.Auth.AccessToken = "token-a"
+	b := webSearchTestAccount()
+	b.Path = "workbuddy-b.json"
+	b.Auth.Auth.AccessToken = "token-b"
+
+	var mu sync.Mutex
+	var hits []string
+	withWebSearchUpstreamAccounts(t, []*Account{a, b}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits = append(hits, r.Header.Get("Authorization"))
+		mu.Unlock()
+		if r.Header.Get("Authorization") == "Bearer token-a" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":6004,"msg":"rate limited"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"results":[{"title":"Go","url":"https://go.dev","snippet":"Language"}]}`))
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/search", strings.NewReader(`{"query":"golang","count":8}`))
+	rec := httptest.NewRecorder()
+	handleWebSearch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	attempts := append([]string(nil), hits...)
+	mu.Unlock()
+	if len(attempts) != 2 || attempts[0] != "Bearer token-a" || attempts[1] != "Bearer token-b" {
+		t.Fatalf("account attempts=%v", attempts)
+	}
+	if !a.CooldownUntil.After(time.Now()) {
+		t.Fatalf("429 account was not cooled down: %v", a.CooldownUntil)
+	}
+}
+
+func TestHandleWebSearchRotatesAccountsAcrossRequests(t *testing.T) {
+	a := webSearchTestAccount()
+	a.Path = "workbuddy-a.json"
+	a.Auth.Auth.AccessToken = "token-a"
+	b := webSearchTestAccount()
+	b.Path = "workbuddy-b.json"
+	b.Auth.Auth.AccessToken = "token-b"
+
+	var mu sync.Mutex
+	var hits []string
+	withWebSearchUpstreamAccounts(t, []*Account{a, b}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits = append(hits, r.Header.Get("Authorization"))
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/search", strings.NewReader(`{"query":"golang","count":5}`))
+		rec := httptest.NewRecorder()
+		handleWebSearch(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("call %d status=%d body=%s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	mu.Lock()
+	attempts := append([]string(nil), hits...)
+	mu.Unlock()
+	if len(attempts) != 2 || attempts[0] != "Bearer token-a" || attempts[1] != "Bearer token-b" {
+		t.Fatalf("round-robin attempts=%v", attempts)
+	}
+}
+
+func TestHandleWebSearchFailsOverAfterUpstreamTimeout(t *testing.T) {
+	a := webSearchTestAccount()
+	a.Path = "workbuddy-a.json"
+	a.Auth.Auth.AccessToken = "token-a"
+	b := webSearchTestAccount()
+	b.Path = "workbuddy-b.json"
+	b.Auth.Auth.AccessToken = "token-b"
+
+	var mu sync.Mutex
+	var hits []string
+	withWebSearchUpstreamAccounts(t, []*Account{a, b}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits = append(hits, r.Header.Get("Authorization"))
+		mu.Unlock()
+		if r.Header.Get("Authorization") == "Bearer token-a" {
+			w.WriteHeader(524)
+			return
+		}
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/search", strings.NewReader(`{"query":"golang","count":8}`))
+	rec := httptest.NewRecorder()
+	handleWebSearch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	attempts := append([]string(nil), hits...)
+	mu.Unlock()
+	if len(attempts) != 2 || attempts[0] != "Bearer token-a" || attempts[1] != "Bearer token-b" {
+		t.Fatalf("timeout failover attempts=%v", attempts)
 	}
 }

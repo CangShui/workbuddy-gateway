@@ -302,12 +302,12 @@ type rateLogRecord struct {
 // 优先级与 modelDisplayMultiplier 的取值顺序一致，保证「感叹号」解释的是控制台真正显示的那个值。
 const (
 	ratePriorityLearnedFree = 1
+	ratePriorityLearnedPaid = 1
 	ratePriorityProbeFree   = 2
 	ratePriorityProbePaid   = 3
 	ratePriorityPromoStale  = 4
 	ratePriorityOfficial    = 6
-	// 正常请求实测「收费」不参与取值（页面仍展示官方倍率），仅作为佐证列出。
-	ratePriorityLearnedPaid = 7
+	// 正常请求实测的免费/收费结论都优先于缓存探测；二者同级时按更新时间取较新的一条。
 )
 
 var (
@@ -420,7 +420,7 @@ func parseRateLine(line, file string) (rateLogRecord, bool) {
 			record.Explain = "正常客户端请求返回 credit=0，判定免费"
 		} else {
 			record.Value, record.Priority = "实测收费", ratePriorityLearnedPaid
-			record.Explain = "正常客户端请求实测收费，仅作佐证，不改变上方官方倍率"
+			record.Explain = "正常客户端请求实测收费，优先于缓存探测结论"
 		}
 		return record, true
 	}
