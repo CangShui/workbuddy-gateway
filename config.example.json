@@ -13,6 +13,7 @@
   "identity": {
     "enabled": true,
     "target": "WorkBuddy",
+    "responseRestore": false,
     "replacements": {
       "Claude Code": "WorkBuddy",
       "Claude": "WorkBuddy",
