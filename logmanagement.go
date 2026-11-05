@@ -99,7 +99,7 @@ func (w *dailyLogWriter) Close() error {
 	return w.file.Close()
 }
 
-var managedLogPattern = regexp.MustCompile(`^(gateway-\d{4}-\d{2}-\d{2}\.log|debug-\d{4}-\d{2}-\d{2}\.jsonl|deployment-\d{4}-\d{2}-\d{2}\.jsonl|frontend-\d{4}-\d{2}-\d{2}\.log)$`)
+var managedLogPattern = regexp.MustCompile(`^(gateway-\d{4}-\d{2}-\d{2}\.log|debug-\d{4}-\d{2}-\d{2}\.jsonl|deployment-\d{4}-\d{2}-\d{2}\.jsonl|frontend-\d{4}-\d{2}-\d{2}\.log|redact-\d{4}-\d{2}-\d{2}\.jsonl)$`)
 var logDatePattern = regexp.MustCompile(`\d{4}-\d{2}-\d{2}`)
 
 type logCleanupResult struct {

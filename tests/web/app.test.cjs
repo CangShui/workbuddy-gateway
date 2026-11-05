@@ -77,6 +77,7 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map(),
     , renderStats, loadStats, changeStatsFilter, loadLogs, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
     , openAddAccount, startAddAccount, pollAddAccount, closeAddAccount, accountRowActions
     , initStatsFilter, writeStatsFilterCookie, readStatsFilterCookie, bindStatsChartHover
+    , renderRedact, loadRedact, saveRedact, previewRedact, loadRedactRecords, openRedactDetail, toggleRedactReveal, closeRedactDetail, clearRedactRecords
   };})();`);
   vm.createContext(context);
   vm.runInContext(source, context);
@@ -290,7 +291,11 @@ test("页面移除统计落盘徽标和摘要卡四分之一圆装饰，选项�
   assert(!page.includes('id="statsStorage"'));
   assert(!/\.usage-metric::after\s*\{/.test(css), "摘要卡的圆形装饰必须删除");
   assert(/\.tabs\s*\{[\s\S]*width:\s*min\(83\.3333vw,\s*3200px\)/.test(css));
-  assert(/\.tabs\s*\{[\s\S]*grid-template-columns:\s*repeat\(7,\s*minmax\(0,\s*1fr\)\)/.test(css));
+  const tabCount = (page.match(/<button class="tab[" ]/g) || []).length;
+  assert.equal(tabCount, 8, "总览、账号池、模型列表、脱敏、日志、配置、定时任务、访问设置");
+  assert(new RegExp("\\.tabs\\s*\\{[\\s\\S]*grid-template-columns:\\s*repeat\\(" + tabCount + ",\\s*minmax\\(0,\\s*1fr\\)\\)").test(css),
+    "选项卡列数必须与按钮数一致");
+  assert(!new RegExp("repeat\\((?!" + tabCount + ",)\\d+,\\s*minmax\\(0,\\s*1fr\\)\\)").test(css.slice(css.indexOf(".tabs"), css.indexOf(".tab {"))));
   assert(/\.health-layout\s*\{[^}]*height:\s*196px/.test(css));
   assert(/\.account-alert\s*\{[^}]*padding:\s*3px 10px/.test(css));
   audit("布局精简与自适应通过", {stats_badge_removed: true, quarter_circle_removed: true, tabs_5_of_6_capped_4k: true});
@@ -1831,4 +1836,81 @@ test("告警条目排成一行且不再有日志跳转；统计范围可按站�
   assert(meta.includes('target="_blank"'), "必须在新标签页打开");
   assert(meta.includes('rel="noreferrer"'), "必须带 rel=noreferrer");
   audit("告警行重排与站点筛选通过", {jump_removed: true, site_scope: true, chip_link: true});
+});
+
+test("脱敏页：标签页显示设置、汇总与记录，详情按需显示原值，退出后清空", async () => {
+  const calls = [];
+  const settings = {secrets: true, personal: true, words: ["SyntheticWordA"], active: true, stats: {requests: 1, values: 3}};
+  const records = {days: 7, more: false, records: [
+    {id: "1001", at: 1791980005000, endpoint: "/v1/messages", model: "glm-5", account: "workbuddy-a.json", values: 3,
+      attempts: 2, restored: 1, failed: false, hasText: true,
+      hits: [{kind: "API_KEY", placeholder: "{{API_KEY_abcdefgh}}", head: "sk-", len: 40, count: 2},
+        {kind: "EMAIL", placeholder: "{{EMAIL_ijklmnop}}", head: "z", len: 26, count: 1}]}],
+    summary: {requests: 1, values: 3, restored: 1, failed: 0, retried: 1, kinds: {API_KEY: 2, EMAIL: 1}, models: {"glm-5": 1},
+      topValues: [{kind: "API_KEY", placeholder: "{{API_KEY_abcdefgh}}", head: "sk-", len: 40, count: 2, requests: 1}]}};
+  const detail = Object.assign({}, records.records[0], {valuesInMemory: 2, traceId: "t1", requestId: 7,
+    segments: [{where: "messages[0].content (user)", text: "key {{API_KEY_abcdefgh}} mail {{EMAIL_ijklmnop}}"}]});
+  const f = fixture(async (url, options) => {
+    calls.push({url, options});
+    if (url === "/admin/api/redact") return response(200, settings);
+    if (url.indexOf("/admin/api/redact-records?") === 0) return response(200, records);
+    if (url.indexOf("/admin/api/redact-record?") === 0) return response(200, detail);
+    if (url === "/admin/api/redact-reveal") return response(200, {values: {"{{API_KEY_abcdefgh}}": "sk-<b>synthetic</b>"}});
+    if (url === "/admin/api/redact-records-clear") return response(200, {cleared: true});
+    return response(200, {});
+  });
+  f.review.state.apiKey = "synthetic-admin";
+  f.element("redactDays").value = "7";
+  f.review.setTab("redact");
+  await new Promise(r => setImmediate(r));
+  await new Promise(r => setImmediate(r));
+  assert.equal(f.review.state.activeTab, "redact");
+  assert.equal(f.element("redactState").textContent, "已开启");
+  assert.equal(f.element("redactWords").value, "SyntheticWordA");
+  assert(calls.some(c => c.url === "/admin/api/redact-records?days=7&limit=50"), "进入标签页必须读取记录");
+  assert(f.element("redactSummary").innerHTML.includes("脱敏请求"), "必须显示汇总卡片");
+  const rows = f.element("redactRecordsTable").innerHTML;
+  assert(rows.includes("glm-5") && rows.includes("API Key ×2") && rows.includes("已脱敏发送"), "记录行必须显示模型、类型与状态");
+  assert(!rows.includes("sk-<b>"), "列表不得出现原值");
+  assert(f.element("redactKindFilter").innerHTML.includes('value="API_KEY"'), "类型筛选来自汇总");
+  assert(f.element("redactTopTable").innerHTML.includes("sk-…（40 字符）"), "最常脱敏的值只显示提示");
+
+  await f.review.openRedactDetail("1001");
+  assert(!f.element("redactDetailCard").classList.contains("hidden"));
+  assert(f.element("redactSegments").innerHTML.includes("<mark>{{API_KEY_abcdefgh}}</mark>"), "上游内容高亮占位符");
+  assert(f.element("redactHitsTable").innerHTML.includes("已隐藏"), "默认不显示原值");
+  assert(!calls.some(c => c.url === "/admin/api/redact-reveal"), "未点击前不得请求原值");
+
+  await f.review.toggleRedactReveal();
+  const reveal = calls.find(c => c.url === "/admin/api/redact-reveal");
+  assert.deepEqual(JSON.parse(reveal.options.body), {id: "1001"});
+  const shown = f.element("redactSegments").innerHTML;
+  assert(shown.includes('<mark class="value" title="{{API_KEY_abcdefgh}}">sk-&lt;b&gt;synthetic&lt;/b&gt;</mark>'), "原值必须转义后显示");
+  assert(shown.includes("<mark>{{EMAIL_ijklmnop}}</mark>"), "内存中没有的原值保持占位符");
+  await f.review.toggleRedactReveal();
+  assert(!f.element("redactSegments").innerHTML.includes("synthetic"), "再次点击隐藏原值");
+
+  f.element("redactSecrets").checked = false;
+  f.element("redactPersonal").checked = true;
+  f.element("redactWords").value = " SyntheticWordC \n\nSyntheticWordD";
+  await f.review.saveRedact();
+  const save = calls.find(c => c.url === "/admin/api/redact" && c.options.method === "POST");
+  assert.deepEqual(JSON.parse(save.options.body), {secrets: false, personal: true, words: ["SyntheticWordC", "SyntheticWordD"]});
+  const posts = calls.filter(c => c.url === "/admin/api/redact" && c.options.method === "POST").length;
+  f.element("redactWords").value = "x";
+  await f.review.saveRedact();
+  assert.equal(calls.filter(c => c.url === "/admin/api/redact" && c.options.method === "POST").length, posts, "过短词条不提交");
+
+  await f.review.clearRedactRecords();
+  assert(calls.some(c => c.url === "/admin/api/redact-records-clear" && c.options.body === "{}"), "清空记录必须提交空对象");
+  assert(f.element("redactDetailCard").classList.contains("hidden"), "清空后关闭详情");
+
+  await f.review.openRedactDetail("1001");
+  await f.review.toggleRedactReveal();
+  f.review.lockDashboard();
+  assert.equal(f.review.state.redactRevealed, null, "退出后丢弃已显示的原值");
+  assert(f.element("redactDetailCard").classList.contains("hidden"));
+  assert.equal(f.element("redactSegments").innerHTML, "");
+  assert.equal(f.element("redactWords").value, "");
+  audit("脱敏页通过", {tab: true, records: true, reveal_on_demand: true, lock_reset: true});
 });

@@ -52,7 +52,16 @@
     addAccountPoll: 0,
     addAccountDeadline: 0,
     statsAccount: "",
-    statsDatesTouched: false
+    statsDatesTouched: false,
+    redactDirty: false,
+    redactSettings: null,
+    lastRedact: null,
+    redactVersion: 0,
+    redactDetailVersion: 0,
+    redactSelected: "",
+    redactDetail: null,
+    redactRevealed: null,
+    redactLimit: 50
   };
 
   function $(id) { return document.getElementById(id); }
@@ -206,6 +215,7 @@
 
   function lockDashboard() {
     resetConfigEditor();
+    resetRedactPage();
     state.tasksLastPoll = 0;
     $("tabs").classList.add("hidden");
     $("dashboard").classList.add("hidden");
@@ -1978,6 +1988,8 @@
       pending = api("/admin/api/models?range=5h").then(function (data) {
         if (!state.togglePending && policyVersion === state.policyVersion) renderModels(data);
       }).catch(onErr);
+    } else if (state.activeTab === "redact") {
+      pending = loadRedactRecords();
     } else if (state.activeTab === "logs") {
       pending = loadLogs(false);
     } else if (state.activeTab === "tasks") {
@@ -2004,6 +2016,7 @@
     if (name === "logs") { loadLogs(true); loadLogSettings(); }
     else if (name === "config") loadConfig();
     else if (name === "settings") loadSettings();
+    else if (name === "redact") { state.redactDirty = false; loadRedact(); refreshActive(); }
     else refreshActive();
   }
 
@@ -2129,6 +2142,284 @@
     }).catch(function () {});
   }
 
+  // ---- 「脱敏」页：设置与脱敏记录（参照 magpie 观测 › 脱敏） --------------------
+  var REDACT_KIND_LABELS = {API_KEY: "API Key", TOKEN: "Token", SECRET: "密钥字段", PASSWORD: "密码", PRIVATE_KEY: "私钥",
+    EMAIL: "邮箱", PHONE: "手机号", ID_CARD: "身份证号", BANK_CARD: "银行卡号", TERM: "自定义词", FAILED: "脱敏失败"};
+  var REDACT_SECRET_KINDS = {API_KEY: true, TOKEN: true, SECRET: true, PASSWORD: true, PRIVATE_KEY: true};
+  var REDACT_PLACEHOLDER = /\{\{[A-Z][A-Z0-9_]*_[a-z2-7]{8}\}\}/g;
+
+  function redactKindLabel(k) { return REDACT_KIND_LABELS[k] || k; }
+
+  function redactKindChip(k, n) {
+    return '<span class="redact-kind' + (REDACT_SECRET_KINDS[k] ? " secret" : "") + '">' + esc(redactKindLabel(k)) +
+      (n > 1 ? " ×" + n : "") + "</span>";
+  }
+
+  function redactKindsText(kinds) {
+    var parts = Object.keys(kinds || {}).sort().map(function (k) { return redactKindLabel(k) + " " + kinds[k]; });
+    return parts.length ? "（" + parts.join("、") + "）" : "";
+  }
+
+  function redactHintText(h) {
+    return (h.head ? h.head + "…" : "") + "（" + h.len + " 字符）";
+  }
+
+  function redactOptions(list, selected, allLabel) {
+    if (selected && list.indexOf(selected) === -1) list = list.concat([selected]);
+    return '<option value="">' + esc(allLabel) + "</option>" + list.map(function (v) {
+      return '<option value="' + esc(v) + '"' + (v === selected ? " selected" : "") + ">" + esc(redactKindLabel(v)) + "</option>";
+    }).join("");
+  }
+
+  function renderRedact(data) {
+    state.redactSettings = data;
+    var on = !!data.active;
+    $("redactState").textContent = on ? "已开启" : "未开启";
+    $("redactState").className = "badge" + (on ? " ok" : "");
+    $("redactSecrets").checked = !!data.secrets;
+    $("redactPersonal").checked = !!data.personal;
+    if (!state.redactDirty) $("redactWords").value = (data.words || []).join("\n");
+    $("redactStatus").textContent = on ? "已开启：后续模型请求发往上游前在本机脱敏，回复中的占位符自动还原。"
+      : "未开启：请求原样发往上游。开启后才会产生脱敏记录。";
+  }
+
+  function loadRedact() {
+    return api("/admin/api/redact", {quiet: true}).then(renderRedact).catch(function () {});
+  }
+
+  function redactQuery() {
+    var q = "days=" + encodeURIComponent($("redactDays").value || "7") + "&limit=" + state.redactLimit;
+    if ($("redactKindFilter").value) q += "&kind=" + encodeURIComponent($("redactKindFilter").value);
+    if ($("redactModelFilter").value) q += "&model=" + encodeURIComponent($("redactModelFilter").value);
+    return "/admin/api/redact-records?" + q;
+  }
+
+  function loadRedactRecords() {
+    var version = ++state.redactVersion;
+    return api(redactQuery(), {quiet: true}).then(function (data) {
+      if (version === state.redactVersion) renderRedactRecords(data);
+    }).catch(function () {});
+  }
+
+  function renderRedactRecords(data) {
+    state.lastRedact = data;
+    var s = data.summary || {}, kinds = s.kinds || {}, models = s.models || {};
+    var kindNames = Object.keys(kinds).sort(function (a, b) { return kinds[b] - kinds[a]; });
+    var modelNames = Object.keys(models).sort(function (a, b) { return models[b] - models[a]; });
+    var topModel = modelNames.length ? modelNames[0] + " · " + models[modelNames[0]] + " 次" : "暂无";
+    setHTMLIfChanged($("redactSummary"),
+      statsCard("脱敏请求", statsNumber(s.requests || 0), "失败未发送 " + (s.failed || 0) + " · 换账号重试 " + (s.retried || 0), "neutral") +
+      statsCard("替换处数", statsNumber(s.values || 0), s.requests ? "平均每请求 " + ((s.values || 0) / s.requests).toFixed(1) + " 处" : "上游没有看到任何原值", "token") +
+      statsCard("回复还原", statsNumber(s.restored || 0), "回复中占位符换回原值的次数", "credit") +
+      statsCard("涉及模型", statsNumber(modelNames.length), topModel, "first"));
+    var range = {1: "今天", 7: "近 7 天", 30: "近 30 天"}[data.days] || ("近 " + data.days + " 天");
+    $("redactRangeText").textContent = range;
+    var max = kindNames.length ? kinds[kindNames[0]] : 0;
+    setHTMLIfChanged($("redactKinds"), kindNames.length ? kindNames.map(function (k) {
+      return '<div class="redact-bar"><span>' + redactKindChip(k, 1) + '</span><span class="redact-bar-track"><i data-pct="' +
+        Math.max(2, Math.round(kinds[k] * 100 / max)) + '"></i></span><span class="redact-bar-count">' + statsNumber(kinds[k]) + "</span></div>";
+    }).join("") : '<p class="stats-empty">' + esc(range) + "没有脱敏记录</p>");
+    // CSP 禁止内联 style 属性；与健康度进度条一样由脚本设置宽度。
+    Array.prototype.forEach.call($("redactKinds").querySelectorAll("[data-pct]"), function (bar) {
+      bar.style.width = bar.getAttribute("data-pct") + "%";
+    });
+    setHTMLIfChanged($("redactKindFilter"), redactOptions(kindNames.concat(s.failed ? ["FAILED"] : []), $("redactKindFilter").value, "全部类型"));
+    setHTMLIfChanged($("redactModelFilter"), redactOptions(modelNames, $("redactModelFilter").value, "全部模型"));
+    var top = s.topValues || [];
+    updateTableBody($("redactTopTable").querySelector("tbody"), top.length ? top.map(function (v) {
+      return '<tr data-row-key="' + esc(v.placeholder) + '"><td>' + redactKindChip(v.kind, 1) + "</td><td>" + esc(redactHintText(v)) +
+        '</td><td class="redact-ph">' + esc(v.placeholder) + "</td><td>" + statsNumber(v.count) + "</td><td>" + statsNumber(v.requests) + "</td></tr>";
+    }).join("") : '<tr><td colspan="5" class="empty">暂无记录</td></tr>');
+    var records = data.records || [];
+    updateTableBody($("redactRecordsTable").querySelector("tbody"), records.length ? records.map(function (r) {
+      var counts = {};
+      (r.hits || []).forEach(function (h) { counts[h.kind] = (counts[h.kind] || 0) + h.count; });
+      var chips = Object.keys(counts).sort().map(function (k) { return redactKindChip(k, counts[k]); }).join("");
+      return '<tr data-row-key="' + esc(r.id) + '"' + (r.id === state.redactSelected ? ' class="selected"' : "") + ">" +
+        "<td>" + esc(fmtTime(Math.floor(r.at / 1000))) + '</td><td class="mono">' + esc(r.endpoint || "-") + "</td><td>" + esc(r.model || "-") +
+        '</td><td class="mono">' + esc(r.account || "-") + "</td><td>" + statsNumber(r.values) + '</td><td class="kinds">' + (chips || "-") +
+        "</td><td>" + statsNumber(r.restored) + "</td><td>" + statsNumber(r.attempts) + "</td><td>" +
+        (r.failed ? '<span class="badge danger">失败未发送</span>' : '<span class="badge ok">已脱敏发送</span>') +
+        '</td><td><button class="ghost" type="button" data-redact-id="' + esc(r.id) + '">详情</button></td></tr>';
+    }).join("") : '<tr><td colspan="10" class="empty">' + (state.redactSettings && !state.redactSettings.active ?
+      "脱敏未开启：在下方“脱敏设置”中开启后，脱敏过的请求会出现在这里" : esc(range) + "没有符合条件的脱敏记录") + "</td></tr>");
+    $("redactRecordsInfo").textContent = records.length ? "显示 " + records.length + " 条，最新在前；点击一行查看详情" : "";
+    $("redactMore").classList.toggle("hidden", !data.more);
+  }
+
+  function openRedactDetail(id) {
+    state.redactSelected = id;
+    state.redactRevealed = null;
+    state.redactDetail = null;
+    $("redactDetailCard").classList.remove("hidden");
+    $("redactDetailTitle").textContent = "记录详情 · 加载中…";
+    if (state.lastRedact) renderRedactRecords(state.lastRedact);
+    var version = ++state.redactDetailVersion;
+    return api("/admin/api/redact-record?id=" + encodeURIComponent(id)).then(function (data) {
+      if (version !== state.redactDetailVersion) return;
+      state.redactDetail = data;
+      renderRedactDetail();
+      if ($("redactDetailCard").scrollIntoView) $("redactDetailCard").scrollIntoView({block: "nearest"});
+    }).catch(function () {
+      if (version === state.redactDetailVersion) $("redactDetailTitle").textContent = "记录详情 · 读取失败";
+    });
+  }
+
+  function redactMarkText(text, values) {
+    return esc(text).replace(REDACT_PLACEHOLDER, function (p) {
+      if (values && Object.prototype.hasOwnProperty.call(values, p)) {
+        return '<mark class="value" title="' + esc(p) + '">' + esc(values[p]) + "</mark>";
+      }
+      return "<mark>" + p + "</mark>";
+    });
+  }
+
+  function renderRedactDetail() {
+    var d = state.redactDetail;
+    if (!d) return;
+    var values = state.redactRevealed;
+    $("redactDetailTitle").textContent = "记录详情 · " + fmtTime(Math.floor(d.at / 1000));
+    $("redactDetailMeta").textContent = "接口 " + (d.endpoint || "-") + " · 模型 " + (d.model || "-") + " · 账号 " + (d.account || "-") +
+      " · 替换 " + d.values + " 处 · 回复还原 " + d.restored + " 次 · 尝试 " + d.attempts + " 次" +
+      (d.traceId ? " · traceId " + d.traceId : "") + (d.requestId ? " · requestId " + d.requestId : "");
+    var reveal = $("redactReveal");
+    reveal.disabled = !d.valuesInMemory;
+    reveal.textContent = values ? "隐藏原值" : (d.valuesInMemory ? "显示原值" : "原值已不在内存");
+    var hits = d.hits || [];
+    updateTableBody($("redactHitsTable").querySelector("tbody"), hits.length ? hits.map(function (h) {
+      var original = values ? (Object.prototype.hasOwnProperty.call(values, h.placeholder) ? '<span class="mono">' + esc(values[h.placeholder]) + "</span>" : "已不在内存")
+        : (d.valuesInMemory ? "已隐藏" : "已不在内存");
+      return '<tr data-row-key="' + esc(h.placeholder) + '"><td>' + redactKindChip(h.kind, 1) + '</td><td class="redact-ph">' + esc(h.placeholder) +
+        "</td><td>" + esc(redactHintText(h)) + "</td><td>" + original + "</td><td>" + statsNumber(h.count) + "</td></tr>";
+    }).join("") : '<tr><td colspan="5" class="empty">' + (d.failed ? "请求体无法解析，脱敏失败，未发送上游" : "无") + "</td></tr>");
+    var segments = d.segments || [];
+    $("redactSegments").innerHTML = segments.length ? segments.map(function (seg) {
+      return '<div class="redact-segment"><div class="redact-segment-where">' + esc(seg.where) + "</div><pre>" +
+        redactMarkText(seg.text, values) + "</pre></div>";
+    }).join("") : '<p class="redact-gone">' + (d.failed ? "脱敏失败的请求不会发往上游。" :
+      "这条请求的文字只保存在网关内存中，网关重启后（或超出最近 300 条）已不可查看；记录仍保留每个值的类型、长度和开头字符。") + "</p>";
+  }
+
+  function toggleRedactReveal() {
+    var d = state.redactDetail;
+    if (!d) return Promise.resolve();
+    if (state.redactRevealed) {
+      state.redactRevealed = null;
+      renderRedactDetail();
+      return Promise.resolve();
+    }
+    $("redactReveal").disabled = true;
+    return api("/admin/api/redact-reveal", {method: "POST", body: {id: d.id}}).then(function (data) {
+      if (state.redactDetail === d) {
+        state.redactRevealed = data.values || {};
+        renderRedactDetail();
+      }
+    }).catch(function () {}).then(function () { if (state.redactDetail === d) $("redactReveal").disabled = !d.valuesInMemory; });
+  }
+
+  function closeRedactDetail() {
+    state.redactSelected = "";
+    state.redactDetail = null;
+    state.redactRevealed = null;
+    state.redactDetailVersion++;
+    $("redactDetailCard").classList.add("hidden");
+    $("redactSegments").innerHTML = "";
+    if (state.lastRedact) renderRedactRecords(state.lastRedact);
+  }
+
+  function clearRedactRecords() {
+    if (!window.confirm("清空全部脱敏记录？\n\n会删除内存中的记录和 logs/redact-*.jsonl，不可撤销。脱敏设置不变，之后的请求会重新记录。")) {
+      return Promise.resolve();
+    }
+    $("redactClear").disabled = true;
+    return api("/admin/api/redact-records-clear", {method: "POST", body: {}}).then(function () {
+      closeRedactDetail();
+      showAlert("脱敏记录已清空；脱敏设置未改变。", true);
+      return loadRedactRecords();
+    }).catch(function () {}).then(function () { $("redactClear").disabled = false; });
+  }
+
+  function setRedactBusy(busy) {
+    ["redactSecrets", "redactPersonal", "redactWords", "redactSave", "redactTryBtn"].forEach(function (id) { $(id).disabled = busy; });
+  }
+
+  function saveRedact() {
+    var words = $("redactWords").value.split(/\r?\n/).map(function (w) { return w.trim(); })
+      .filter(function (w) { return w !== ""; });
+    var short = words.filter(function (w) { return Array.from(w).length < 2; });
+    if (short.length) {
+      $("redactStatus").textContent = "自定义词每项至少 2 个字符：" + short.join("、");
+      return Promise.resolve();
+    }
+    setRedactBusy(true);
+    return api("/admin/api/redact", {method: "POST", body: {secrets: $("redactSecrets").checked,
+      personal: $("redactPersonal").checked, words: words}}).then(function (data) {
+      state.redactDirty = false;
+      renderRedact(data);
+      showAlert(data.active ? "请求脱敏已开启：已写入 config.json，后续模型请求立即生效。" :
+        "请求脱敏已关闭：已写入 config.json，后续请求原样发往上游。", true);
+      loadRedactRecords();
+    }).catch(function (err) {
+      if (err && err.detail) $("redactStatus").textContent = "保存失败：" + err.detail + "；输入已保留。";
+    }).then(function () { setRedactBusy(false); });
+  }
+
+  function previewRedact() {
+    var text = $("redactTryInput").value;
+    if (!text) { $("redactTryOutput").textContent = ""; return Promise.resolve(); }
+    setRedactBusy(true);
+    return api("/admin/api/redact-preview", {method: "POST", body: {text: text}}).then(function (data) {
+      var counts = {};
+      (data.hits || []).forEach(function (h) { counts[h.kind] = (counts[h.kind] || 0) + 1; });
+      var note = data.hits.length ? "命中 " + data.hits.length + " 处" + redactKindsText(counts) : "未发现需要脱敏的内容";
+      if (data.off) note += "；当前未开启，按“密钥与凭据 + 个人信息”预览";
+      $("redactTryOutput").textContent = data.masked + "\n\n— " + note;
+    }).catch(function () {}).then(function () { setRedactBusy(false); });
+  }
+
+  function resetRedactPage() {
+    state.redactDirty = false;
+    state.redactVersion++;
+    state.redactDetailVersion++;
+    state.redactSelected = "";
+    state.redactDetail = null;
+    state.redactRevealed = null;
+    state.lastRedact = null;
+    state.redactSettings = null;
+    state.redactLimit = 50;
+    $("redactDetailCard").classList.add("hidden");
+    ["redactWords", "redactTryInput"].forEach(function (id) { $(id).value = ""; });
+    ["redactTryOutput", "redactStatus", "redactRecordsInfo", "redactDetailMeta"].forEach(function (id) { $(id).textContent = ""; });
+    ["redactSummary", "redactKinds", "redactSegments"].forEach(function (id) { $(id).innerHTML = ""; $(id)._sourceHTML = ""; });
+    ["redactRecordsTable", "redactTopTable", "redactHitsTable"].forEach(function (id) {
+      var body = $(id).querySelector("tbody");
+      body.innerHTML = "";
+      body._tableSourceHTML = "";
+    });
+    $("redactState").textContent = "未开启";
+    $("redactState").className = "badge";
+  }
+
+  function initRedactPage() {
+    ["redactDays", "redactKindFilter", "redactModelFilter"].forEach(function (id) {
+      $(id).addEventListener("change", function () { state.redactLimit = 50; loadRedactRecords(); });
+    });
+    $("redactMore").addEventListener("click", function () {
+      state.redactLimit = Math.min(200, state.redactLimit + 50);
+      loadRedactRecords();
+    });
+    $("redactRecordsTable").addEventListener("click", function (e) {
+      var row = e.target && e.target.closest ? e.target.closest("tr[data-row-key]") : null;
+      if (row) openRedactDetail(row.getAttribute("data-row-key"));
+    });
+    $("redactReveal").addEventListener("click", toggleRedactReveal);
+    $("redactDetailClose").addEventListener("click", closeRedactDetail);
+    $("redactClear").addEventListener("click", clearRedactRecords);
+    $("redactSave").addEventListener("click", saveRedact);
+    $("redactTryBtn").addEventListener("click", previewRedact);
+    $("redactWords").addEventListener("input", function () { state.redactDirty = true; });
+  }
+
   function initTheme() {
     var saved = localStorage.getItem("wb_theme");
     if (saved) document.documentElement.setAttribute("data-theme", saved);
@@ -2150,6 +2441,7 @@
     });
     $("apiKey").value = state.apiKey;
     initTheme();
+    initRedactPage();
     $("saveKey").addEventListener("click", saveKey);
     $("statsApply").addEventListener("click", function () { changeStatsFilter(false); });
     $("statsPeriod").addEventListener("change", function () { changeStatsFilter(true); });
