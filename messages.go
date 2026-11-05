@@ -118,6 +118,8 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	wantThinking := anthropicThinkingOn(msgReq)
 	debugSetModelAndStream(r, modelName, isStream)
 	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
+	// 身份还原只读取合并 system 之前的原始请求；出站请求体不受影响。
+	planIdentityRestore(r, msgReq)
 	prepareConversationContext(r, msgReq)
 
 	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
@@ -153,6 +155,8 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	chatReq["stream"] = true // 上游强制流式，非流式由网关本地聚合
 
+	// 身份还原启用时，回译状态机按块记录建立状态，把暂存的尾部留到流结束再下发；
+	// 未启用时完全不改变原有回译行为。
 	prepareUpstreamChatRequest(chatReq, r, reqID, modelName)
 
 	upstreamBytes, err := json.Marshal(chatReq)
@@ -565,6 +569,21 @@ type anthropicStreamState struct {
 	toolOrder    []int
 	finish       string
 	usage        map[string]any
+	// 身份还原：正文与推理正文两个文本通道各持有跨分片尾部缓存。
+	// 两者为 nil 表示未启用还原，文本块照旧立即收口，行为与引入前一致。
+	thinkingRestorer *identityRestorer
+	textRestorer     *identityRestorer
+}
+
+// newRestoringAnthropicStreamState 额外接收本次请求的还原计划。计划为空时
+// 不创建任何缓存，回译行为与未引入还原前逐一相同。
+func newRestoringAnthropicStreamState(modelName string, wantThinking bool, plan identityRestore) *anthropicStreamState {
+	state := newAnthropicStreamState(modelName, wantThinking)
+	if plan.active() {
+		state.thinkingRestorer = newIdentityRestorer(plan)
+		state.textRestorer = newIdentityRestorer(plan)
+	}
+	return state
 }
 
 func newAnthropicStreamState(modelName string, wantThinking bool) *anthropicStreamState {
@@ -642,6 +661,17 @@ func (s *anthropicStreamState) feed(chunk map[string]any) []byte {
 
 func (s *anthropicStreamState) stopText(out []byte) []byte {
 	if s.text != nil && s.text.open {
+		// 还原启用时先冲刷暂存尾部，再正常收口；保证后续 tool block
+		// 打开前当前 text block 已停止，维持协议块顺序。
+		if s.textRestorer != nil {
+			if tail := s.textRestorer.Flush(); tail != "" {
+				s.text.buf.WriteString(tail)
+				out = append(out, s.emit("content_block_delta", map[string]any{
+					"index": s.text.index,
+					"delta": map[string]any{"type": "text_delta", "text": tail},
+				})...)
+			}
+		}
 		out = append(out, s.emit("content_block_stop", map[string]any{"index": s.text.index})...)
 		s.text.open = false
 	}
@@ -653,6 +683,23 @@ func (s *anthropicStreamState) stopText(out []byte) []byte {
 func (s *anthropicStreamState) stopThinking(out []byte) []byte {
 	if s.thinking == nil || !s.thinking.open {
 		return out
+	}
+	return s.closeThinking(out)
+}
+
+func (s *anthropicStreamState) closeThinking(out []byte) []byte {
+	if s.thinking == nil || !s.thinking.open {
+		return out
+	}
+	// signature 必须覆盖完整推理正文；先冲刷还原器尾部，再发签名并收口。
+	if s.thinkingRestorer != nil {
+		if tail := s.thinkingRestorer.Flush(); tail != "" {
+			s.thinking.buf.WriteString(tail)
+			out = append(out, s.emit("content_block_delta", map[string]any{
+				"index": s.thinking.index,
+				"delta": map[string]any{"type": "thinking_delta", "thinking": tail},
+			})...)
+		}
 	}
 	s.thinking.open = false
 	out = append(out, s.emit("content_block_delta", map[string]any{
@@ -675,10 +722,17 @@ func (s *anthropicStreamState) appendThinking(rc string) []byte {
 			"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
 		})...)
 	}
-	s.thinking.buf.WriteString(rc)
+	delta := rc
+	if s.thinkingRestorer != nil {
+		delta = s.thinkingRestorer.Write(rc)
+	}
+	s.thinking.buf.WriteString(delta)
+	if delta == "" {
+		return out
+	}
 	out = append(out, s.emit("content_block_delta", map[string]any{
 		"index": s.thinking.index,
-		"delta": map[string]any{"type": "thinking_delta", "thinking": rc},
+		"delta": map[string]any{"type": "thinking_delta", "thinking": delta},
 	})...)
 	return out
 }
@@ -695,10 +749,17 @@ func (s *anthropicStreamState) appendText(ct string) []byte {
 			"content_block": map[string]any{"type": "text", "text": ""},
 		})...)
 	}
-	s.text.buf.WriteString(ct)
+	delta := ct
+	if s.textRestorer != nil {
+		delta = s.textRestorer.Write(ct)
+	}
+	s.text.buf.WriteString(delta)
+	if delta == "" {
+		return out
+	}
 	out = append(out, s.emit("content_block_delta", map[string]any{
 		"index": s.text.index,
-		"delta": map[string]any{"type": "text_delta", "text": ct},
+		"delta": map[string]any{"type": "text_delta", "text": delta},
 	})...)
 	return out
 }
@@ -790,9 +851,11 @@ func (s *anthropicStreamState) anthropicUsage() map[string]any {
 }
 
 // finishEvents 关闭所有未收口块并输出 message_delta + message_stop。
+// 启用身份还原时，先把两个文本通道暂存的尾部作为普通增量下发，再收口文本块，
+// 保证最终文本与一次性还原整段文本完全一致。
 func (s *anthropicStreamState) finishEvents() []byte {
 	var out []byte
-	out = s.stopThinking(out)
+	out = s.closeThinking(out)
 	out = s.stopText(out)
 	for _, idx := range s.toolOrder {
 		slot := s.tools[idx]
@@ -903,7 +966,8 @@ func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.R
 		flusher.Flush()
 	}
 
-	state := newAnthropicStreamState(modelName, wantThinking)
+	// 启用还原时状态机把暂存尾部留到流结束再下发，见 appendText/stopText。
+	state := newRestoringAnthropicStreamState(modelName, wantThinking, identityRestoreFor(r))
 	body := newTTFTReader(resp.Body, startTime)
 	defer finishFirstToken(r, modelName, reqID, body)
 	scanErr := scanUpstreamSSE(body, state, writeEvent)
@@ -942,7 +1006,7 @@ func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.R
 	}
 
 	writeEvent(state.finishEvents())
-	observeModelCredit(acc, modelName, state.usage, reqID)
+	observeModelCredit(r, acc, modelName, state.usage, reqID)
 	statsObserveUsage(r, state.usage, true)
 	recordModelTokens(modelName, state.usage, reqID)
 	recordModelLatency(modelName, time.Since(startTime))
@@ -953,7 +1017,7 @@ func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.R
 // writeMessagesAggregate 本地聚合上游流式数据，输出完整 Anthropic Message。
 func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time, wantThinking bool) {
 	defer resp.Body.Close()
-	state := newAnthropicStreamState(modelName, wantThinking)
+	state := newRestoringAnthropicStreamState(modelName, wantThinking, identityRestoreFor(r))
 	body := newTTFTReader(resp.Body, startTime)
 	defer finishFirstToken(r, modelName, reqID, body)
 	if err := scanUpstreamSSE(body, state, nil); err != nil {
@@ -973,8 +1037,19 @@ func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.R
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "上游流结束但没有 finish_reason，本次回复不完整")
 		return
 	}
+	// 非流式聚合也要冲刷还原器暂存的尾部，否则 text/reasoning 结尾会被截断。
+	if state.thinkingRestorer != nil {
+		if tail := state.thinkingRestorer.Flush(); tail != "" && state.thinking != nil {
+			state.thinking.buf.WriteString(tail)
+		}
+	}
+	if state.textRestorer != nil {
+		if tail := state.textRestorer.Flush(); tail != "" && state.text != nil {
+			state.text.buf.WriteString(tail)
+		}
+	}
 	msg := state.aggregate()
-	observeModelCredit(acc, modelName, state.usage, reqID)
+	observeModelCredit(r, acc, modelName, state.usage, reqID)
 	statsObserveUsage(r, state.usage, true)
 	recordModelTokens(modelName, state.usage, reqID)
 	recordModelLatency(modelName, time.Since(startTime))

@@ -184,7 +184,7 @@ func ensureRuntimeConfigFile(path string) error {
 	if err := os.Rename(temporary, path); err != nil {
 		return err
 	}
-	log.Printf("[配置初始化] 已补充缺失的 identity/concurrent 默认配置；已有值和其他配置保留，后续修改仍可热加载")
+	log.Printf("[配置初始化] 已补充缺失的 identity/concurrent 默认配置；实验功能 identity.responseRestore 缺省补为 false，已有值和其他配置保留，后续修改仍可热加载")
 	return nil
 }
 
@@ -215,6 +215,18 @@ func ensureIdentityDefaultReplacements(doc map[string]json.RawMessage) (bool, er
 		}
 		doc[identityKey] = encoded
 		return true, nil
+	}
+	changed := false
+	hasRestore := false
+	for key := range identity {
+		if strings.EqualFold(key, "responseRestore") {
+			hasRestore = true
+			break
+		}
+	}
+	if !hasRestore {
+		identity["responseRestore"] = json.RawMessage("false")
+		changed = true
 	}
 	target := "WorkBuddy"
 	for key, raw := range identity {
@@ -262,7 +274,7 @@ func ensureIdentityDefaultReplacements(doc map[string]json.RawMessage) (bool, er
 				updated = true
 			}
 		}
-		if !updated {
+		if !updated && !changed {
 			return false, nil
 		}
 		encoded, err := json.Marshal(replacements)
@@ -412,6 +424,9 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 func logIdentityRuntimeConfig(trace string) {
 	enabled, target, rules := identitySettingsSummary()
 	literal, wildcard, invalid := identityRuleDetails()
+	settings := identitySnapshot()
+	log.Printf("[响应身份还原配置] traceId=%s 实验功能=true 配置开关=%t 实际启用=%t 说明=默认false；升级仅补充缺失开关；仅明确且唯一的身份声明可还原，URL和文件路径保留，已有请求保持原计划",
+		trace, settings.responseRestore, settings.enabled && settings.responseRestore)
 	log.Printf("[身份替换配置] traceId=%s 启用=%t 目标=%s 规则数=%d 字面规则=%d 首位通配规则=%d 忽略非法规则=%d 说明=所有文字替换均按identity.replacements执行；仅处理system/developer/assistant文本；热加载只影响后续请求",
 		trace, enabled, target, rules, literal, wildcard, invalid)
 	if invalid > 0 {

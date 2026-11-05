@@ -362,6 +362,13 @@ func parseRateLine(line, file string) (rateLogRecord, bool) {
 		record.LogLine = redactSensitiveText(line)
 		record.Site, record.Model = m[1], m[2]
 		record.Source = "官方目录（" + m[9] + "）"
+		if parsed, err := time.Parse(time.RFC3339, m[10]); err == nil {
+			record.UpdatedAt = parsed.Unix()
+		} else if parsed, err := time.ParseInLocation("2006-01-02T15:04:05", m[10], time.Local); err == nil {
+			record.UpdatedAt = parsed.Unix()
+		} else if m[10] == "未知" {
+			record.UpdatedAt = 0
+		}
 		expired := m[8] == "true"
 		switch {
 		case m[5] != "true":
@@ -388,6 +395,13 @@ func parseRateLine(line, file string) (rateLogRecord, bool) {
 		record.LogLine = redactSensitiveText(line)
 		record.Site, record.Model = m[1], m[2]
 		record.Source = "价格探测（缓存结论）"
+		if parsed, err := time.Parse(time.RFC3339, m[6]); err == nil {
+			record.UpdatedAt = parsed.Unix()
+		} else if parsed, err := time.ParseInLocation("2006-01-02T15:04:05", m[6], time.Local); err == nil {
+			record.UpdatedAt = parsed.Unix()
+		} else if m[6] == "未知" {
+			record.UpdatedAt = 0
+		}
 		record.Value, record.Unknown, record.Priority = probeValue(m[3])
 		record.Detail = "判定=" + m[3] + " credit=" + m[4] + " tokens=" + m[5] + " 探测时间=" + m[6] + " " + m[7]
 		record.Explain = "上次真实探测结论：收费（尚未复测）"
@@ -440,6 +454,9 @@ func readRateEvents() (rateLogScan, error) {
 	var scan rateLogScan
 	entries, err := os.ReadDir(logDir)
 	if errors.Is(err, os.ErrNotExist) {
+		if info, statErr := os.Stat(logDir); statErr == nil && !info.IsDir() {
+			return scan, errors.New("普通日志路径不是目录")
+		}
 		return scan, nil
 	}
 	if err != nil {
@@ -521,7 +538,8 @@ func readRateEvents() (rateLogScan, error) {
 func aggregateRateDetails(records []rateLogRecord) map[string]map[string]any {
 	grouped := map[string][]rateLogRecord{}
 	for _, record := range records {
-		key := record.Site + "|" + normalizeModelName(record.Model)
+		key := probeKey(record.Site, record.Model)
+		record.Model = catalogDisplayModelID(record.Site, record.Model)
 		grouped[key] = append(grouped[key], record)
 	}
 	out := make(map[string]map[string]any, len(grouped))
@@ -588,15 +606,15 @@ func handleWebUIRateDetail(w http.ResponseWriter, r *http.Request) {
 		payload := rateDetailCache.payload
 		rateDetailCache.Unlock()
 		log.Printf("[管理倍率来源] traceId=%s 结果=命中缓存 说明=仅读现有普通日志，不修改配置、不触发探测", debugTraceID(r))
-		writeAdminData(w, r, payload)
+		writeRateDetailResponse(w, r, payload)
 		return
 	}
 	rateDetailCache.Unlock()
 	scan, err := readRateEvents()
+	logProblem := ""
 	if err != nil {
-		log.Printf("[管理倍率来源] traceId=%s 结果=读取失败 原因=%s 说明=页面显示没有日志，不伪造来源", debugTraceID(r), safeDebugError(err))
-		writeJSONError(w, http.StatusServiceUnavailable, "日志暂不可读，请稍后重试")
-		return
+		log.Printf("[管理倍率来源] traceId=%s 结果=原始日志读取失败 原因=%s 说明=继续展示已持久化的真实来源，原始日志标记不可读，不伪造记录", debugTraceID(r), safeDebugError(err))
+		logProblem = "原始普通日志暂不可读；当前目录与已保存的实测来源仍可查看"
 	}
 	now := time.Now()
 	rates := aggregateRateDetails(scan.Records)
@@ -612,23 +630,46 @@ func handleWebUIRateDetail(w http.ResponseWriter, r *http.Request) {
 		"readBytes": scan.Scanned, "readBudgetBytes": rateLogReadBudget, "truncated": scan.Truncated,
 		"autoProbeEnabled": scan.AutoProbeEnabled, "autoProbeKnown": scan.AutoProbeKnown,
 		"refreshHint": refreshHint,
-		"noLogHint":   "普通日志中没有该模型的记录。用该站点的账号请求一次这个模型，就会产生新的倍率记录。",
-		"source":      "gateway 普通日志",
-		"note":        "倍率来源与更新时间全部取自普通日志；日志中没有记录的模型显示「没有日志」。目录倍率在首次或变化时记录，探测与实测结论在产生时记录；原始日志默认折叠。",
+		"noLogHint":   "尚未找到该模型的目录或有效实测来源；缺失信息不代表免费，也不代表从未调用。",
+		"source":      "当前目录与持久化实测来源；普通日志仅作原始证据",
+		"note":        "数值与模型列表共用倍率决策；日志没有命中时不显示“没有调用”。原始日志默认折叠。",
+		"logProblem":  logProblem,
 	}
 	rateDetailCache.Lock()
 	rateDetailCache.payload, rateDetailCache.at = payload, now
 	rateDetailCache.Unlock()
 	log.Printf("[管理倍率来源] traceId=%s 结果=读取成功 记录=%d 站点模型=%d 扫描字节=%d 截断=%t 自动探测已开启=%t 说明=仅读现有普通日志，不触发探测或目录刷新", debugTraceID(r), len(scan.Records), len(rates), scan.Scanned, scan.Truncated, scan.AutoProbeEnabled)
+	writeRateDetailResponse(w, r, payload)
+}
+
+func writeRateDetailResponse(w http.ResponseWriter, r *http.Request, cached map[string]any) {
+	payload := make(map[string]any, len(cached)+2)
+	for key, value := range cached {
+		payload[key] = value
+	}
+	raw, _ := cached["rates"].(map[string]map[string]any)
+	now := time.Now()
+	rates, problem := currentRateDetails(raw, now)
+	for _, entry := range rates {
+		if entry["unknown"] == true {
+			entry["refreshHint"] = rateRefreshHint(cfg.automaticPriceProbesAllowed())
+		}
+	}
+	payload["rates"], payload["sourceProblem"] = rates, problem
+	payload["autoProbeEnabled"], payload["autoProbeKnown"] = cfg.automaticPriceProbesAllowed(), true
+	payload["refreshHint"] = rateRefreshHint(cfg.automaticPriceProbesAllowed())
+	payload["generatedAt"], payload["revision"] = now.Unix(), rateDisplayRevision(now)
+	log.Printf("[管理倍率来源] traceId=%s 阶段=统一倍率决策 站点模型=%d 版本=%s 日志窗口截断=%t 来源持久化异常=%t 说明=目录或实测变化立即生效，原始日志缓存不缓存倍率结论",
+		debugTraceID(r), len(rates), rateDisplayRevision(now), cached["truncated"] == true, problem != "")
 	writeAdminData(w, r, payload)
 }
 
-// rateRefreshHint 说明「未知」时怎样让倍率更新；探测开关状态同样取自普通日志。
+// rateRefreshHint 说明有效新证据怎样产生，不承诺缺少 usage 的请求也会改变结论。
 func rateRefreshHint(autoProbeEnabled bool) string {
 	if autoProbeEnabled {
-		return "后台自动探测已开启，会在下一轮自动复测；也可以让该站点的账号请求一次这个模型，立即按 usage.credit 重新判定。"
+		return "后台自动探测已开启，符合条件时会自动复测；也可让该站点账号请求模型，只有完整回复中的有效 usage.credit 才会更新实测结论，不保证能获得具体数值倍率。"
 	}
-	return "后台自动探测已关闭。用该站点的账号请求一次这个模型，网关会按返回的 usage.credit 自动重新判定并写入日志。"
+	return "后台自动探测已关闭。可用该站点账号请求一次模型；只有完整回复中的有效 usage.credit 才会更新实测来源，未返回 usage 时保留上次结论，不能由积分推算倍率。"
 }
 
 func handleWebUITasks(w http.ResponseWriter, r *http.Request) {
@@ -850,6 +891,8 @@ func handleWebUIModels(w http.ResponseWriter, r *http.Request) {
 		if disabled {
 			models[i].AvailableAccounts = 0
 		}
+		models[i].CNMultiplier = modelDisplayMultiplier("cn", models[i].ID, models[i].CNFree)
+		models[i].IntlMultiplier = modelDisplayMultiplier("intl", models[i].ID, models[i].IntlFree)
 	}
 	if rangeParam == "5h" {
 		now := time.Now()
@@ -878,11 +921,12 @@ func handleWebUIModels(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[管理模型] traceId=%s 结果=读取成功 模型数=%d", debugTraceID(r), len(models))
 	writeAdminData(w, r, map[string]any{
-		"source":     modelSourceLabel(modelSourceFromSnapshots(models)),
-		"models":     models,
-		"stale":      time.Now().Unix()-snap.UpdatedAt > 15,
-		"policyMode": currentModelPolicyMode(),
-		"range":      rangeParam,
+		"source":       modelSourceLabel(modelSourceFromSnapshots(models)),
+		"models":       models,
+		"stale":        time.Now().Unix()-snap.UpdatedAt > 15,
+		"policyMode":   currentModelPolicyMode(),
+		"range":        rangeParam,
+		"rateRevision": rateDisplayRevision(time.Now()),
 	})
 }
 

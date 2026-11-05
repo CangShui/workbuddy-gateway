@@ -113,7 +113,7 @@ func TestMergeCatalogsBackfillsCapabilityWithoutOverwriting(t *testing.T) {
 		ID: "a", MaxInputTokens: 999, MaxOutputTokens: 128000, MaxAllowedSize: 1000000,
 		ContextLengths: []int{300000, 1000000}, ContextDefaultLength: 300000,
 	}}
-	merged := mergeCatalogs(live, npm)
+	merged := mergeCatalogs("cn", live, npm)
 	if len(merged) != 1 {
 		t.Fatalf("merged=%d", len(merged))
 	}

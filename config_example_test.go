@@ -71,8 +71,9 @@ func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 	exampleSchema := runtimeFileConfig{}
 	exampleSchema.Models.Accounts = map[string]modelAccountFileConfig{"all": {}}
 	identityEnabled := true
+	identityResponseRestore := false
 	exampleSchema.Identity = runtimeIdentityConfig{Enabled: &identityEnabled, Target: "WorkBuddy",
-		Replacements: defaultIdentityReplacements("WorkBuddy")}
+		Replacements: defaultIdentityReplacements("WorkBuddy"), ResponseRestore: &identityResponseRestore}
 	schema, err := json.Marshal(exampleSchema)
 	if err != nil {
 		t.Fatal(err)
@@ -138,6 +139,9 @@ func TestConfigExampleIncludesIdentityCompatibilityDefaults(t *testing.T) {
 	var c runtimeFileConfig
 	if err := json.Unmarshal(raw, &c); err != nil {
 		t.Fatal(err)
+	}
+	if c.Identity.ResponseRestore == nil || *c.Identity.ResponseRestore {
+		t.Fatal("config.example.json must explicitly disable experimental response restore")
 	}
 	if len(c.DeprecatedPromptCompatibility) != 0 {
 		t.Fatal("example must not contain the removed compatibility field")

@@ -22,21 +22,17 @@ import (
 // -----------------------------------------------------------------------------
 // 模型目录与倍率
 //
-// 列表来源（两路合并去重）：
-//  1. 实时接口 GET {Base}/v2/enterprises/personal/models（权威，含促销）
-//  2. npm 包内静态目录 product.internal.json / product.cloudhosted.json
+// 列表来源（按优先级合并，站点内别名去重）：
+//  1. 官方桌面目录 GET {Base}/v3/config
+//  2. 官方窄表 GET {Base}/v2/enterprises/personal/models
+//  3. npm 静态目录 product.internal.json / product.cloudhosted.json
 //
 // 任一路失败用本地缓存；无缓存则用另一路成功的数据先顶上，等下次刷新覆盖；
 // 两路都失败且无缓存则不展示模型列表（不影响模型调用，调用始终透传）。
 //
-// 倍率：
-//  1. 优先实时接口生效倍率（credits × 促销 factor）
-//  2. 若接口给出 0.00x 但促销已到期，或该模型不在接口目录中，
-//     用「余额未耗尽」的同站点账号探测一次（每 12 小时一轮）
-//     - 探测为免费 → 展示 0.00x，并继续每 12 小时复测确认
-//     - 探测为收费 → 展示 [未知倍率]，直到接口重新给出 0.00x
-//     （无促销时间，或仍在促销时间窗口内）才恢复免费
-//     - 14018 / 未知 → 不覆盖接口值
+// 倍率数值和来源统一由 rate_resolution.go 决定；实测与目录时间随缓存保存。
+// 重复刷新不取消已确认的冲突，真实价格规则变化才使旧实测失效。
+// 后台真实探测需要显式开启；目录抓取和查看详情不会自动发起模型生成。
 // -----------------------------------------------------------------------------
 
 const (
@@ -77,20 +73,25 @@ var npmBases = []string{
 }
 
 type catalogModel struct {
-	ID              string  `json:"id"`
-	Name            string  `json:"name,omitempty"`
-	Credits         string  `json:"credits,omitempty"`
-	BaseMultiplier  float64 `json:"baseMultiplier,omitempty"`
-	Multiplier      float64 `json:"multiplier,omitempty"` // 生效倍率（含促销）
-	HasMultiplier   bool    `json:"hasMultiplier,omitempty"`
-	PromoLabel      string  `json:"promoLabel,omitempty"`
-	PromoUntil      string  `json:"promoUntil,omitempty"`
-	PromoFree       bool    `json:"promoFree,omitempty"`
-	PromoExpired    bool    `json:"promoExpired,omitempty"` // 有促销但已过期/未生效
-	FromLive        bool    `json:"fromLive,omitempty"`     // 是否来自实时接口
-	MaxInputTokens  int     `json:"maxInputTokens,omitempty"`
-	MaxOutputTokens int     `json:"maxOutputTokens,omitempty"`
-	MaxAllowedSize  int     `json:"maxAllowedSize,omitempty"` // 上游声明的最大允许上下文
+	ID              string   `json:"id"`
+	Name            string   `json:"name,omitempty"`
+	Credits         string   `json:"credits,omitempty"`
+	BaseMultiplier  float64  `json:"baseMultiplier,omitempty"`
+	Multiplier      float64  `json:"multiplier,omitempty"` // 生效倍率（含促销）
+	HasMultiplier   bool     `json:"hasMultiplier,omitempty"`
+	PromoLabel      string   `json:"promoLabel,omitempty"`
+	PromoUntil      string   `json:"promoUntil,omitempty"`
+	PromoFrom       string   `json:"promoFrom,omitempty"`
+	PromoFactor     *float64 `json:"promoFactor,omitempty"`
+	PromoFree       bool     `json:"promoFree,omitempty"`
+	PromoExpired    bool     `json:"promoExpired,omitempty"`  // 有促销但已过期/未生效
+	FromLive        bool     `json:"fromLive,omitempty"`      // 是否来自实时接口
+	RateCheckedAt   int64    `json:"rateCheckedAt,omitempty"` // 最后成功读取该来源，毫秒
+	RateChangedAt   int64    `json:"rateChangedAt,omitempty"` // 价格规则最后变动，毫秒
+	RateCached      bool     `json:"-"`                       // 本轮沿用缓存，不能冒充新抓取
+	MaxInputTokens  int      `json:"maxInputTokens,omitempty"`
+	MaxOutputTokens int      `json:"maxOutputTokens,omitempty"`
+	MaxAllowedSize  int      `json:"maxAllowedSize,omitempty"` // 上游声明的最大允许上下文
 	// ContextLengths / ContextDefaultLength 来自上游 contextWindow：
 	// 前者是客户端可选的上下文档位，后者是客户端默认预算。
 	// 它们与「模型能力上限」（MaxInputTokens）语义不同，不能合并成一个值：
@@ -102,6 +103,10 @@ type catalogModel struct {
 // modelPriceProbe 是某站点某模型的价格探测状态。
 type modelPriceProbe struct {
 	LastProbeAt int64   `json:"lastProbeAt,omitempty"`
+	VerdictAt   int64   `json:"verdictAt,omitempty"` // 最后一次成功结论，不能被失败的尝试更新时间
+	LastError   string  `json:"lastError,omitempty"`
+	FreeUntil   string  `json:"freeUntil,omitempty"`
+	Cached      bool    `json:"-"`
 	Verdict     string  `json:"verdict,omitempty"` // free | paid
 	Credit      float64 `json:"credit,omitempty"`
 	Tokens      int64   `json:"tokens,omitempty"`
@@ -109,20 +114,23 @@ type modelPriceProbe struct {
 }
 
 type modelsCache struct {
-	Schema    int                        `json:"schema"`
-	Source    string                     `json:"source"`
-	FetchedAt int64                      `json:"fetchedAt"`
-	Catalogs  map[string][]catalogModel  `json:"catalogs"`
-	Probes    map[string]modelPriceProbe `json:"probes,omitempty"`
+	Schema    int                             `json:"schema"`
+	Source    string                          `json:"source"`
+	FetchedAt int64                           `json:"fetchedAt"`
+	Catalogs  map[string][]catalogModel       `json:"catalogs"`
+	Probes    map[string]modelPriceProbe      `json:"probes,omitempty"`
+	RateUsage map[string]rateUsageObservation `json:"rateUsage,omitempty"`
 }
 
 var (
-	modelsMu          sync.RWMutex
-	catalogModels     = map[string][]catalogModel{}
-	modelProbes       = map[string]modelPriceProbe{}
-	dynamicSource     string
-	modelsScanTrigger = make(chan struct{}, 1)
-	modelProbeTrigger = make(chan struct{}, 1)
+	modelsMu           sync.RWMutex
+	catalogModels      = map[string][]catalogModel{}
+	modelProbes        = map[string]modelPriceProbe{}
+	dynamicSource      string
+	modelRateUsage     = map[string]rateUsageObservation{}
+	rateSourcesProblem string
+	modelsScanTrigger  = make(chan struct{}, 1)
+	modelProbeTrigger  = make(chan struct{}, 1)
 )
 
 // rateLogState 记录本进程已经写过的「官方倍率」日志签名。
@@ -134,24 +142,34 @@ var rateLogState = struct {
 
 // logOfficialRates 把官方目录取回的倍率写入普通日志，供网页控制台展示数据来源与更新时间。
 // 只记录摘要字段，不涉及任何凭据。
-func logOfficialRates(site string, models []catalogModel, refreshedAt time.Time) {
+func logOfficialRates(site string, models []catalogModel, refreshedAt time.Time, trace string) {
 	rateLogState.Lock()
 	defer rateLogState.Unlock()
 	changed := 0
 	for _, m := range models {
 		key := site + "|" + m.ID
-		signature := fmt.Sprintf("%s|%t|%g|%t|%s|%s", m.Credits, m.HasMultiplier, m.Multiplier, m.PromoExpired, m.PromoLabel, m.PromoUntil)
+		signature := fmt.Sprintf("%s|%t|%g|%t|%s|%s|%s|%t|%t", m.Credits, m.HasMultiplier, m.Multiplier, m.PromoExpired, m.PromoLabel, m.PromoFrom, m.PromoUntil, m.FromLive, m.RateCached)
 		if previous, ok := rateLogState.seen[key]; ok && previous == signature {
 			continue
 		}
 		rateLogState.seen[key] = signature
 		changed++
-		source := "npm/缓存"
+		source := "npm静态目录"
 		if m.FromLive {
 			source = "实时接口"
 		}
-		log.Printf("[Models] 官方倍率 站点=%s 模型=%s 原始credits=%q 生效倍率=%s 有倍率=%t 促销=%q 促销截止=%q 促销已过期=%t 来源=%s 刷新时间=%s",
-			site, m.ID, m.Credits, fmt.Sprintf("%.2f", m.Multiplier), m.HasMultiplier, m.PromoLabel, m.PromoUntil, m.PromoExpired, source, refreshedAt.Format("2006-01-02T15:04:05"))
+		checked := refreshedAt.Format(time.RFC3339)
+		if m.RateCheckedAt > 0 {
+			checked = time.UnixMilli(m.RateCheckedAt).Format(time.RFC3339)
+		}
+		if m.RateCached {
+			source = "目录缓存"
+			if m.RateCheckedAt == 0 {
+				checked = "未知"
+			}
+		}
+		log.Printf("[Models] 官方倍率 站点=%s 模型=%s 原始credits=%q 生效倍率=%s 有倍率=%t 促销=%q 促销截止=%q 促销已过期=%t 来源=%s 刷新时间=%s 促销开始=%q traceId=%s",
+			site, m.ID, m.Credits, strings.TrimSuffix(formatRateMultiplier(m.Multiplier), "x"), m.HasMultiplier, m.PromoLabel, m.PromoUntil, m.PromoExpired, source, checked, m.PromoFrom, trace)
 	}
 	if changed > 0 {
 		log.Printf("[Models] 官方倍率已记录：站点=%s 本轮新增或变化=%d 说明=未变化的模型不重复写日志", site, changed)
@@ -159,7 +177,14 @@ func logOfficialRates(site string, models []catalogModel, refreshedAt time.Time)
 }
 
 func probeKey(site, model string) string {
-	return site + "|" + normalizeModelName(model)
+	return site + "|" + catalogDisplayModelID(site, model)
+}
+
+func formatRateMultiplier(value float64) string {
+	if value > 0 && value < 0.005 {
+		return strconv.FormatFloat(value, 'f', -1, 64) + "x"
+	}
+	return fmt.Sprintf("%.2fx", value)
 }
 
 // parseCredits 解析 credits 字段为数值倍率，例如 "x0.29 credits" -> 0.29。
@@ -172,11 +197,17 @@ func parseCredits(v any) (float64, bool) {
 		s = strings.ReplaceAll(s, "credit", "")
 		s = strings.TrimSpace(s)
 		f, err := strconv.ParseFloat(s, 64)
-		return f, err == nil
+		if err == nil && validRateCredit(f) {
+			return f, true
+		}
 	case float64:
-		return x, true
+		if validRateCredit(x) {
+			return x, true
+		}
 	case int:
-		return float64(x), true
+		if x >= 0 {
+			return float64(x), true
+		}
 	}
 	return 0, false
 }
@@ -193,7 +224,7 @@ type livePromotion struct {
 		Label string `json:"label"`
 	} `json:"badge"`
 	Discount *struct {
-		Factor float64 `json:"factor"`
+		Factor *float64 `json:"factor"`
 	} `json:"discount"`
 	Schedule struct {
 		ValidFrom  string `json:"validFrom"`
@@ -272,7 +303,7 @@ func fetchLiveCatalogByAuth(auth *StoredAuth) ([]catalogModel, int, error) {
 	merged := sources[0].models
 	active := sources[0].promos
 	for _, source := range sources[1:] {
-		merged = mergeCatalogs(merged, source.models)
+		merged = mergeCatalogs(prof.Key, merged, source.models)
 		if source.promos > active {
 			active = source.promos
 		}
@@ -346,12 +377,12 @@ func promoActive(p livePromotion, now time.Time) bool {
 		return false
 	}
 	if p.Schedule.ValidFrom != "" {
-		if from, err := time.Parse(time.RFC3339, p.Schedule.ValidFrom); err == nil && now.Before(from) {
+		if from, err := time.Parse(time.RFC3339, p.Schedule.ValidFrom); err != nil || now.Before(from) {
 			return false
 		}
 	}
 	if p.Schedule.ValidUntil != "" {
-		if until, err := time.Parse(time.RFC3339, p.Schedule.ValidUntil); err == nil && !now.Before(until) {
+		if until, err := time.Parse(time.RFC3339, p.Schedule.ValidUntil); err != nil || !now.Before(until) {
 			return false
 		}
 	}
@@ -372,6 +403,7 @@ func parseLiveCatalog(data []byte) ([]catalogModel, int, error) {
 		factor  float64
 		label   string
 		until   string
+		from    string
 		expired bool
 	}
 	hits := map[string]hit{}
@@ -379,9 +411,10 @@ func parseLiveCatalog(data []byte) ([]catalogModel, int, error) {
 	for _, p := range doc.ModelPromotions {
 		// /v3/config 里还有只用于展示的“夜间折扣”徽章，可能没有 discount 数值；
 		// 这类促销不能当作 factor=0 的限免，否则会把官方基础倍率错误改成 0.00x。
-		if p.Discount == nil {
+		if p.Discount == nil || p.Discount.Factor == nil || !p.Enabled || !validRateCredit(*p.Discount.Factor) {
 			continue
 		}
+		factor := *p.Discount.Factor
 		on := promoActive(p, now)
 		if on {
 			active++
@@ -392,16 +425,16 @@ func parseLiveCatalog(data []byte) ([]catalogModel, int, error) {
 		}
 		for _, id := range p.ModelIDs {
 			if on {
-				if old, ok := hits[id]; ok && !old.expired && old.factor <= p.Discount.Factor {
+				if old, ok := hits[id]; ok && !old.expired && old.factor <= factor {
 					continue
 				}
-				hits[id] = hit{factor: p.Discount.Factor, label: label, until: p.Schedule.ValidUntil}
+				hits[id] = hit{factor: factor, label: label, until: p.Schedule.ValidUntil, from: p.Schedule.ValidFrom}
 			} else {
 				// 记录"存在促销但当前不生效"，用于触发价格探测。
-				if old, ok := hits[id]; ok && old.expired {
+				if _, ok := hits[id]; ok {
 					continue
 				}
-				hits[id] = hit{label: label, until: p.Schedule.ValidUntil, expired: true}
+				hits[id] = hit{factor: factor, label: label, until: p.Schedule.ValidUntil, from: p.Schedule.ValidFrom, expired: true}
 			}
 		}
 	}
@@ -426,6 +459,8 @@ func parseLiveCatalog(data []byte) ([]catalogModel, int, error) {
 		applyCatalogCapability(&entry, m.MaxAllowedSize, lengths, defaultLength)
 		if s, ok := m.Credits.(string); ok {
 			entry.Credits = strings.TrimSpace(s)
+		} else if m.Credits != nil {
+			entry.Credits = fmt.Sprint(m.Credits)
 		}
 		base, hasBase := parseCredits(m.Credits)
 		entry.BaseMultiplier = base
@@ -434,18 +469,24 @@ func parseLiveCatalog(data []byte) ([]catalogModel, int, error) {
 		if h, ok := hits[id]; ok {
 			entry.PromoLabel = h.label
 			entry.PromoUntil = h.until
+			entry.PromoFrom = h.from
+			factor := h.factor
+			entry.PromoFactor = &factor
 			if h.expired {
 				entry.PromoExpired = true
 			} else {
 				entry.Multiplier = base * h.factor
 				if !hasBase {
-					entry.Multiplier = h.factor
+					entry.Multiplier = 0
 				}
-				entry.HasMultiplier = true
+				entry.HasMultiplier = hasBase || h.factor == 0
 				if h.factor == 0 {
 					entry.PromoFree = true
 				}
 			}
+		}
+		if !validRateCredit(entry.Multiplier) {
+			entry.Multiplier, entry.HasMultiplier = 0, false
 		}
 		out = append(out, entry)
 	}
@@ -748,22 +789,24 @@ func backfillCapability(dst *catalogModel, src catalogModel) {
 
 // mergeCatalogs 合并两份目录：实时接口优先，npm 仅补齐接口没有的模型。
 // 同一模型两边都有时，用 npm 补齐实时目录缺失的能力字段（不覆盖实时值）。
-func mergeCatalogs(live, npm []catalogModel) []catalogModel {
+func mergeCatalogs(site string, live, npm []catalogModel) []catalogModel {
 	out := make([]catalogModel, 0, len(live)+len(npm))
 	index := map[string]int{}
 	for _, m := range live {
-		if _, ok := index[m.ID]; ok {
+		key := catalogDisplayModelID(site, m.ID)
+		if _, ok := index[key]; ok {
 			continue
 		}
-		index[m.ID] = len(out)
+		index[key] = len(out)
 		out = append(out, m)
 	}
 	for _, m := range npm {
-		if i, ok := index[m.ID]; ok {
+		key := catalogDisplayModelID(site, m.ID)
+		if i, ok := index[key]; ok {
 			backfillCapability(&out[i], m)
 			continue
 		}
-		index[m.ID] = len(out)
+		index[key] = len(out)
 		out = append(out, m)
 	}
 	return out
@@ -788,17 +831,43 @@ func loadModelsCache() {
 		if len(models) < modelsMinCount || len(models) > modelsMaxCount {
 			continue
 		}
-		validated[key] = models
+		for i := range models {
+			models[i].RateCached = true
+			if models[i].RateCheckedAt == 0 {
+				if at, parseErr := time.ParseInLocation("2006-01-02 15:04", strings.TrimPrefix(cache.Source, "live-api@"), time.Local); parseErr == nil {
+					models[i].RateCheckedAt = at.UnixMilli()
+				}
+			}
+		}
+		validated[key] = mergeCatalogs(key, models, nil)
 	}
 	modelsMu.Lock()
 	if len(validated) > 0 {
 		catalogModels = validated
 	}
-	if len(cache.Probes) > 0 {
-		modelProbes = cache.Probes
+	modelProbes = map[string]modelPriceProbe{}
+	for key, probe := range cache.Probes {
+		if site, model, ok := strings.Cut(key, "|"); ok {
+			probe.Cached = true
+			key = probeKey(site, model)
+			if old, exists := modelProbes[key]; !exists || old.LastProbeAt <= probe.LastProbeAt {
+				modelProbes[key] = probe
+			}
+		}
 	}
 	dynamicSource = cache.Source
+	modelRateUsage = map[string]rateUsageObservation{}
+	for key, observation := range cache.RateUsage {
+		site, model, ok := strings.Cut(key, "|")
+		if ok && observation.valid() {
+			key = probeKey(site, model)
+			if old := modelRateUsage[key]; old.At <= observation.At {
+				modelRateUsage[key] = observation
+			}
+		}
+	}
 	modelsMu.Unlock()
+	rateSourcesRevision.Add(1)
 	for key, models := range validated {
 		log.Printf("[Models] 已加载站点目录缓存：站点=%s，模型数=%d", key, len(models))
 	}
@@ -813,8 +882,12 @@ func loadModelsCache() {
 			continue
 		}
 		probeTime := "未知"
-		if probe.LastProbeAt > 0 {
-			probeTime = time.Unix(probe.LastProbeAt, 0).Format("2006-01-02T15:04:05")
+		observedAt := probe.VerdictAt
+		if observedAt == 0 {
+			observedAt = probe.LastProbeAt
+		}
+		if observedAt > 0 {
+			probeTime = time.Unix(observedAt, 0).Format(time.RFC3339)
 		}
 		log.Printf("[ModelPrice] 载入缓存结论 站点=%s 模型=%s 判定=%s credit=%s tokens=%d 探测时间=%s 说明=%s 来源=缓存文件（非本轮新探测）",
 			site, model, probe.Verdict, formatQuota(probe.Credit), probe.Tokens, probeTime, probe.Detail)
@@ -825,6 +898,7 @@ func saveModelsCache(source string, catalogs map[string][]catalogModel, probes m
 	data, err := json.MarshalIndent(modelsCache{
 		Schema: modelsCacheSchema, Source: source, FetchedAt: time.Now().Unix(),
 		Catalogs: catalogs, Probes: probes,
+		RateUsage: modelRateUsage,
 	}, "", "  ")
 	if err != nil {
 		return err
@@ -838,7 +912,9 @@ func saveModelsCache(source string, catalogs map[string][]catalogModel, probes m
 
 func persistModelsLocked(source string) error {
 	err := saveModelsCache(source, catalogModels, modelProbes)
+	rateSourcesProblem = ""
 	if err != nil {
+		rateSourcesProblem = "倍率来源仅保存在内存，缓存落盘失败；重启后可能需要重新确认"
 		log.Printf("[Models] 缓存写入失败: %v", err)
 	}
 	return err
@@ -894,15 +970,8 @@ func modelEntry(site, modelID string) (catalogModel, bool) {
 	defer modelsMu.RUnlock()
 	modelID = normalizeModelName(modelID)
 	for _, m := range catalogModels[site] {
-		if m.ID == modelID {
+		if catalogDisplayModelID(site, m.ID) == catalogDisplayModelID(site, modelID) {
 			return m, true
-		}
-	}
-	if site == "intl" && !strings.HasSuffix(modelID, "-sg") {
-		for _, m := range catalogModels[site] {
-			if m.ID == modelID+"-sg" {
-				return m, true
-			}
 		}
 	}
 	return catalogModel{}, false
@@ -1056,34 +1125,7 @@ func modelProbeVerdict(site, modelID string) string {
 // 促销过期只表示折扣结束，倍率回落到 credits 原价，并不等于"价格未知"；
 // 只有实测确认收费、且接口给不出有效倍率时，才显示「收费(倍率未知)」。
 func modelDisplayMultiplier(site, modelID, freeLabel string) string {
-	if freeLabel == "是" {
-		return "0.00x"
-	}
-	// 实际请求已经学到过收费时，不能被缓存的价格探测“免费”结论覆盖；
-	// 否则会出现模型已被标记为收费、列表仍显示 0.00x 的矛盾。
-	if freeLabel == "否" || freeLabel == "混合" {
-		entry, ok := modelEntry(site, modelID)
-		if ok && entry.HasMultiplier && entry.Multiplier > 0 && !entry.PromoExpired {
-			return fmt.Sprintf("%.2fx", entry.Multiplier)
-		}
-		return "收费(倍率未知)"
-	}
-	switch modelProbeVerdict(site, modelID) {
-	case "free":
-		return "0.00x"
-	case "paid":
-		return "收费(倍率未知)"
-	}
-	entry, ok := modelEntry(site, modelID)
-	if !ok || !entry.HasMultiplier {
-		return "-"
-	}
-	// 促销已过期时接口的 credits 不可信（上游常把促销价固化在 credits 里），
-	// 探测出结果前按完全未知处理，不展示可能过期的价格。
-	if entry.PromoExpired {
-		return "-"
-	}
-	return fmt.Sprintf("%.2fx", entry.Multiplier)
+	return resolveModelRate(site, modelID, freeLabel, time.Now()).Value
 }
 
 // siteKnownFree 判断某站点该模型是否已确认免费（实测或接口明确 0.00x）。
@@ -1219,20 +1261,36 @@ func refreshModelsOnce(schedule ...time.Time) {
 
 		switch {
 		case liveOK && npmOK:
-			fetched[site] = mergeCatalogs(live, npm)
+			fetched[site] = mergeCatalogs(site, live, npm)
 		case liveOK:
 			fetched[site] = live
 		case npmOK:
-			fetched[site] = npm
+			if cached := prev[site]; len(cached) > 0 {
+				fetched[site] = mergeCatalogs(site, cached, npm)
+				cachedIDs := make(map[string]bool, len(cached))
+				for _, model := range cached {
+					cachedIDs[catalogDisplayModelID(site, model.ID)] = true
+				}
+				for i := range fetched[site] {
+					fetched[site][i].RateCached = cachedIDs[catalogDisplayModelID(site, fetched[site][i].ID)]
+				}
+				usedCache = true
+			} else {
+				fetched[site] = npm
+			}
 		default:
 			if cached, ok := prev[site]; ok && len(cached) > 0 {
 				fetched[site] = cached
+				for i := range fetched[site] {
+					fetched[site][i].RateCached = true
+				}
 				usedCache = true
 				log.Printf("[Models] 站点=%s 两路来源均失败，沿用缓存（模型数=%d）", site, len(cached))
 			} else {
 				log.Printf("[Models] 站点=%s 两路来源均失败且无缓存，该站点本次不展示模型", site)
 			}
 		}
+		stampCatalogRates(site, fetched[site], prev[site], time.Now())
 	}
 
 	// 能力信息覆盖情况：只在目录刷新时记录一次，不随 /v1/models 逐次打印，
@@ -1285,10 +1343,11 @@ func refreshModelsOnce(schedule ...time.Time) {
 	}
 	cacheErr := persistModelsLocked(source)
 	modelsMu.Unlock()
+	rateSourcesRevision.Add(1)
 	refreshedAt := time.Now()
 	for _, site := range catalogSites {
 		if models, ok := fetched[site]; ok && len(models) > 0 {
-			logOfficialRates(site, models, refreshedAt)
+			logOfficialRates(site, models, refreshedAt, trace)
 		}
 	}
 	requestModelsProbe()
@@ -1442,19 +1501,32 @@ func modelPriceProbeOnce() {
 			verdict, credit, tokens, detail := probeModelPrice(acc, id)
 			modelsMu.Lock()
 			p := modelProbes[probeKey(site, id)]
+			if p.VerdictAt == 0 && p.Verdict != "" {
+				p.VerdictAt = p.LastProbeAt
+			}
 			p.LastProbeAt = now.Unix()
-			p.Credit, p.Tokens, p.Detail = credit, tokens, detail
 			if verdict != "" {
 				p.Verdict = verdict
+				p.VerdictAt = now.Unix()
+				p.Credit, p.Tokens, p.Detail = credit, tokens, detail
+				p.LastError = ""
+				p.FreeUntil = ""
+				p.Cached = false
+				if verdict == modelCostFree {
+					p.FreeUntil = catalogFreeUntilLocked(site, id, now)
+				}
+			} else {
+				p.LastError = truncate(redactSensitiveText(detail), 400)
 			}
 			modelProbes[probeKey(site, id)] = p
 			cacheErr := persistModelsLocked(dynamicSource)
 			modelsMu.Unlock()
+			rateSourcesRevision.Add(1)
 			if verdict == "" || cacheErr != nil {
 				failed++
 			}
 			log.Printf("[ModelPrice] 站点=%s 账号=%s 模型=%s -> verdict=%s credit=%s tokens=%d (%s)",
-				site, acc.Path, id, p.Verdict, formatQuota(credit), tokens, detail)
+				site, acc.Path, id, verdict, formatQuota(credit), tokens, detail)
 			done++
 		}
 	}
@@ -1566,8 +1638,8 @@ func probeModelPrice(acc *Account, model string) (string, float64, int64, string
 	}
 	usage := readUsageFromSSE(resp.Body)
 	credit, ok := usageCredit(usage)
-	if !ok {
-		return "", 0, 0, "无 usage.credit，不覆盖"
+	if !ok || !validRateCredit(credit) {
+		return "", 0, 0, "无完整回复的有效 usage.credit，不覆盖"
 	}
 	tokens, _ := usageTotalTokens(usage)
 	if credit > 0 {

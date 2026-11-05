@@ -10,6 +10,12 @@
   --ok: #1a9f5c;
   --warn: #c9820a;
   --danger: #d9453b;
+  --json-key: #0b6e99;
+  --json-string: #a33b20;
+  --json-number: #6b46c1;
+  --json-boolean: #0f7b4f;
+  --json-null: #8b5e00;
+  --json-punctuation: #5c6370;
   --radius: 10px;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
@@ -24,6 +30,12 @@
     --border: #2e3038;
     --brand: #35d08a;
     --brand-soft: #16301f;
+    --json-key: #7cc7ff;
+    --json-string: #ffab91;
+    --json-number: #c7a7ff;
+    --json-boolean: #7fe0b0;
+    --json-null: #e6c07a;
+    --json-punctuation: #a5acb8;
   }
 }
 
@@ -36,6 +48,12 @@
   --border: #2e3038;
   --brand: #35d08a;
   --brand-soft: #16301f;
+  --json-key: #7cc7ff;
+  --json-string: #ffab91;
+  --json-number: #c7a7ff;
+  --json-boolean: #7fe0b0;
+  --json-null: #e6c07a;
+  --json-punctuation: #a5acb8;
 }
 
 * { box-sizing: border-box; }
@@ -263,11 +281,30 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .config-warning li + li { margin-top: 8px; }
 .config-warning .actions { margin-top: 16px; }
 .config-sensitive { color: var(--warn); font-size: 12px; margin: 0 0 12px; }
-.config-editor {
-  display: block; width: 100%; min-height: 320px; height: 52vh; margin-top: 8px; padding: 12px;
-  resize: vertical; overflow: auto; tab-size: 2; font-family: var(--mono); font-size: 13px; line-height: 1.6;
-  color: var(--text); background: var(--surface-muted); border: 1px solid var(--border); border-radius: 8px;
+.config-editor-shell { position: relative; margin-top: 8px; }
+.config-editor, .config-editor-highlight {
+  display: block; width: 100%; min-height: 320px; height: 52vh; margin: 0; padding: 12px;
+  tab-size: 2; font-family: var(--mono); font-size: 13px; line-height: 1.6;
+  white-space: pre; overflow-wrap: normal; word-break: normal;
 }
+.config-editor {
+  position: relative; z-index: 1; resize: vertical; overflow: auto;
+  color: transparent; -webkit-text-fill-color: transparent; caret-color: var(--text);
+  background: transparent; border: 1px solid transparent; border-radius: 8px;
+}
+.config-editor::selection { color: transparent; background: rgba(15, 157, 88, .24); }
+.config-editor-highlight {
+  position: absolute; inset: 0; z-index: 0; overflow: auto; pointer-events: none;
+  color: var(--text); background: var(--surface-muted); border: 1px solid var(--border); border-radius: 8px;
+  scrollbar-width: none;
+}
+.config-editor-highlight::-webkit-scrollbar { display: none; }
+.json-key { color: var(--json-key); }
+.json-string { color: var(--json-string); }
+.json-number { color: var(--json-number); }
+.json-boolean { color: var(--json-boolean); }
+.json-null { color: var(--json-null); }
+.json-punctuation { color: var(--json-punctuation); }
 .config-editor:focus-visible, #panel-config button:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
 #configEditorStatus { min-height: 20px; overflow-wrap: anywhere; }
 .config-warning code { overflow-wrap: anywhere; }

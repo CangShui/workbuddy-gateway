@@ -15,7 +15,10 @@ func resetModelsStateT(t *testing.T) {
 	t.Helper()
 	modelsMu.Lock()
 	catalogModels = map[string][]catalogModel{}
+	modelProbes = map[string]modelPriceProbe{}
 	dynamicSource = ""
+	modelRateUsage = map[string]rateUsageObservation{}
+	rateSourcesProblem = ""
 	modelsMu.Unlock()
 }
 
@@ -203,7 +206,7 @@ func TestMergeCatalogsPrefersLiveAndFillsNPM(t *testing.T) {
 		{ID: "hy3", Multiplier: 0.99, HasMultiplier: true}, // 接口已有 → 保留接口值
 		{ID: "legacy-only", Multiplier: 0.5, HasMultiplier: true},
 	}
-	merged := mergeCatalogs(live, npm)
+	merged := mergeCatalogs("cn", live, npm)
 	if len(merged) != 2 {
 		t.Fatalf("expected 2 merged models, got %+v", merged)
 	}
@@ -272,8 +275,8 @@ func TestModelDisplayMultiplierWithProbeVerdict(t *testing.T) {
 	modelsMu.Lock()
 	modelProbes[probeKey("cn", "x")] = modelPriceProbe{Verdict: "paid"}
 	modelsMu.Unlock()
-	if got := modelDisplayMultiplier("cn", "x", "-"); got != "收费(倍率未知)" {
-		t.Fatalf("probed paid should show 收费(倍率未知), got %s", got)
+	if got := modelDisplayMultiplier("cn", "x", "-"); got != "0.29x" {
+		t.Fatalf("paid probe confirms charging but must preserve the known official multiplier, got %s", got)
 	}
 	modelsMu.Lock()
 	modelProbes[probeKey("cn", "x")] = modelPriceProbe{Verdict: "free"}

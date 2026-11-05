@@ -48,7 +48,16 @@ func chdirTemp(t *testing.T) {
 	if err := os.Chdir(dir); err != nil {
 		t.Fatal(err)
 	}
+	modelsMu.Lock()
+	oldRateUsage, oldRateProblem := modelRateUsage, rateSourcesProblem
+	modelRateUsage, rateSourcesProblem = map[string]rateUsageObservation{}, ""
+	modelsMu.Unlock()
+	oldRateRevision := rateSourcesRevision.Swap(0)
 	t.Cleanup(func() {
+		modelsMu.Lock()
+		modelRateUsage, rateSourcesProblem = oldRateUsage, oldRateProblem
+		modelsMu.Unlock()
+		rateSourcesRevision.Store(oldRateRevision)
 		// 必须在同一个清理里先恢复工作目录、再删除，顺序不能颠倒。
 		_ = os.Chdir(old)
 		_ = os.RemoveAll(dir)
@@ -1090,7 +1099,7 @@ func TestUsageCreditAndObserveModelCost(t *testing.T) {
 	log.SetOutput(&logBuf)
 	defer log.SetOutput(oldLogWriter)
 	// 样本过小：credit=0 但 total_tokens 太低，不得判定为免费
-	observeModelCredit(acc, "tiny-model", map[string]any{"credit": float64(0), "total_tokens": float64(2)}, 10)
+	observeModelCredit(nil, acc, "tiny-model", map[string]any{"credit": float64(0), "total_tokens": float64(2)}, 10)
 	accountMu.Lock()
 	tiny := acc.ModelStates["tiny-model"]
 	accountMu.Unlock()
@@ -1099,7 +1108,7 @@ func TestUsageCreditAndObserveModelCost(t *testing.T) {
 	}
 
 	// 样本充足：credit=0 且 total_tokens 达标，判定为免费
-	observeModelCredit(acc, "free-model", map[string]any{"credit": float64(0), "total_tokens": float64(500)}, 1)
+	observeModelCredit(nil, acc, "free-model", map[string]any{"credit": float64(0), "total_tokens": float64(500)}, 1)
 	accountMu.Lock()
 	state := acc.ModelStates["free-model"]
 	accountMu.Unlock()
@@ -1109,7 +1118,7 @@ func TestUsageCreditAndObserveModelCost(t *testing.T) {
 	if text := logBuf.String(); !strings.Contains(text, "[FreeModel]") || !strings.Contains(text, "付费余额耗尽账号 empty.json") {
 		t.Fatalf("missing explicit free model exhausted-account log: %s", text)
 	}
-	observeModelCredit(acc, "paid-model", map[string]any{"credit": 2.5}, 2)
+	observeModelCredit(nil, acc, "paid-model", map[string]any{"credit": 2.5}, 2)
 	accountMu.Lock()
 	paid := acc.ModelStates["paid-model"]
 	accountMu.Unlock()

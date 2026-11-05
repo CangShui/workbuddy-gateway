@@ -71,7 +71,8 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map(),
     state, api, showAlert, hideAlert, togglePolicy, renderAccounts, renderModels, renderStatus, refreshActive,
     renderPoolHealth, renderAccountAlerts, bindAccountAlertTooltip, loadAccountAlerts, lockDashboard,
     saveKey, saveAPISettings, initializeAdmin, discoverSetup,
-    showConfigWarning, loadConfigEditor, saveConfigEditor, exitConfigEdit, setTab, lockDashboard,
+    showConfigWarning, loadConfig, loadConfigEditor, saveConfigEditor, exitConfigEdit, setTab, lockDashboard,
+    jsonHighlightHTML, renderConfigEditorHighlight,
     initListFilters, changeListFilter, reportRestoredListFilters,
     rateCell, rateKey, rateDetailHTML, ensureRateDetails, toggleRateDetail, restoreRateDetails
     , renderStats, loadStats, changeStatsFilter, loadLogs, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
@@ -498,7 +499,7 @@ function configFixture(fetchImpl) {
       if (result) return result;
     }
     if (route.startsWith("/admin/api/config-edit?")) return response(200, {content: configContent, revision: "original-revision"});
-    if (route === "/admin/api/config") return response(200, {exists: true, content: "masked preview"});
+    if (route === "/admin/api/config") return response(200, {exists: true, content: '{\n  "gateway": {"adminKey": "[REDACTED]", "apiPort": 8317},\n  "identity": {"responseRestore": false}\n}'});
     if (route === "/admin/api/settings") return response(200, {apiKeyConfigured: true, apiPort: 8317, webPort: 8316});
     return response(200, {saved: true, adminKeyChanged: false, settings: {}});
   });
@@ -510,6 +511,34 @@ async function openConfigEditor(f) {
   f.review.showConfigWarning();
   await f.review.loadConfigEditor();
 }
+
+test("配置预览和编辑器保留原文并高亮JSON，HTML字符被转义", async () => {
+  const f = configFixture();
+  const page = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
+  assert(page.includes('id="configEditorHighlight"'), "编辑器缺少高亮遮罩层");
+  assert(page.includes('wrap="off"'), "JSON 编辑器应关闭自动换行以保持内容与高亮对齐");
+  const raw = '{\n  "gateway": {"adminKey": "<tag> & \\"quoted\\"", "apiPort": 8317},\n  "enabled": true,\n  "empty": null\n}';
+  const html = f.review.jsonHighlightHTML(raw);
+  assert.match(html, /json-key/);
+  assert.match(html, /json-string/);
+  assert.match(html, /json-number/);
+  assert.match(html, /json-boolean/);
+  assert.match(html, /json-null/);
+  assert(html.includes("&lt;tag&gt; &amp;"), "HTML 字符必须转义");
+  assert(html.includes("&quot;"), "引号必须转义");
+  assert(!html.includes("<tag>"), "高亮不能把配置值拼成 HTML");
+  assert.doesNotThrow(() => f.review.jsonHighlightHTML('{"unterminated": "value'));
+
+  await f.review.loadConfig();
+  assert.match(f.element("configBox").innerHTML, /json-key/);
+  const editor = f.element("configEditor");
+  editor.value = raw;
+  f.review.renderConfigEditorHighlight();
+  assert.match(f.element("configEditorHighlight").innerHTML, /json-key/);
+  assert.match(f.element("configEditorHighlight").innerHTML, /json-number/);
+  assert.equal(editor.value, raw, "高亮不能改动编辑内容");
+  audit("配置JSON高亮通过", {preview: true, editor: true, html_escaped: true});
+});
 
 test("配置编辑先警告，确认后才请求真实原文，审计不含正文", async () => {
   const f = configFixture();
@@ -880,9 +909,10 @@ test("已知倍率用白话解释，未知额外给出如何刷新，原始日�
   assert.match(unknown, /请求一次这个模型/);
   assert.match(unknown, /其他记录/);
   assert.match(unknown, /官方促销已于 2026-09-08 结束/);
-  const missing = f.review.rateDetailHTML({rates: {}, noLogHint: "普通日志中没有该模型的记录。用该站点的账号请求一次这个模型，就会产生新的倍率记录。"}, "intl", "not-logged-model");
-  assert.match(missing, /没有日志/);
-  assert.match(missing, /请求一次这个模型/);
+  const missing = f.review.rateDetailHTML({rates: {}, noLogHint: "尚未找到目录或有效实测来源，不能据此判断模型没有被调用。"}, "intl", "not-logged-model");
+  assert.match(missing, /暂未找到倍率来源/);
+  assert.match(missing, /不能据此判断/);
+  assert(!missing.includes("就会产生"));
   assert(!missing.includes("来源："));
   audit("倍率白话解释与刷新指引通过");
 });
@@ -903,7 +933,7 @@ test("点击感叹号按需拉取日志详情并复用缓存，失败不伪造�
   f.review.toggleRateDetail({target: second.button});
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(f.calls.filter(c => c.route === "/admin/api/rate-detail").length, 1);
-  assert.match(second.panel.innerHTML, /没有日志/);
+  assert.match(second.panel.innerHTML, /暂未找到倍率来源/);
   // 再次点击折叠，并清除展开状态。
   f.review.toggleRateDetail({target: first.button});
   assert.equal(first.button.getAttribute("aria-expanded"), "false");
@@ -963,6 +993,79 @@ test("展开原始日志后，轮询刷新不会把它自动折叠", async () =>
   assert.equal(f.review.state.openRawLogs["cn|hy3"], undefined);
   assert(!/<details class='rate-raw' open>/.test(f.review.rateDetailHTML(payload, "cn", "hy3")));
   audit("原始日志展开状态在轮询后保持通过");
+});
+
+test("倍率来源独立于普通日志，展示冲突、目录刷新和有效实测而不谎报没有日志", () => {
+  const f = rateFixture({rates: {}});
+  const html = f.review.rateDetailHTML({
+    truncated: true,
+    rates: {"intl|deepseek-v4.1-flash": {
+      hasSource: true, hasLog: false, source: "正常请求实测", value: "收费(倍率未知)",
+      updatedAt: 1793860000, checkedAt: 1793859000, changedAt: 1793850000,
+      explain: "有效实测已扣费；目录仍标免费，存在冲突", unknown: true, conflict: true,
+      catalog: {model: "deepseek-v4.1-flash-sg", credits: "x0.00"},
+      observation: {updatedAt: 1793860000, class: "paid", credit: 1.25},
+      records: [],
+    }},
+  }, "intl", "deepseek-v4.1-flash-sg");
+  assert.match(html, /当前倍率：收费\(倍率未知\)/);
+  assert.match(html, /存在冲突/);
+  assert.match(html, /目录最近成功读取/);
+  assert.match(html, /价格规则最近变化/);
+  assert.match(html, /usage.credit=1.25/);
+  assert.match(html, /原始日志未在本次扫描窗口内找到/);
+  assert(!html.includes("没有日志"));
+  assert.equal(f.review.rateKey("intl", "DeepSeek-V4.1-Flash-SG"), "intl|deepseek-v4.1-flash");
+  const missing = f.review.rateDetailHTML({rates: {}, truncated: true}, "cn", "m");
+  assert.match(missing, /未覆盖全部记录/);
+  assert(!missing.includes("请求一次"));
+  const failure = f.review.rateDetailHTML({
+    rates: {}, logProblem: "原始普通日志暂不可读",
+  }, "cn", "m");
+  assert.match(failure, /暂不可读/);
+  audit("倍率持久来源、国际别名和扫描范围说明通过");
+});
+
+test("倍率来源版本改变立即失效缓存，同版本复用", async () => {
+  const payload = {revision: 1, rates: {"cn|hy3": {hasSource: true, source: "目录",
+    value: "0.11x", updatedAt: 1793860000, records: []}}};
+  const f = rateFixture(payload);
+  const row = {id: "hy3", cnMultiplier: "0.11x", intlMultiplier: "-", enabled: true};
+  f.review.renderModels({models: [row], rateRevision: 1});
+  await f.review.ensureRateDetails();
+  assert.equal(f.review.state.rateDetails, payload);
+  f.review.renderModels({models: [row], rateRevision: 1});
+  assert.equal(f.review.state.rateDetails, payload);
+  f.review.renderModels({models: [row], rateRevision: 2});
+  assert.equal(f.review.state.rateDetails, null);
+  audit("倍率版本更新不受原有60秒缓存限制");
+});
+
+test("倍率刷新进行中切换版本，旧结果不写入新缓存，已展开内容刷新时不闪回加载提示", async () => {
+  let release;
+  const f = fixture(async (route) => {
+    if (route === "/admin/api/client-events") return response(204, {});
+    if (route === "/admin/api/rate-detail") return new Promise(resolve => { release = resolve; });
+    return response(200, {});
+  });
+  f.review.state.apiKey = "synthetic-admin-key";
+  f.review.state.rateRevision = "1:0";
+  const pending = f.review.ensureRateDetails();
+  f.review.state.rateRevision = "2:0";
+  release(response(200, {revision: "1:0", rates: {}}));
+  await pending;
+  assert.equal(f.review.state.rateDetails, null);
+  const g = rateFixture({rates: {"cn|hy3": {hasSource: true, value: "0.29x",
+    source: "官方目录", updatedAt: 1793860000, records: []}}});
+  const {button, panel} = fakeRateButton("cn", "hy3");
+  panel.innerHTML = "previous evidence";
+  button.setAttribute("aria-expanded", "true");
+  g.review.state.openRateKeys["cn|hy3"] = true;
+  g.review.restoreRateDetails({querySelectorAll: () => [button]}, true);
+  assert.equal(panel.innerHTML, "previous evidence");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(panel.innerHTML, /当前倍率：0.29x/);
+  audit("倍率在途版本隔离与无闪烁更新通过");
 });
 
 // ---- 总览 · 用量与性能 ------------------------------------------------------

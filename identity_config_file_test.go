@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -23,6 +24,9 @@ func TestEnsureRuntimeConfigFileCreatesCompleteDefault(t *testing.T) {
 	if c.Identity.Enabled == nil || !*c.Identity.Enabled || c.Identity.Target != "WorkBuddy" {
 		t.Fatalf("default identity=%#v", c.Identity)
 	}
+	if c.Identity.ResponseRestore == nil || *c.Identity.ResponseRestore {
+		t.Fatalf("new config must explicitly disable experimental response restore: %#v", c.Identity.ResponseRestore)
+	}
 	for _, term := range []string{"Claude Code", "Claude", "DeepSeek Harness", "Codex", "ZCode", "Grok Build", "Grok", "Grok released by xAI"} {
 		if c.Identity.Replacements[term] != "WorkBuddy" {
 			t.Fatalf("default replacement %q=%q", term, c.Identity.Replacements[term])
@@ -33,6 +37,72 @@ func TestEnsureRuntimeConfigFileCreatesCompleteDefault(t *testing.T) {
 	}
 	if c.Identity.Replacements["are paths the user"] != "are paths that the user" {
 		t.Fatalf("default paths replacement=%q", c.Identity.Replacements["are paths the user"])
+	}
+}
+
+func TestUpgradeAddsDisabledResponseRestore(t *testing.T) {
+	complete := defaultIdentityConfig()
+	complete.ResponseRestore = nil
+	completeJSON, err := json.Marshal(complete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		identity string
+		want     bool
+	}{
+		{"missing_section", "", false},
+		{"null_section", "null", false},
+		{"empty_section", "{}", false},
+		{"disabled_identity", `{"enabled":false,"target":"Assistant","replacements":{"Custom":"Assistant"}}`, false},
+		{"complete_old_rules", string(completeJSON), false},
+		{"explicit_false", `{"responseRestore":false}`, false},
+		{"explicit_true", `{"responseRestore":true}`, true},
+		{"case_insensitive", `{"ResponseRestore":true}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			doc := map[string]json.RawMessage{
+				"systemPrompt": json.RawMessage(`{"force":"keep"}`),
+				"concurrent":   json.RawMessage(`{"MaxAcc":7,"MaxGlobal":12}`),
+			}
+			if tc.identity != "" {
+				doc["identity"] = json.RawMessage(tc.identity)
+			}
+			raw, _ := json.Marshal(doc)
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := ensureRuntimeConfigFile(path); err != nil {
+				t.Fatal(err)
+			}
+			first, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var c runtimeFileConfig
+			if err := json.Unmarshal(first, &c); err != nil {
+				t.Fatal(err)
+			}
+			if c.Identity.ResponseRestore == nil || *c.Identity.ResponseRestore != tc.want {
+				t.Fatalf("responseRestore=%v want explicit %t", c.Identity.ResponseRestore, tc.want)
+			}
+			if c.SystemPrompt.Force != "keep" || c.Concurrent.MaxAcc != 7 || c.Concurrent.MaxGlobal != 12 {
+				t.Fatalf("unrelated configuration changed: %s", first)
+			}
+			if tc.name == "disabled_identity" && (c.Identity.Enabled == nil || *c.Identity.Enabled ||
+				c.Identity.Target != "Assistant" || c.Identity.Replacements["Custom"] != "Assistant") {
+				t.Fatalf("custom identity changed: %s", first)
+			}
+			if err := ensureRuntimeConfigFile(path); err != nil {
+				t.Fatal(err)
+			}
+			second, _ := os.ReadFile(path)
+			if !bytes.Equal(first, second) {
+				t.Fatalf("second startup changed config:\n%s\n%s", first, second)
+			}
+		})
 	}
 }
 

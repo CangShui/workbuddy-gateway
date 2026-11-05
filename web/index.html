@@ -244,7 +244,10 @@
       <div id="configEditorPanel" class="hidden">
         <p class="config-sensitive">编辑中 · 包含真实 Key，仅保留在当前页面内存中。离开配置页或退出编辑会清除原文。</p>
         <label for="configEditor" class="hint">完整配置 JSON</label>
-        <textarea id="configEditor" class="config-editor" spellcheck="false" autocomplete="off" autocapitalize="off" aria-describedby="configEditorStatus"></textarea>
+        <div class="config-editor-shell">
+          <pre id="configEditorHighlight" class="config-editor-highlight" aria-hidden="true"></pre>
+          <textarea id="configEditor" class="config-editor" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" aria-describedby="configEditorStatus"></textarea>
+        </div>
         <p id="configEditorStatus" class="hint action-result" role="status" aria-live="polite"></p>
         <div class="actions">
           <button id="saveConfig" type="button">校验并保存</button>

@@ -31,6 +31,7 @@ func TestParseRateLineCoversEveryLoggedSource(t *testing.T) {
 		unknown   bool
 		priority  int
 		sourceHas string
+		observed  string
 	}{
 		{
 			name: "官方倍率-促销已过期",
@@ -49,6 +50,7 @@ func TestParseRateLineCoversEveryLoggedSource(t *testing.T) {
 			line: prefix + `[ModelPrice] 载入缓存结论 站点=intl 模型=hy4-preview 判定=paid credit=0.05 tokens=385 探测时间=2026-10-02T00:23:40 说明=usage.credit>0 收费 来源=缓存文件（非本轮新探测）`,
 			site: "intl", model: "hy4-preview", value: "收费(倍率未知)", unknown: true,
 			priority: ratePriorityProbePaid, sourceHas: "缓存结论",
+			observed: "2026-10-02T00:23:40",
 		},
 		{
 			name: "探测实测-免费",
@@ -82,7 +84,11 @@ func TestParseRateLineCoversEveryLoggedSource(t *testing.T) {
 			if !strings.Contains(record.Source, tc.sourceHas) {
 				t.Fatalf("来源=%q 期望包含 %q", record.Source, tc.sourceHas)
 			}
-			if record.UpdatedAt != time.Date(2026, 10, 13, 10, 59, 36, 0, time.Local).Unix() {
+			wantAt := time.Date(2026, 10, 13, 10, 59, 36, 0, time.Local)
+			if tc.observed != "" {
+				wantAt, _ = time.ParseInLocation("2006-01-02T15:04:05", tc.observed, time.Local)
+			}
+			if record.UpdatedAt != wantAt.Unix() {
 				t.Fatalf("时间解析错误: %d", record.UpdatedAt)
 			}
 			if record.LogLine == "" || record.LogFile != "gateway-2026-10-13.log" {
@@ -156,6 +162,14 @@ func TestRateDetailEndpointReadsLogsAndReportsMissingLog(t *testing.T) {
 	if err := os.WriteFile(path, []byte(lines), 0600); err != nil {
 		t.Fatal(err)
 	}
+	modelsMu.Lock()
+	catalogModels = map[string][]catalogModel{
+		"cn": {{ID: "hy3", HasMultiplier: true, Multiplier: 0.29, FromLive: true}},
+	}
+	modelProbes = map[string]modelPriceProbe{
+		probeKey("intl", "hy4-preview"): {Verdict: "paid"},
+	}
+	modelsMu.Unlock()
 	for _, key := range []string{"", "feature-api-key"} {
 		if w := adminRequest(handler, "GET", "/admin/api/rate-detail", key, ""); w.Code != http.StatusUnauthorized {
 			t.Fatal("倍率来源接口绕过管理鉴权")
@@ -189,8 +203,8 @@ func TestRateDetailEndpointReadsLogsAndReportsMissingLog(t *testing.T) {
 	if _, exists := payload.Rates["cn|not-in-log"]; exists {
 		t.Fatal("没有日志的模型不应出现在结果里")
 	}
-	if !strings.Contains(payload.Note, "没有日志") {
-		t.Fatal("接口应说明没有日志时的展示方式")
+	if !strings.Contains(payload.Note, "共用倍率决策") {
+		t.Fatal("接口应说明数值与详情共用倍率决策")
 	}
 	var hints struct {
 		RefreshHint     string `json:"refreshHint"`
@@ -201,8 +215,8 @@ func TestRateDetailEndpointReadsLogsAndReportsMissingLog(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &hints); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(hints.RefreshHint, "请求一次") || !strings.Contains(hints.NoLogHint, "请求一次") {
-		t.Fatalf("未知与无日志都必须给出可执行的刷新方式: %+v", hints)
+	if !strings.Contains(hints.RefreshHint, "有效") || strings.Contains(hints.NoLogHint, "就会产生") {
+		t.Fatalf("不能承诺请求一次必定产生倍率日志: %+v", hints)
 	}
 	var detailed struct {
 		Rates map[string]map[string]any `json:"rates"`
@@ -222,8 +236,8 @@ func TestRateDetailEndpointReadsLogsAndReportsMissingLog(t *testing.T) {
 		t.Fatal("短时间内应命中缓存，避免每次点击都重扫日志")
 	}
 	resetRateDetailCache(t)
-	if w := adminRequest(handler, "GET", "/admin/api/rate-detail", "feature-admin-key", ""); !strings.Contains(w.Body.String(), "0.50x") {
-		t.Fatal("缓存过期后必须读取最新日志")
+	if w := adminRequest(handler, "GET", "/admin/api/rate-detail", "feature-admin-key", ""); !strings.Contains(w.Body.String(), "0.50x") || !strings.Contains(w.Body.String(), `"value":"0.29x"`) {
+		t.Fatal("缓存过期读取最新原始日志，但历史日志不能覆盖当前目录倍率")
 	}
 }
 
@@ -331,9 +345,10 @@ func TestAggregateRateDetailsDeduplicatesAndCapsOtherRecords(t *testing.T) {
 	}
 }
 
-func TestRateRefreshHintFollowsLoggedProbeSwitch(t *testing.T) {
+func TestRateRefreshHintFollowsCurrentProbeSwitch(t *testing.T) {
 	isolateAdminFeatures(t)
 	resetRateDetailCache(t)
+	cfg.AllowPriceProbes, cfg.DisablePriceProbes = true, false
 	handler := newWebUIHandler()
 	path := filepath.Join(logDir, "gateway-2026-10-13.log")
 	content := strings.Join([]string{
@@ -353,7 +368,7 @@ func TestRateRefreshHintFollowsLoggedProbeSwitch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !payload.AutoProbeKnown || !payload.AutoProbeEnabled {
-		t.Fatalf("探测开关状态应取自普通日志: %+v", payload)
+		t.Fatalf("探测开关状态应与当前服务一致: %+v", payload)
 	}
 	if !strings.Contains(payload.RefreshHint, "自动复测") {
 		t.Fatalf("探测已开启时应说明会自动复测: %q", payload.RefreshHint)
@@ -372,7 +387,7 @@ func TestRateLogLinesStayInNormalLogNotDebug(t *testing.T) {
 	if err := switchDebugLogging(false); err != nil {
 		t.Fatal(err)
 	}
-	logOfficialRates("cn", []catalogModel{{ID: "hy3", Credits: "x0.29", HasMultiplier: true, Multiplier: 0.29, FromLive: true}}, time.Now())
+	logOfficialRates("cn", []catalogModel{{ID: "hy3", Credits: "x0.29", HasMultiplier: true, Multiplier: 0.29, FromLive: true}}, time.Now(), "rate-log-test")
 	if !strings.Contains(audit.String(), "[Models] 官方倍率 站点=cn 模型=hy3") {
 		t.Fatal("官方倍率必须写入普通日志")
 	}
@@ -381,7 +396,7 @@ func TestRateLogLinesStayInNormalLogNotDebug(t *testing.T) {
 	}
 	// 同一签名不重复记录，避免每小时刷屏。
 	before := strings.Count(audit.String(), "[Models] 官方倍率 站点=cn 模型=hy3")
-	logOfficialRates("cn", []catalogModel{{ID: "hy3", Credits: "x0.29", HasMultiplier: true, Multiplier: 0.29, FromLive: true}}, time.Now())
+	logOfficialRates("cn", []catalogModel{{ID: "hy3", Credits: "x0.29", HasMultiplier: true, Multiplier: 0.29, FromLive: true}}, time.Now(), "rate-log-test")
 	if after := strings.Count(audit.String(), "[Models] 官方倍率 站点=cn 模型=hy3"); after != before {
 		t.Fatal("倍率未变化时不应重复写日志")
 	}

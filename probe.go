@@ -267,16 +267,16 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 	usage := readUsageFromSSE(resp.Body)
 	credit, hasCredit := usageCredit(usage)
 	tokens, _ := usageTotalTokens(usage)
-	if !hasCredit {
+	if !hasCredit || !validRateCredit(credit) {
 		result.Status = "unknown"
-		result.Detail = "上游未返回 usage.credit，无法判定"
+		result.Detail = "上游未返回有效 usage.credit，无法判定"
 		return result
 	}
 	result.Credit = credit
 	result.Tokens = tokens
 
 	if credit > 0 {
-		observeModelCredit(acc, model, usage, 0)
+		observeModelCredit(req, acc, model, usage, 0)
 		result.Status = "paid"
 		result.Detail = fmt.Sprintf("usage.credit=%s，收费", formatQuota(credit))
 		return result
@@ -286,7 +286,7 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 		result.Detail = fmt.Sprintf("credit=0 但样本过小（total_tokens=%d < %d），不判定免费", tokens, modelFreeMinTokens)
 		return result
 	}
-	observeModelCredit(acc, model, usage, 0)
+	observeModelCredit(req, acc, model, usage, 0)
 	result.Status = "free"
 	result.Detail = fmt.Sprintf("usage.credit=0，total_tokens=%d，免费", tokens)
 	return result
@@ -295,12 +295,16 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 // readUsageFromSSE 从上游 SSE 流中读取最后一个 usage 对象。
 func readUsageFromSSE(r io.Reader) map[string]any {
 	var usage map[string]any
+	finish := ""
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		data := stripDataPrefix(scanner.Text())
-		if data == "" || data == "[DONE]" {
+		if data == "" {
 			continue
+		}
+		if data == "[DONE]" {
+			break
 		}
 		var chunk map[string]any
 		if json.Unmarshal([]byte(data), &chunk) != nil {
@@ -309,6 +313,10 @@ func readUsageFromSSE(r io.Reader) map[string]any {
 		if u, ok := chunk["usage"].(map[string]any); ok {
 			usage = u
 		}
+		finish = noteFinishReason(finish, chunk)
+	}
+	if scanner.Err() != nil || finish == "" {
+		return nil
 	}
 	return usage
 }

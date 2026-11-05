@@ -37,6 +37,7 @@
     rateDetails: null,
     rateDetailsAt: 0,
     rateDetailsPending: null,
+    rateRevision: null,
     openRateKeys: {},
     openRawLogs: {},
     statsPending: false,
@@ -214,6 +215,7 @@
     state.rateDetails = null;
     state.rateDetailsAt = 0;
     state.rateDetailsPending = null;
+    state.rateRevision = null;
     state.openRateKeys = {};
     state.openRawLogs = {};
     state.statsVersion++;
@@ -1538,6 +1540,12 @@
   }
 
   function renderModels(data) {
+    var rateChanged = data.rateRevision !== undefined && state.rateRevision !== data.rateRevision;
+    if (rateChanged) {
+      state.rateRevision = data.rateRevision;
+      state.rateDetails = null;
+      state.rateDetailsAt = 0;
+    }
     state.lastModels = data;
     var list = data.models || [];
     var onlyUsable = $("onlyUsable").checked;
@@ -1570,13 +1578,15 @@
     }).join("");
     updateTableBody(tb, html);
     restorePolicyFocus(tb, focusTarget);
-    restoreRateDetails(tb);
+    restoreRateDetails(tb, rateChanged);
     if (data.stale) showAlert("模型统计快照过旧，当前展示的是上次数据。", false, "/admin/api/models");
   }
 
-  // ---- 倍率来源：全部取自普通日志，没有记录就显示「没有日志」 -------------------
+  // ---- 倍率来源：数值共用后端决策，原始日志只是可追溯证据 -----------------------
   function rateKey(site, model) {
-    return site + "|" + String(model || "").trim().toLowerCase();
+    var id = String(model || "").trim().toLowerCase();
+    if (site === "intl" && id.endsWith("-sg")) id = id.slice(0, -3);
+    return site + "|" + id;
   }
 
   function rateCell(site, model, text) {
@@ -1591,9 +1601,12 @@
   function ensureRateDetails() {
     if (state.rateDetails && Date.now() - state.rateDetailsAt < 60000) return Promise.resolve(state.rateDetails);
     if (state.rateDetailsPending) return state.rateDetailsPending;
+    var requestedRevision = state.rateRevision;
     state.rateDetailsPending = api("/admin/api/rate-detail").then(function (data) {
-      state.rateDetails = data;
-      state.rateDetailsAt = Date.now();
+      if (requestedRevision === state.rateRevision) {
+        state.rateDetails = data;
+        state.rateDetailsAt = Date.now();
+      }
       state.rateDetailsPending = null;
       return data;
     }).catch(function (err) {
@@ -1605,15 +1618,46 @@
 
   function rateDetailHTML(payload, site, model) {
     var info = payload && payload.rates ? payload.rates[rateKey(site, model)] : null;
-    if (!info || !info.hasLog) {
-      return "<p class='rate-none'>没有日志</p><p class='hint'>" +
-        esc(payload && payload.noLogHint || "普通日志中没有该模型的倍率记录。") + "</p>";
+    if (!info || (!info.hasSource && !info.hasLog)) {
+      var missingHint = payload && payload.truncated ?
+        "本次原始日志扫描未覆盖全部记录，暂未找到该模型的来源；这不代表模型没有被调用。" :
+        (payload && payload.noLogHint || "尚无该模型的目录或有效实测来源，不能推断倍率。");
+      if (payload && payload.logProblem) missingHint = payload.logProblem;
+      return "<p class='rate-none'>暂未找到倍率来源</p><p class='hint'>" + esc(missingHint) + "</p>";
     }
     // 不再标注「状态：未知」：该结论是实测过的，写「未知」会让人误以为从未检测。
     var meta = "<div class='rate-meta'><span>来源：" + esc(info.source) + "</span>" +
       "<span>更新时间：" + esc(fmtTime(info.updatedAt)) + "</span></div>";
     var html = meta;
+    if (info.value) html += "<p class='rate-current'>当前倍率：" + esc(info.value) + "</p>";
     if (info.explain) html += "<p class='rate-explain'>" + esc(info.explain) + "</p>";
+    if (info.checkedAt) html += "<p class='hint'>目录最近成功读取：" + esc(fmtTime(info.checkedAt)) + "</p>";
+    if (info.changedAt) html += "<p class='hint'>价格规则最近变化：" + esc(fmtTime(info.changedAt)) + "</p>";
+    if (info.catalog) {
+      html += "<p class='hint'>目录模型：" + esc(info.catalog.model || model) +
+        "；原始 credits：" + esc(info.catalog.credits || "未提供") + "</p>";
+      if (info.catalog.promoUntil) html += "<p class='hint'>促销截止：" + esc(info.catalog.promoUntil) + "</p>";
+    }
+    if (info.observation) {
+      html += "<p class='hint'>最近实测：" + esc(fmtTime(info.observation.updatedAt)) +
+        "；" + esc(info.observation.class === "free" ? "免费" : "收费") +
+        (info.observation.credit != null ? "；usage.credit=" + esc(String(info.observation.credit)) : "；旧账本未保存具体积分") + "</p>";
+      if (info.observation.freeUntil) html += "<p class='hint'>该免费样本关联的促销截止：" +
+        esc(info.observation.freeUntil) + "；过期后不能继续当作当前免费依据。</p>";
+    }
+    if (info.probe) {
+      html += "<p class='hint'>最近有效探测：" + esc(fmtTime(info.probe.updatedAt)) +
+        "；" + esc(info.probe.verdict || "无结论") + "</p>";
+      if (info.probe.lastError) html += "<p class='hint'>最近探测未成功：" + esc(info.probe.lastError) +
+        "；失败不会更新上次有效结论的时间。</p>";
+    }
+    if (payload && payload.sourceProblem) html += "<p class='hint'>" + esc(payload.sourceProblem) + "</p>";
+    if (payload && payload.logProblem) html += "<p class='hint'>" + esc(payload.logProblem) + "</p>";
+    else if (info.hasSource && !info.hasLog) {
+      html += "<p class='hint'>" + (payload && payload.truncated ?
+        "当前来源已保存；原始日志未在本次扫描窗口内找到，不影响倍率结论。" :
+        "当前来源已保存；原始普通日志暂未找到或已按保留策略清理，不影响倍率结论。") + "</p>";
+    }
     if (info.unknown && info.refreshHint) {
       html += "<p class='rate-refresh'><strong>如何刷新：</strong>" + esc(info.refreshHint) + "</p>";
     }
@@ -1642,8 +1686,18 @@
     var model = button.getAttribute("data-rate-model");
     panel.classList.remove("hidden");
     button.setAttribute("aria-expanded", "true");
-    panel.innerHTML = "<p class='hint'>读取日志中…</p>";
+    if (!panel.innerHTML) panel.innerHTML = "<p class='hint'>读取倍率来源中…</p>";
+    var requestedRevision = state.rateRevision;
     ensureRateDetails().then(function (payload) {
+      if (!state.openRateKeys[rateKey(site, model)]) return;
+      if (requestedRevision !== state.rateRevision) {
+        fillRateDetail(button, panel);
+        return;
+      }
+      var info = payload && payload.rates && payload.rates[rateKey(site, model)];
+      var cell = button.closest("td");
+      var valueElement = cell && cell.querySelector(".rate-value");
+      if (info && valueElement && info.value) valueElement.textContent = info.value;
       panel.innerHTML = rateDetailHTML(payload, site, model);
       // details 的 toggle 事件不冒泡，只能在渲染后逐个绑定，用于记住展开状态。
       var details = panel.querySelector("details.rate-raw");
@@ -1681,13 +1735,13 @@
   }
 
   // Replaced cells restore their details; unchanged expanded cells stay intact.
-  function restoreRateDetails(table) {
+  function restoreRateDetails(table, force) {
     Array.prototype.forEach.call(table.querySelectorAll("button.rate-info"), function (button) {
       var key = rateKey(button.getAttribute("data-rate-site"), button.getAttribute("data-rate-model"));
       if (!state.openRateKeys[key]) return;
       var cell = button.closest("td");
       var panel = cell ? cell.querySelector(".rate-detail") : null;
-      if (panel && (button.getAttribute("aria-expanded") !== "true" || panel.classList.contains("hidden"))) {
+      if (panel && (force || button.getAttribute("aria-expanded") !== "true" || panel.classList.contains("hidden"))) {
         fillRateDetail(button, panel);
       }
     });
@@ -1719,13 +1773,126 @@
   }
 
   // ---- 渲染：配置 --------------------------------------------------------
+  function jsonLiteralBoundary(text, end) {
+    if (end >= text.length) return true;
+    return !/[A-Za-z0-9_$]/.test(text.charAt(end));
+  }
+
+  function jsonNumberLength(text, start) {
+    var i = start, length = text.length;
+    if (text.charAt(i) === "-") i++;
+    if (i >= length) return 0;
+    if (text.charAt(i) === "0") {
+      i++;
+    } else if (text.charAt(i) >= "1" && text.charAt(i) <= "9") {
+      while (i < length && text.charAt(i) >= "0" && text.charAt(i) <= "9") i++;
+    } else {
+      return 0;
+    }
+    if (text.charAt(i) === ".") {
+      i++;
+      if (text.charAt(i) < "0" || text.charAt(i) > "9") return 0;
+      while (i < length && text.charAt(i) >= "0" && text.charAt(i) <= "9") i++;
+    }
+    if (text.charAt(i) === "e" || text.charAt(i) === "E") {
+      i++;
+      if (text.charAt(i) === "+" || text.charAt(i) === "-") i++;
+      if (text.charAt(i) < "0" || text.charAt(i) > "9") return 0;
+      while (i < length && text.charAt(i) >= "0" && text.charAt(i) <= "9") i++;
+    }
+    return i - start;
+  }
+
+  function jsonHighlightHTML(text) {
+    var source = String(text === undefined || text === null ? "" : text);
+    var out = [], plain = "", i = 0;
+    function flush() {
+      if (plain) {
+        out.push(esc(plain));
+        plain = "";
+      }
+    }
+    function token(className, value) {
+      flush();
+      out.push('<span class="json-' + className + '">' + esc(value) + "</span>");
+    }
+    while (i < source.length) {
+      var ch = source.charAt(i);
+      if (ch === '"') {
+        var start = i++;
+        while (i < source.length) {
+          if (source.charAt(i) === "\\") {
+            i += 2;
+            continue;
+          }
+          if (source.charAt(i) === '"') {
+            i++;
+            break;
+          }
+          i++;
+        }
+        var value = source.slice(start, i);
+        var next = i;
+        while (next < source.length && /\s/.test(source.charAt(next))) next++;
+        token(source.charAt(next) === ":" ? "key" : "string", value);
+        continue;
+      }
+      if (ch === "-" || (ch >= "0" && ch <= "9")) {
+        var numberLength = jsonNumberLength(source, i);
+        if (numberLength > 0) {
+          token("number", source.slice(i, i + numberLength));
+          i += numberLength;
+          continue;
+        }
+      }
+      if (source.slice(i, i + 4) === "true" && jsonLiteralBoundary(source, i + 4)) {
+        token("boolean", "true");
+        i += 4;
+        continue;
+      }
+      if (source.slice(i, i + 5) === "false" && jsonLiteralBoundary(source, i + 5)) {
+        token("boolean", "false");
+        i += 5;
+        continue;
+      }
+      if (source.slice(i, i + 4) === "null" && jsonLiteralBoundary(source, i + 4)) {
+        token("null", "null");
+        i += 4;
+        continue;
+      }
+      if ("{}[]:,".indexOf(ch) >= 0) {
+        token("punctuation", ch);
+        i++;
+        continue;
+      }
+      plain += ch;
+      i++;
+    }
+    flush();
+    return out.join("");
+  }
+
+  function syncConfigEditorHighlight() {
+    var area = $("configEditor"), layer = $("configEditorHighlight");
+    if (!area || !layer) return;
+    layer.scrollTop = area.scrollTop;
+    layer.scrollLeft = area.scrollLeft;
+  }
+
+  function renderConfigEditorHighlight() {
+    var area = $("configEditor"), layer = $("configEditorHighlight");
+    if (!area || !layer) return;
+    layer.innerHTML = jsonHighlightHTML(area.value);
+    syncConfigEditorHighlight();
+  }
+
   function loadConfig() {
     var version = ++state.configPreviewVersion;
     return api("/admin/api/config").then(function (data) {
       if (version !== state.configPreviewVersion) return;
       var box = $("configBox");
       if (!data.exists) { box.textContent = "未找到 " + (data.path || "config.json"); return; }
-      box.textContent = data.content;
+      box.innerHTML = jsonHighlightHTML(data.content);
     }).catch(function () {
       // 保留上次内容。
     });
@@ -1750,6 +1917,7 @@
     state.configRevision = "";
     state.configOriginal = "";
     $("configEditor").value = "";
+    $("configEditorHighlight").innerHTML = "";
     $("configEditorStatus").textContent = "";
     $("configWarning").classList.add("hidden");
     $("configEditorPanel").classList.add("hidden");
@@ -1795,6 +1963,9 @@
       state.configOriginal = data.content;
       state.configMode = "edit";
       $("configEditor").value = data.content;
+      $("configEditor").scrollTop = 0;
+      $("configEditor").scrollLeft = 0;
+      renderConfigEditorHighlight();
       $("configWarning").classList.add("hidden");
       $("configBox").classList.add("hidden");
       $("configEditorPanel").classList.remove("hidden");
@@ -1810,7 +1981,14 @@
     }).then(function () {
       if (version !== state.configVersion) return;
       setConfigBusy(false);
-      if (state.configMode === "edit") $("configEditor").focus();
+      if (state.configMode === "edit") {
+        var area = $("configEditor");
+        area.focus();
+        if (area.setSelectionRange) area.setSelectionRange(0, 0);
+        area.scrollTop = 0;
+        area.scrollLeft = 0;
+        renderConfigEditorHighlight();
+      }
     });
   }
 
@@ -2182,8 +2360,10 @@
     $("reloadConfigEditor").addEventListener("click", loadConfigEditor);
     $("saveConfig").addEventListener("click", saveConfigEditor);
     $("configEditor").addEventListener("input", function () {
+      renderConfigEditorHighlight();
       $("configEditorStatus").textContent = configDirty() ? "有未保存的修改。离开配置页会提示确认；不会自动保存。" : "内容未修改。";
     });
+    $("configEditor").addEventListener("scroll", syncConfigEditorHighlight);
     window.addEventListener("beforeunload", function (event) {
       if (!configDirty() && !state.configPending) return;
       event.preventDefault();

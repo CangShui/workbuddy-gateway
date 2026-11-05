@@ -158,7 +158,7 @@ func TestDefaultDisabledPriceProbeStillLearnsFromNormalRequests(t *testing.T) {
 		{"learn-free", map[string]any{"credit": 0, "total_tokens": 100}, modelCostFree},
 		{"learn-paid", map[string]any{"credit": 1.5, "total_tokens": 10}, modelCostPaid},
 	} {
-		observeModelCredit(acc, tc.model, tc.usage, 1)
+		observeModelCredit(nil, acc, tc.model, tc.usage, 1)
 		accountMu.Lock()
 		state := acc.ModelStates[tc.model]
 		accountMu.Unlock()
