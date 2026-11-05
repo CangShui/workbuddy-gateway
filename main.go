@@ -3747,6 +3747,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	isStream, _ := reqObj["stream"].(bool)
 	debugSetModelAndStream(r, modelName, isStream)
 	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
+	// 身份还原只读取入站原始请求；出站请求体与入站替换保持原样。
+	planIdentityRestore(r, reqObj)
 	prepareConversationContext(r, reqObj)
 
 	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
@@ -3844,6 +3846,9 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 		finishReason := ""
 		sawDone := false
 		commentLines, metadataLines := 0, 0
+		// 每个通道的还原缓存都属于本次尝试；重放时从干净状态重新累积。
+		restorePlan := identityRestoreFor(r)
+		restorers := map[chatRestoreKey]*identityRestorer{}
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
@@ -3879,11 +3884,16 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 				}
 				finishReason = noteFinishReason(finishReason, chunk)
 			}
-			if cleanedChunk := cleanChunkJSON(cleanData); cleanedChunk != "" {
-				guard.writeData(cleanedChunk)
+			if cleanedChunk := cleanChunkObject(cleanData, restorePlan, restorers); cleanedChunk != "" {
+				writeRestoredChatChunk(guard, cleanedChunk, chunk, restorers)
 			}
 		}
 		scanErr := scanner.Err()
+		// 只有确认上游正常完成时才补发剩余尾部；中断或缺少 finish_reason
+		// 时保持残缺语义，不能把尾部伪造成完整回复。
+		if scanErr == nil && finishReason != "" {
+			flushAllChatRestorers(guard, restorers)
+		}
 		if commentLines > 0 || metadataLines > 0 {
 			debugEvent(r, "debug", "stream_sse_framing_checked", map[string]any{
 				"comment_lines": commentLines, "metadata_lines": metadataLines,
@@ -3988,6 +3998,7 @@ func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
 		return
 	}
+	completionJSON = restoreChatCompletionIdentity(r, completionJSON)
 	usage := usageFromCompletion(completionJSON)
 	statsObserveUsage(r, usage, true)
 	observeModelCredit(acc, modelName, usage, reqID)
@@ -4311,6 +4322,160 @@ func noteFinishReason(current string, chunk map[string]any) string {
 	return current
 }
 
+type chatRestoreKey struct {
+	choice  int
+	channel string
+}
+
+func chatRestoreKeyFor(choice int, channel string) chatRestoreKey {
+	return chatRestoreKey{choice: choice, channel: channel}
+}
+
+// writeRestoredChatChunk 保持以下顺序：本片正文/工具增量、被还原器扣留的尾部、
+// 纯 finish_reason 终止帧。终止片自身带正文时不能先 flush，否则正文会倒序。
+func writeRestoredChatChunk(guard *streamWriteGuard, cleaned string, original map[string]any, restorers map[chatRestoreKey]*identityRestorer) {
+	contentChunk, terminalChunk := splitFinishedChatChunk(cleaned)
+	if contentChunk != "" {
+		guard.writeData(contentChunk)
+	}
+	if terminalChunk == "" {
+		return
+	}
+	flushFinishedChatChoices(guard, restorers, original)
+	guard.writeData(terminalChunk)
+}
+
+// splitFinishedChatChunk 把带 finish_reason 的 Chat 分片拆成内容片和纯终止片。
+// usage 等顶层元数据留在内容片，终止片只保留 id/model 与 choices 的结束信息。
+func splitFinishedChatChunk(cleaned string) (string, string) {
+	var obj map[string]any
+	if json.Unmarshal([]byte(cleaned), &obj) != nil {
+		return cleaned, ""
+	}
+	choices, _ := obj["choices"].([]any)
+	terminal := make([]any, 0, len(choices))
+	for _, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		finish := strOf(choice["finish_reason"])
+		if finish == "" {
+			continue
+		}
+		terminal = append(terminal, map[string]any{
+			"index":         intFloat(choice["index"]),
+			"delta":         map[string]any{},
+			"finish_reason": finish,
+		})
+		choice["finish_reason"] = nil
+	}
+	if len(terminal) == 0 {
+		return cleaned, ""
+	}
+	content, err := json.Marshal(obj)
+	if err != nil {
+		return cleaned, ""
+	}
+	terminalObj := map[string]any{"choices": terminal}
+	for _, key := range []string{"id", "object", "created", "model", "system_fingerprint"} {
+		if value, ok := obj[key]; ok {
+			terminalObj[key] = value
+		}
+	}
+	end, err := json.Marshal(terminalObj)
+	if err != nil {
+		return cleaned, ""
+	}
+	return string(content), string(end)
+}
+
+// flushFinishedChatChoices 在某个 choice 的 finish_reason 帧之前吐出它的尾部。
+// Chat 的 n>1 场景中每个 choice 必须使用独立缓存，否则不同 choice 的正文会串流。
+func flushFinishedChatChoices(guard *streamWriteGuard, restorers map[chatRestoreKey]*identityRestorer, chunk map[string]any) {
+	choices, _ := chunk["choices"].([]any)
+	for _, c := range choices {
+		choice, ok := c.(map[string]any)
+		if !ok || strOf(choice["finish_reason"]) == "" {
+			continue
+		}
+		choiceIndex := intFloat(choice["index"])
+		for _, channel := range []string{"content", "reasoning_content"} {
+			key := chatRestoreKeyFor(choiceIndex, channel)
+			if restorer := restorers[key]; restorer != nil {
+				if tail := restorer.Flush(); tail != "" {
+					guard.writeData(tailChunkJSON(choiceIndex, channel, tail))
+				}
+			}
+		}
+	}
+}
+
+// flushAllChatRestorers 处理没有 finish_reason 但正常 EOF 的边界情况，以及
+// finish_reason 之后才出现的尾部。正常路径应在终止帧前调用上面的函数。
+func flushAllChatRestorers(guard *streamWriteGuard, restorers map[chatRestoreKey]*identityRestorer) {
+	for key, restorer := range restorers {
+		if tail := restorer.Flush(); tail != "" {
+			guard.writeData(tailChunkJSON(key.choice, key.channel, tail))
+		}
+	}
+}
+
+// tailChunkJSON 把收尾时补发的尾部包装成最小的 Chat 分片。
+func tailChunkJSON(choiceIndex int, channel, text string) string {
+	payload, err := json.Marshal(map[string]any{
+		"choices": []any{map[string]any{"index": choiceIndex, "delta": map[string]any{channel: text}, "finish_reason": nil}},
+	})
+	if err != nil {
+		return ""
+	}
+	return string(payload)
+}
+
+// restoreChatCompletionIdentity 对本地聚合出的 Chat 回复做身份还原。
+// 只处理 message.content 与 message.reasoning_content 两个可见文本通道；
+// 工具调用、角色、用量和分片结构保持原样。未开启还原时原样返回输入字节。
+func restoreChatCompletionIdentity(r *http.Request, completionJSON []byte) []byte {
+	plan := identityRestoreFor(r)
+	if !plan.active() {
+		return completionJSON
+	}
+	var completion map[string]any
+	if json.Unmarshal(completionJSON, &completion) != nil {
+		return completionJSON
+	}
+	choices, _ := completion["choices"].([]any)
+	changed := false
+	for _, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		message, ok := choice["message"].(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, channel := range []string{"content", "reasoning_content"} {
+			text, ok := message[channel].(string)
+			if !ok || text == "" {
+				continue
+			}
+			if next := restoreIdentityText(plan.rules, text); next != text {
+				message[channel] = next
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return completionJSON
+	}
+	out, err := json.Marshal(completion)
+	if err != nil {
+		return completionJSON
+	}
+	return out
+}
+
 func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	var content, reasoning, role, respModel, respID, finish string
 	var created int64
@@ -4427,7 +4592,15 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 //  2. 旧版 function_call 空壳：上游在含工具调用的终止片追加
 //     {"function_call":{"name":"","arguments":""}}，属同类非规范噪声，一并清除。
 //  3. delta 中的空值字段（content:""、tool_calls:[] 等）。
+//
+// cleanChunkJSON 清洗单个 Chat 分片，使其符合 OpenAI 流式分片规范后再透传。
 func cleanChunkJSON(s string) string {
+	return cleanChunkObject(s, identityRestore{}, nil)
+}
+
+// cleanChunkObject 清洗单个 Chat 分片，并对正文与推理正文两个通道做身份还原。
+// restorers 由流式调用方跨分片复用；工具参数、角色和元数据不参与还原。
+func cleanChunkObject(s string, plan identityRestore, restorers map[chatRestoreKey]*identityRestorer) string {
 	var obj map[string]any
 	if json.Unmarshal([]byte(s), &obj) != nil {
 		return s
@@ -4469,6 +4642,26 @@ func cleanChunkJSON(s string) string {
 					}
 					if isEmptyValue(v) {
 						delete(delta, k)
+					}
+				}
+				if plan.active() {
+					for _, channel := range []string{"content", "reasoning_content"} {
+						text, ok := delta[channel].(string)
+						if !ok || text == "" {
+							continue
+						}
+						key := chatRestoreKeyFor(intFloat(choice["index"]), channel)
+						restorer := restorers[key]
+						if restorer == nil {
+							restorer = newIdentityRestorer(plan)
+							restorers[key] = restorer
+						}
+						next := restorer.Write(text)
+						if next == "" {
+							delete(delta, channel)
+						} else if next != text {
+							delta[channel] = next
+						}
 					}
 				}
 			}

@@ -71,8 +71,9 @@ func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 	exampleSchema := runtimeFileConfig{}
 	exampleSchema.Models.Accounts = map[string]modelAccountFileConfig{"all": {}}
 	identityEnabled := true
+	identityResponseRestore := false
 	exampleSchema.Identity = runtimeIdentityConfig{Enabled: &identityEnabled, Target: "WorkBuddy",
-		Replacements: defaultIdentityReplacements("WorkBuddy")}
+		Replacements: defaultIdentityReplacements("WorkBuddy"), ResponseRestore: &identityResponseRestore}
 	schema, err := json.Marshal(exampleSchema)
 	if err != nil {
 		t.Fatal(err)

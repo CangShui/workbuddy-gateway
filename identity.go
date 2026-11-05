@@ -16,6 +16,9 @@ type runtimeIdentityConfig struct {
 	Enabled      *bool             `json:"enabled,omitempty"`
 	Target       string            `json:"target,omitempty"`
 	Replacements map[string]string `json:"replacements,omitempty"`
+	// ResponseRestore 默认关闭。开启后只改写响应可见正文：把出站时被替换掉的
+	// 客户端身份还原回来。入站请求处理与出站请求体完全不受影响。
+	ResponseRestore *bool `json:"responseRestore,omitempty"`
 }
 
 type identityReplacement struct {
@@ -32,6 +35,11 @@ type identitySettings struct {
 	target       string
 	replacements []identityReplacement
 	invalidRules int
+	// responseRestore 是配置开关；restoreTargets 是可直接按字节查找的
+	// identity.replacements 键（字面规则）及其值，供响应还原使用：
+	// 前半段是完全等于 target 的替换值（身份名），后半段是包含 target 的替换值。
+	responseRestore bool
+	restoreTargets  []identityRestoreRule
 }
 
 var (
@@ -132,9 +140,41 @@ func buildIdentitySettings(c runtimeIdentityConfig) identitySettings {
 		}
 		return a.Old < b.Old
 	})
+	restoreRules := buildIdentityRestoreRules(target, replacements)
 	return identitySettings{
 		enabled: enabled, target: target, replacements: replacements, invalidRules: invalid,
+		responseRestore: c.ResponseRestore != nil && *c.ResponseRestore, restoreTargets: restoreRules,
 	}
+}
+
+// buildIdentityRestoreRules 从已编译的替换规则导出身份名对照：from 是客户端身份名
+// （例如 "Claude Code"），to 是它入站时被改写成的值（identity.target）；
+// 生成请求还原计划时把二者对调。
+// 通配规则没有固定的客户端身份；拼写修正等其他替换值不含 target，入站时没有被
+// 改写，逆向替换会产生错误事实。两类规则都不参与还原。
+// 同一客户端名只保留一条规则，结果按客户端名长度降序排列。
+func buildIdentityRestoreRules(target string, rules []identityReplacement) []identityRestoreRule {
+	out := make([]identityRestoreRule, 0, len(rules))
+	seenName := make(map[string]bool)
+	for _, rule := range rules {
+		value := strings.TrimSpace(rule.New)
+		if rule.Wildcard || value != target || seenName[rule.Old] {
+			continue
+		}
+		seenName[rule.Old] = true
+		out = append(out, identityRestoreRule{from: rule.Old, to: value, exactName: true})
+	}
+	return sortRestoreRules(out)
+}
+
+func sortRestoreRules(rules []identityRestoreRule) []identityRestoreRule {
+	sort.SliceStable(rules, func(i, j int) bool {
+		if len(rules[i].from) != len(rules[j].from) {
+			return len(rules[i].from) > len(rules[j].from)
+		}
+		return rules[i].from < rules[j].from
+	})
+	return rules
 }
 
 func compileIdentityReplacement(old, newValue string) (identityReplacement, bool) {
@@ -161,7 +201,8 @@ func compileIdentityReplacement(old, newValue string) (identityReplacement, bool
 func identitySnapshot() identitySettings {
 	identityConfigMu.RLock()
 	snapshot := currentIdentity
-	snapshot.replacements = append([]identityReplacement(nil), currentIdentity.replacements...)
+	snapshot.replacements = append([]identityReplacement(nil), snapshot.replacements...)
+	snapshot.restoreTargets = append([]identityRestoreRule(nil), snapshot.restoreTargets...)
 	identityConfigMu.RUnlock()
 	return snapshot
 }

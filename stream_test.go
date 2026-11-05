@@ -304,7 +304,7 @@ func TestStreamChatResponsePreservesHeartbeatFraming(t *testing.T) {
 		}
 		dataFrames++
 	}
-	if dataFrames != 2 || !strings.HasSuffix(out, "data: [DONE]\n\n") {
+	if dataFrames != 3 || !strings.HasSuffix(out, "data: [DONE]\n\n") {
 		t.Fatalf("completion frames must be preserved: %q", out)
 	}
 }
