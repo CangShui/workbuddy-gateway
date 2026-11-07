@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.45"
+	version = "1.14.46"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -1753,9 +1753,17 @@ func isRateLimited(statusCode int, body string) bool {
 	return false
 }
 
-func isModelRateLimited(body string) bool {
+func isModelRateLimited(statusCode int, body string) bool {
+	// 500/11134 等服务不可用响应也会带 "switch to another model" 文案，
+	// 但那是上游模型故障，不是模型级限流；只有 429 才允许进入模型冷却，
+	// 否则会逐个账号重试同一请求并放大上游错误。
+	if statusCode != http.StatusTooManyRequests {
+		return false
+	}
 	low := strings.ToLower(body)
-	return strings.Contains(body, `"code":6004`) || strings.Contains(body, "切换其他模型") || strings.Contains(low, "switch to another model")
+	return strings.Contains(body, `"code":6004`) || strings.Contains(body, `"code":14003`) ||
+		strings.Contains(body, "切换其他模型") || strings.Contains(low, "switch to another model") ||
+		strings.Contains(body, "模型繁忙") || strings.Contains(low, "model busy")
 }
 
 func isQuotaExhausted(statusCode int, body string) bool {
@@ -3653,7 +3661,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 				continue
 			}
 
-			if isModelRateLimited(errStr) {
+			if isModelRateLimited(resp.StatusCode, errStr) {
 				until, ok := parseResetTime(errStr)
 				if !ok {
 					until = time.Now().Add(60 * time.Second)

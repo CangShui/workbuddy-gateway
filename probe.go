@@ -246,7 +246,7 @@ func probeAccountModel(ctx context.Context, acc *Account, model string) probeRes
 			markModelQuotaBlocked(acc, model, errStr)
 			result.Status = "quota"
 			result.Detail = "额度耗尽（已记为该账号收费模型）"
-		case isModelRateLimited(errStr):
+		case isModelRateLimited(resp.StatusCode, errStr):
 			until, ok := parseResetTime(errStr)
 			if !ok {
 				until = time.Now().Add(60 * time.Second)

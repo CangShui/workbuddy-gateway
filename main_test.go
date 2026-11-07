@@ -489,10 +489,20 @@ func TestQuotaRecoveryClearsBlocksKeepsModelCooldown(t *testing.T) {
 }
 
 func TestIsModelRateLimited(t *testing.T) {
-	if !isModelRateLimited(`{"code":6004,"msg":"您也可以切换其他模型继续使用"}`) {
+	if !isModelRateLimited(http.StatusTooManyRequests, `{"code":6004,"msg":"您也可以切换其他模型继续使用"}`) {
 		t.Fatal("6004 should be model-level rate limit")
 	}
-	if isModelRateLimited(`{"code":14018,"msg":"额度已用尽"}`) {
+	if !isModelRateLimited(http.StatusTooManyRequests, `{"code":14003,"msg":"too many requests","displayTips":{"en":"Please switch to another model"}}`) {
+		t.Fatal("14003 should be model-level rate limit")
+	}
+	providerUnavailable := `{"code":11134,"msg":"the model provider is temporarily unavailable, please retry later or switch to another model"}`
+	if isModelRateLimited(http.StatusInternalServerError, providerUnavailable) {
+		t.Fatal("500/11134 must not be treated as model rate limit")
+	}
+	if isRateLimited(http.StatusInternalServerError, providerUnavailable) {
+		t.Fatal("500/11134 must not be treated as account rate limit")
+	}
+	if isModelRateLimited(http.StatusTooManyRequests, `{"code":14018,"msg":"额度已用尽"}`) {
 		t.Fatal("14018 should not be model rate limit")
 	}
 }

@@ -1630,7 +1630,7 @@ func probeModelPrice(acc *Account, model string) (string, float64, int64, string
 		switch {
 		case isQuotaExhausted(resp.StatusCode, s):
 			return "", 0, 0, "14018 额度耗尽，不覆盖"
-		case isModelRateLimited(s):
+		case isModelRateLimited(resp.StatusCode, s):
 			return "", 0, 0, "6004 模型限流，不覆盖"
 		default:
 			return "", 0, 0, fmt.Sprintf("HTTP %d，不覆盖", resp.StatusCode)
