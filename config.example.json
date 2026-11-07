@@ -36,6 +36,11 @@
     "MaxAcc": 4,
     "MaxGlobal": 0
   },
+  "redact": {
+    "secrets": false,
+    "personal": false,
+    "words": []
+  },
   "debug": {
     "enabled": false,
     "fullRequests": false

@@ -30,6 +30,7 @@
   <button class="tab active" data-tab="overview" type="button">总览</button>
   <button class="tab" data-tab="accounts" type="button">账号池</button>
   <button class="tab" data-tab="models" type="button">模型列表</button>
+  <button class="tab" data-tab="redact" type="button">脱敏</button>
   <button class="tab" data-tab="logs" type="button">日志</button>
   <button class="tab" data-tab="config" type="button">配置</button>
   <button class="tab" data-tab="tasks" type="button">定时任务</button>
@@ -186,6 +187,73 @@
           <tbody></tbody>
         </table>
       </div>
+    </div>
+  </section>
+
+  <section id="panel-redact" class="panel">
+    <div class="redact-head">
+      <h2 class="overview-subheading">请求脱敏 <span id="redactState" class="badge">未开启</span></h2>
+      <div class="stats-controls redact-controls">
+        <label>时间范围<select id="redactDays"><option value="1">今天</option><option value="7" selected>近 7 天</option><option value="30">近 30 天</option></select></label>
+        <label>类型<select id="redactKindFilter"><option value="">全部类型</option></select></label>
+        <label>模型<select id="redactModelFilter"><option value="">全部模型</option></select></label>
+        <button id="redactClear" class="ghost danger" type="button">清空记录</button>
+      </div>
+    </div>
+    <p class="hint">发往上游模型前，网关在本机把密钥、个人信息和自定义词换成 <code>{{类型_xxxxxxxx}}</code> 占位符，回复里的占位符自动换回原值。
+      记录只保存类型、占位符、开头几个字符与长度；上游实际收到的文字和原值只在网关内存中，重启后不可再查看。</p>
+    <div id="redactSummary" class="usage-cards"></div>
+    <div class="redact-grid">
+      <div class="card">
+        <div class="card-title">按类型 <span id="redactRangeText" class="hint"></span></div>
+        <div id="redactKinds" class="redact-bars"><p class="stats-empty">暂无记录</p></div>
+      </div>
+      <div class="card">
+        <div class="card-title">最常脱敏的值 <span class="hint">只显示开头字符与长度</span></div>
+        <div class="table-wrap"><table id="redactTopTable">
+          <thead><tr><th>类型</th><th>值提示</th><th>占位符</th><th>出现次数</th><th>涉及请求</th></tr></thead>
+          <tbody><tr><td colspan="5" class="empty">暂无记录</td></tr></tbody>
+        </table></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">脱敏记录 <span id="redactRecordsInfo" class="hint"></span></div>
+      <div class="table-wrap"><table id="redactRecordsTable">
+        <thead><tr><th>时间</th><th>接口</th><th>模型</th><th>账号</th><th>替换</th><th>类型</th><th>回复还原</th><th>尝试</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody><tr><td colspan="10" class="empty">等待记录</td></tr></tbody>
+      </table></div>
+      <div class="actions"><button id="redactMore" class="ghost hidden" type="button">加载更早的记录</button></div>
+    </div>
+    <div id="redactDetailCard" class="card hidden" aria-live="polite">
+      <div class="card-title"><span id="redactDetailTitle">记录详情</span>
+        <span class="filter">
+          <button id="redactReveal" class="ghost" type="button">显示原值</button>
+          <button id="redactDetailClose" class="ghost" type="button">关闭</button>
+        </span>
+      </div>
+      <p id="redactDetailMeta" class="hint"></p>
+      <div class="table-wrap"><table id="redactHitsTable">
+        <thead><tr><th>类型</th><th>占位符</th><th>值提示</th><th>原值</th><th>次数</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <h3 class="redact-subtitle">上游实际收到的内容</h3>
+      <div id="redactSegments" class="redact-segments"></div>
+    </div>
+    <div class="card settings-card">
+      <div class="card-title">脱敏设置</div>
+      <label class="redact-option"><input type="checkbox" id="redactSecrets"> <span><strong>密钥与凭据</strong><span class="hint">API Key、Token、JWT、私钥、密码、Authorization / Cookie</span></span></label>
+      <label class="redact-option"><input type="checkbox" id="redactPersonal"> <span><strong>个人信息</strong><span class="hint">邮箱、手机号、身份证号、银行卡号</span></span></label>
+      <label for="redactWords" class="redact-words-label">自定义脱敏词（每行一个，区分大小写，任何开关下都生效）</label>
+      <textarea id="redactWords" rows="4" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+      <p class="hint">代价：模型看到的是占位符而不是原值，针对值本身的任务（例如“这个 Token 为什么被拒”）无法完成。工具定义、图片等多媒体数据和模型名原样发送。保存写入 config.json 的 redact 段并立即生效。</p>
+      <div class="actions"><button id="redactSave" type="button">保存脱敏设置</button></div>
+      <p id="redactStatus" class="hint action-result" role="status" aria-live="polite"></p>
+      <details class="redact-try">
+        <summary>试一试</summary>
+        <textarea id="redactTryInput" rows="3" spellcheck="false" autocomplete="off" placeholder="粘贴一段文字，查看发往上游时的样子（不会登记或保存）"></textarea>
+        <button id="redactTryBtn" class="ghost" type="button">预览脱敏结果</button>
+        <pre id="redactTryOutput" class="redact-try-output"></pre>
+      </details>
     </div>
   </section>
 

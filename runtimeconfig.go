@@ -73,6 +73,9 @@ func parseRuntimeConfig(data []byte) (runtimeFileConfig, error) {
 	if _, err := normalizeRequestProfile(c.Upstream.RequestProfile); err != nil {
 		return c, err
 	}
+	if _, err := normalizeRedactConfig(c.Redact); err != nil {
+		return c, err
+	}
 	return c, nil
 }
 
@@ -369,6 +372,12 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	_ = setModelAccountFilter(c.Models.Accounts)
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)
 	setIdentityConfig(c.Identity)
+	previousRedact := currentRedactOptions()
+	setRedactConfig(c.Redact)
+	if now := currentRedactOptions(); !hot || previousRedact.secrets != now.secrets || previousRedact.personal != now.personal || len(previousRedact.words) != len(now.words) {
+		log.Printf("[请求脱敏配置] traceId=%s 密钥与凭据=%t 个人信息=%t 自定义词数=%d 说明=只影响后续模型请求；原值仅保存在内存，不记录词条正文",
+			trace, now.secrets, now.personal, len(now.words))
+	}
 	deprecatedPromptCompatibilityPresent.Store(len(c.DeprecatedPromptCompatibility) > 0)
 	modelConcurrency.configure(c.Concurrent)
 	logConcurrentConfig(trace)

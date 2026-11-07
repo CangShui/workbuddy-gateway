@@ -185,6 +185,22 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 	// 兼容直接调用与测试；正常入口已经在协议转换前准备完成。只生成一次，不能在 try 循环里重建。
 	prepareConversationContext(r, nil)
 	profile := requestProfileFor(r)
+	// 请求脱敏（config.json redact 段）：在编码出站请求体之前替换为占位符，回复在下方还原。
+	// 失败即不发送，绝不退回原文外发。
+	upstreamBytes, redactRes, redactErr := maskRequestJSON(upstreamBytes, currentRedactOptions())
+	if redactErr != nil {
+		noteRedactFailure(r, reqID, traceID, acc)
+		log.Printf("[请求脱敏] traceId=%s requestId=%d 结果=失败 原因=%v 业务影响=未发送上游", traceID, reqID, redactErr)
+		debugEvent(r, "error", "request_redact_failed", map[string]any{"status_code": 502, "business_impact": "脱敏失败，请求未发送上游"})
+		return nil, nil, redactErr
+	}
+	var redactRec *redactRecord
+	if redactRes != nil {
+		redactRec = noteRedactRecord(r, reqID, traceID, acc, redactRes)
+		log.Printf("[请求脱敏] traceId=%s requestId=%d 结果=已脱敏 替换数=%d 类型=%s 说明=原值仅保存在网关内存，回复中的占位符自动还原；不记录原值",
+			traceID, reqID, len(redactRes.hits), summarizeRedactHits(redactRes.hits))
+		debugEvent(r, "info", "request_redacted", map[string]any{"values": len(redactRes.hits), "kinds": summarizeRedactHits(redactRes.hits)})
+	}
 	wireBytes, encodeErr := encodeModelRequest(upstreamBytes, profile, prof)
 	if encodeErr != nil {
 		log.Printf("[出站兼容] traceId=%s requestId=%d 阶段=请求编码 结果=失败 业务影响=未发送上游", traceID, reqID)
@@ -243,6 +259,9 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 		resp, err := cfg.HttpClient.Do(req)
 		debugFullUpstreamResponse(r, req, resp, try, headersWritten.Load(), bodyWritten.Load(), err)
 		if err == nil {
+			if redactRes != nil && resp.Body != nil {
+				resp.Body = newRedactRestoreBody(resp.Body, redactRec)
+			}
 			return resp, upstreamCancel, nil
 		}
 		upstreamCancel()
@@ -668,6 +687,7 @@ func main() {
 	}
 	closeDebug := func() {}
 	if serveCommand {
+		loadRedactRecords()
 		var err error
 		closeDebug, err = initDebugLogging()
 		if err != nil {
