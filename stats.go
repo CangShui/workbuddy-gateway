@@ -56,14 +56,15 @@ type statsDocument struct {
 
 var requestStats = struct {
 	sync.Mutex
-	document  statsDocument
-	revision  uint64
-	saved     uint64
-	lastSaved int64
-	mode      string // pending / file / memory
-	problem   string // 安全的白话原因，不回传底层错误或用户文件内容
-	blocked   bool   // 坏文件或符号链接不得被自动覆盖
-	enabled   bool
+	document     statsDocument
+	revision     uint64
+	saved        uint64
+	lastSaved    int64
+	mode         string // pending / file / memory
+	problem      string // 安全的白话原因，不回传底层错误或用户文件内容
+	blocked      bool   // 坏文件或符号链接不得被自动覆盖
+	enabled      bool
+	lastPruneLog int64 // 上次裁剪日志时间（UnixMilli），限频避免窗口填满后每轮刷日志
 }{document: statsDocument{Schema: statsSchema, Accounts: map[string]statsAccount{}, Requests: []statsRequest{}}, mode: "pending"}
 
 var statsWriteMu sync.Mutex
@@ -215,6 +216,7 @@ func flushOptionalStats() error {
 		return nil
 	}
 	revision := requestStats.revision
+	statsPruneRequestsLocked(time.Now())
 	raw, err := json.Marshal(requestStats.document)
 	requestStats.Unlock()
 	if err == nil && len(raw) > statsMaxFileBytes {
@@ -263,6 +265,53 @@ func writeOptionalStatsFile(raw []byte) error {
 		return err
 	}
 	return os.Rename(tmp, statsFile)
+}
+
+// statsRetentionDays 是逐条请求记录的保留窗口。stats.json 的 Requests 只增不减会让
+// 序列化/写盘成本随历史总量线性上涨（实测 19.7 天 21 MB、303 B/条），并最终顶到
+// statsMaxFileBytes 上限后停止落盘、重启时拒绝加载丢失全部历史。按窗口裁剪后，
+// 单文件体积上限 = 峰值日请求量 × 303B × 30（约 1.1 MB/天请求量），远低于上限。
+const statsRetentionDays = 30
+
+// statsPruneRequestsLocked 按保留窗口裁剪逐条请求记录（调用方持有 requestStats 锁）。
+// Requests 由 append 产生、按 At 单调不减（同毫秒保持插入序），可安全二分；
+// 裁剪后同步清理不再被任何保留记录引用的账号条目，满足 validStatsDocument
+// 「每条记录的账号必须存在于 Accounts」的约束。注意 captureAccountStatsLocked
+// 每轮都会重新登记当前活跃账号，这里只删「已无任何保留记录」的孤儿条目。
+func statsPruneRequestsLocked(now time.Time) {
+	reqs := requestStats.document.Requests
+	if len(reqs) == 0 {
+		return
+	}
+	cutoff := now.Add(-statsRetentionDays * 24 * time.Hour).UnixMilli()
+	start := sort.Search(len(reqs), func(i int) bool { return reqs[i].At >= cutoff })
+	if start == 0 {
+		return
+	}
+	kept := append([]statsRequest(nil), reqs[start:]...)
+	referenced := make(map[string]struct{}, len(requestStats.document.Accounts))
+	for _, row := range kept {
+		referenced[row.Account] = struct{}{}
+	}
+	for id := range requestStats.document.Accounts {
+		if _, ok := referenced[id]; !ok {
+			delete(requestStats.document.Accounts, id)
+		}
+	}
+	if len(kept) == 0 {
+		requestStats.document.StartedAt = now.UnixMilli()
+	} else {
+		requestStats.document.StartedAt = kept[0].At
+	}
+	requestStats.document.Requests = kept
+	// 裁剪是数据位置变化而非用量事实变化：saved 与 revision 保持差值即可，
+	// 不额外 +1，避免无流量时段被裁剪自身触发反复写盘。
+	// 窗口填满后每轮 flush 都会有少量记录自然过期，日志按小时限频，避免刷屏。
+	nowMs := now.UnixMilli()
+	if requestStats.lastPruneLog == 0 || nowMs-requestStats.lastPruneLog >= int64(time.Hour/time.Millisecond) {
+		requestStats.lastPruneLog = nowMs
+		log.Printf("[统计文件] traceId=%s 阶段=保留期裁剪 窗口=%d天 裁剪=%d条 保留=%d条 说明=控制单文件体积与序列化成本，超出窗口的逐条明细不再保留", newTraceID(), statsRetentionDays, start, len(kept))
+	}
 }
 
 func statsPersistenceLoop(ctx context.Context) {
