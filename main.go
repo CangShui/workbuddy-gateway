@@ -1824,12 +1824,14 @@ func doRefreshToken(sa *StoredAuth) error {
 	if sa == nil || sa.Auth.RefreshToken == "" {
 		return fmt.Errorf("无法刷新：缺少 RefreshToken")
 	}
+	oldTokens := sa.Auth // refreshTokenPayload 会就地覆盖，先留存旧值供延迟淘汰
 	if _, err := refreshTokenPayload(sa); err != nil {
 		return err
 	}
 	if err := saveAuth(sa); err != nil {
 		return fmt.Errorf("写回凭据失败: %w", err)
 	}
+	retireStaleCredentialSecrets(cfg.AuthFile, oldTokens, sa.Auth)
 	log.Printf("[Auth] Token 刷新成功！新过期时间: %s", time.Unix(sa.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
 	return nil
 }
@@ -1915,6 +1917,9 @@ func refreshAccountToken(acc *Account, reason string) error {
 		acc.LastRefreshError = ""
 	}
 	accountMu.Unlock()
+	// 令牌已轮换：把上一代秘密值延迟移出脱敏词表（两代宽限，见 retireRetiredSecrets）。
+	// 该调用与词表无锁竞争：unregister 只删恰好匹配的旧值，仍被其他账号使用则保留。
+	retireStaleCredentialSecrets(path, oldTokens, refreshed.Auth)
 	newExpiresAt := refreshed.Auth.ExpiresAt
 	if oldExpiresAt > 0 && newExpiresAt <= oldExpiresAt {
 		// 刷新成功但访问令牌期限没有顺延：该账号可能已接近上游的登录态上限。
@@ -1925,6 +1930,64 @@ func refreshAccountToken(acc *Account, reason string) error {
 		path, time.Unix(oldExpiresAt, 0).Format("2006-01-02 15:04:05"), time.Unix(newExpiresAt, 0).Format("2006-01-02 15:04:05"), reason)
 	writeStatusSnapshot()
 	return nil
+}
+
+// retireStaleCredentialSecrets 在令牌轮换成功后，把上一代访问/刷新令牌延迟移出
+// 脱敏词表（sensitiveSecrets 只增不减会让脱敏成本随刷新次数单调上涨，pprof 实测
+// 词表翻倍时空转分配 +67%）。
+//
+// 不立即删除：刚退位的令牌仍可能出现在进行中的上游请求头与已排队的日志行里，
+// 因此按凭据路径保留一个宽限槽，下一轮轮换时（闲置已满一个刷新周期）才淘汰。
+// 淘汰前做在用检查：任一凭据路径的当前令牌或任何已加载账号仍持有该值时跳过，
+// 避免多账号共用同一凭据值时误删保护。未发生真实轮换（上游返回相同令牌）时不淘汰。
+func retireStaleCredentialSecrets(path string, previous, current StoredTokens) {
+	secretRetireMu.Lock()
+	defer secretRetireMu.Unlock()
+	if secretRetireState == nil {
+		secretRetireState = &secretRetireBookkeeping{
+			grace: map[string]StoredTokens{}, current: map[string]StoredTokens{},
+		}
+	}
+	state := secretRetireState
+	state.current[path] = current
+	if previous == current || (previous.AccessToken == "" && previous.RefreshToken == "") {
+		return
+	}
+	if grace, ok := state.grace[path]; ok && grace != (StoredTokens{}) {
+		state.retireIfUnused(grace)
+	}
+	state.grace[path] = previous
+}
+
+type secretRetireBookkeeping struct {
+	// grace 按凭据路径保留刚退位的一代令牌，下一轮轮换时淘汰。
+	grace map[string]StoredTokens
+	// current 记录各路径当前在用令牌，作为在用检查的第一层依据。
+	current map[string]StoredTokens
+}
+
+var secretRetireMu sync.Mutex
+var secretRetireState *secretRetireBookkeeping
+
+// retireIfUnused 仅当宽限值不再被任何路径的在用令牌或已加载账号持有时移出词表。
+func (s *secretRetireBookkeeping) retireIfUnused(grace StoredTokens) {
+	for _, tokens := range s.current {
+		if tokens.AccessToken == grace.AccessToken || tokens.RefreshToken == grace.RefreshToken {
+			return
+		}
+	}
+	accountMu.Lock()
+	for _, acc := range accounts {
+		if acc == nil || acc.Auth == nil {
+			continue
+		}
+		if acc.Auth.Auth.AccessToken == grace.AccessToken || acc.Auth.Auth.RefreshToken == grace.RefreshToken {
+			accountMu.Unlock()
+			return
+		}
+	}
+	accountMu.Unlock()
+	unregisterSecrets(grace.AccessToken, grace.RefreshToken)
 }
 
 // recordRefreshFailure 累计连续刷新失败次数并返回当前次数。
