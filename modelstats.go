@@ -223,7 +223,14 @@ type ttftReader struct {
 }
 
 func newTTFTReader(r io.Reader, start time.Time) *ttftReader {
-	return &ttftReader{r: r, start: start}
+	reader := &ttftReader{r: r, start: start}
+	// 实验恢复可能已解析并暂存首段；沿用实际观测时间，不把释放缓存当成首Token。
+	if observed, ok := r.(interface{ observedFirstToken() time.Duration }); ok {
+		if duration := observed.observedFirstToken(); duration > 0 {
+			reader.once.Do(func() { reader.d = duration })
+		}
+	}
+	return reader
 }
 
 func (t *ttftReader) Read(p []byte) (int, error) {

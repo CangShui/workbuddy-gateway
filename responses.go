@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -105,6 +104,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	resp = recoverEmptyResponse(w, r, resp, acc, prof, upstreamBytes, modelName, reqID, startTime, isStream)
 	if isStream {
 		streamResponsesResponse(w, r, resp, modelName, reqID, acc, prof, startTime)
 	} else {
@@ -590,8 +590,17 @@ func writeResponsesAggregate(w http.ResponseWriter, r *http.Request, resp *http.
 	defer resp.Body.Close()
 	body := newTTFTReader(resp.Body, startTime)
 	defer finishFirstToken(r, modelName, reqID, body)
-	completionJSON, err := aggregateCompletion(body, modelName)
+	completionJSON, err := aggregateCompletion(body, modelName, r)
 	if err != nil {
+		if errors.Is(err, errUpstreamAccountRestricted) {
+			markAccountRestricted(r, acc, reqID, modelName)
+			writeUpstreamError(w, r, http.StatusForbidden, "account_restricted", err.Error())
+			return
+		}
+		if failure := upstreamSSEClientError(err); failure != nil {
+			writeUpstreamError(w, r, http.StatusBadGateway, "upstream_error", strOf(failure["message"]))
+			return
+		}
 		debugEvent(r, "error", "aggregate_response_failed", map[string]any{
 			"error_type": debugErrorType(err),
 			"error":      safeDebugError(err),
@@ -601,7 +610,9 @@ func writeResponsesAggregate(w http.ResponseWriter, r *http.Request, resp *http.
 		return
 	}
 	usage := usageFromCompletion(completionJSON)
-	statsObserveUsage(r, usage, true)
+	progress, finish := completionOutputFromJSON(completionJSON)
+	statsObserveUsage(r, usage, finish != "length")
+	logOutputBudget(r, reqID, modelName, finish, progress, usage)
 	observeModelCredit(r, acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
 	recordModelLatency(modelName, time.Since(startTime))
@@ -619,7 +630,11 @@ func writeResponsesAggregate(w http.ResponseWriter, r *http.Request, resp *http.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
-	debugEvent(r, "info", "aggregate_response_completed", map[string]any{
+	event := "aggregate_response_completed"
+	if finish == "length" {
+		event = "aggregate_response_incomplete"
+	}
+	debugEvent(r, "info", event, map[string]any{
 		"status_code":    http.StatusOK,
 		"response_bytes": len(out),
 	})
@@ -638,10 +653,11 @@ func chatCompletionToResponsesWithTools(chatJSON []byte, modelName string, toolM
 		return nil, err
 	}
 
-	var content, reasoning string
+	var content, reasoning, finish string
 	var toolCalls []any
 	if choices, ok := chat["choices"].([]any); ok && len(choices) > 0 {
 		if choice, ok := choices[0].(map[string]any); ok {
+			finish, _ = choice["finish_reason"].(string)
 			if msg, ok := choice["message"].(map[string]any); ok {
 				content, _ = msg["content"].(string)
 				reasoning, _ = msg["reasoning_content"].(string)
@@ -650,20 +666,24 @@ func chatCompletionToResponsesWithTools(chatJSON []byte, modelName string, toolM
 		}
 	}
 
+	itemStatus := "completed"
+	if finish == "length" {
+		itemStatus = "incomplete"
+	}
 	output := []any{}
 	if reasoning != "" {
 		output = append(output, map[string]any{
 			"id":      "rs_" + compactUUID(),
 			"type":    "reasoning",
-			"status":  "completed",
+			"status":  itemStatus,
 			"summary": []any{map[string]any{"type": "summary_text", "text": reasoning}},
 		})
 	}
-	if content != "" || len(toolCalls) == 0 {
+	if content != "" || (len(toolCalls) == 0 && finish != "length") {
 		output = append(output, map[string]any{
 			"id":     "msg_" + compactUUID(),
 			"type":   "message",
-			"status": "completed",
+			"status": itemStatus,
 			"role":   "assistant",
 			"content": []any{
 				map[string]any{"type": "output_text", "text": content, "annotations": []any{}},
@@ -681,7 +701,9 @@ func chatCompletionToResponsesWithTools(chatJSON []byte, modelName string, toolM
 			name, _ = fn["name"].(string)
 			args, _ = fn["arguments"].(string)
 		}
-		output = append(output, responsesToolCallItem(callID, name, args, toolMap))
+		item := responsesToolCallItem(callID, name, args, toolMap)
+		item["status"] = itemStatus
+		output = append(output, item)
 	}
 
 	now := time.Now().Unix()
@@ -700,6 +722,11 @@ func chatCompletionToResponsesWithTools(chatJSON []byte, modelName string, toolM
 	result["status"] = "completed"
 	result["output"] = output
 	result["completed_at"] = now
+	if finish == "length" {
+		result["status"] = "incomplete"
+		result["completed_at"] = nil
+		result["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+	}
 	if usage, ok := chat["usage"].(map[string]any); ok {
 		result["usage"] = toResponsesUsage(usage)
 	}
@@ -803,13 +830,17 @@ func toResponsesUsage(u map[string]any) map[string]any {
 	if d, ok := u["completion_tokens_details"].(map[string]any); ok {
 		reasoningTokens = numOr0(d["reasoning_tokens"])
 	}
-	return map[string]any{
+	result := map[string]any{
 		"input_tokens":          int64(in),
 		"input_tokens_details":  map[string]any{"cached_tokens": int64(cached)},
 		"output_tokens":         int64(out),
 		"output_tokens_details": map[string]any{"reasoning_tokens": int64(reasoningTokens)},
 		"total_tokens":          int64(total),
 	}
+	if recovery := u["reasoning_recovery"]; recovery != nil {
+		result["reasoning_recovery"] = recovery
+	}
+	return result
 }
 
 func numOr0(v any) float64 {
@@ -911,6 +942,7 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	}
 
 	var usage map[string]any
+	var progress completionOutput
 	finishReason := ""
 	sawDone := false
 
@@ -925,8 +957,7 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 
 	body := newTTFTReader(resp.Body, startTime)
 	defer finishFirstToken(r, modelName, reqID, body)
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	scanner := newUpstreamSSEScanner(body, r)
 	for scanner.Scan() {
 		data := stripDataPrefix(scanner.Text())
 		if data == "" {
@@ -941,6 +972,7 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 			continue
 		}
 		observeFirstToken(body, chunk)
+		progress.observe(chunk)
 		if u, ok := chunk["usage"].(map[string]any); ok {
 			usage = u
 		}
@@ -1055,8 +1087,23 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	}
 	scanErr := scanner.Err()
 	completeTokenStream(body, scanErr == nil && finishReason != "")
-	statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
+	statsObserveUsage(r, usage, scanErr == nil && finishReason != "" && finishReason != "length")
 	if scanErr != nil {
+		if errors.Is(scanErr, errUpstreamAccountRestricted) {
+			markAccountRestricted(r, acc, reqID, modelName)
+			failed := buildResponsesEnvelope(respID, modelName, created)
+			failed["status"], failed["error"] = "failed", accountRestrictionError()
+			emit("response.failed", map[string]any{"response": failed})
+			recordModelLatency(modelName, time.Since(startTime))
+			return
+		}
+		if failure := upstreamSSEClientError(scanErr); failure != nil {
+			failed := buildResponsesEnvelope(respID, modelName, created)
+			failed["status"], failed["error"] = "failed", failure
+			emit("response.failed", map[string]any{"response": failed})
+			recordModelLatency(modelName, time.Since(startTime))
+			return
+		}
 		debugEvent(r, "error", "stream_response_failed", map[string]any{
 			"error_type": debugErrorType(scanErr),
 			"error":      safeDebugError(scanErr),
@@ -1101,8 +1148,13 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 		return
 	}
 
-	// 若无任何输出，补一个空 message，保证 output 非空且事件序列完整
-	if !reasoningOpen && !msgOpen && len(toolOrder) == 0 {
+	logOutputBudget(r, reqID, modelName, finishReason, progress, usage)
+	itemStatus := "completed"
+	if finishReason == "length" {
+		itemStatus = "incomplete"
+	}
+	// 正常空响应保留原有空 message；预算耗尽时不伪造正文。
+	if !reasoningOpen && !msgOpen && len(toolOrder) == 0 && finishReason != "length" {
 		openMessage()
 	}
 
@@ -1119,7 +1171,7 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 		text := reasoningSB.String()
 		emit("response.reasoning_summary_text.done", map[string]any{"item_id": reasoningItemID, "output_index": reasoningIndex, "summary_index": 0, "text": text})
 		emit("response.reasoning_summary_part.done", map[string]any{"item_id": reasoningItemID, "output_index": reasoningIndex, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": text}})
-		item := map[string]any{"id": reasoningItemID, "type": "reasoning", "status": "completed", "summary": []any{map[string]any{"type": "summary_text", "text": text}}}
+		item := map[string]any{"id": reasoningItemID, "type": "reasoning", "status": itemStatus, "summary": []any{map[string]any{"type": "summary_text", "text": text}}}
 		emit("response.output_item.done", map[string]any{"output_index": reasoningIndex, "item": item})
 		idxToItem[reasoningIndex] = item
 	}
@@ -1137,7 +1189,7 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 		text := msgSB.String()
 		emit("response.output_text.done", map[string]any{"item_id": msgItemID, "output_index": msgIndex, "content_index": 0, "text": text})
 		emit("response.content_part.done", map[string]any{"item_id": msgItemID, "output_index": msgIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "annotations": []any{}, "text": text}})
-		item := map[string]any{"id": msgItemID, "type": "message", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "annotations": []any{}, "text": text}}}
+		item := map[string]any{"id": msgItemID, "type": "message", "status": itemStatus, "role": "assistant", "content": []any{map[string]any{"type": "output_text", "annotations": []any{}, "text": text}}}
 		emit("response.output_item.done", map[string]any{"output_index": msgIndex, "item": item})
 		idxToItem[msgIndex] = item
 	}
@@ -1152,11 +1204,13 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 			emit("response.custom_tool_call_input.delta", map[string]any{
 				"item_id": tcItemID[idx], "output_index": tcIndex[idx], "delta": input,
 			})
-			emit("response.custom_tool_call_input.done", map[string]any{
-				"item_id": tcItemID[idx], "output_index": tcIndex[idx], "input": input,
-			})
+			if finishReason != "length" {
+				emit("response.custom_tool_call_input.done", map[string]any{
+					"item_id": tcItemID[idx], "output_index": tcIndex[idx], "input": input,
+				})
+			}
 			item := map[string]any{
-				"id": tcItemID[idx], "type": "custom_tool_call", "status": "completed",
+				"id": tcItemID[idx], "type": "custom_tool_call", "status": itemStatus,
 				"call_id": st.ID, "name": meta.Name, "input": input,
 			}
 			emit("response.output_item.done", map[string]any{"output_index": tcIndex[idx], "item": item})
@@ -1167,8 +1221,10 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 		if meta.Namespace != "" {
 			eventName = meta.Name
 		}
-		emit("response.function_call_arguments.done", map[string]any{"item_id": tcItemID[idx], "output_index": tcIndex[idx], "name": eventName, "arguments": args})
-		item := map[string]any{"id": tcItemID[idx], "type": "function_call", "status": "completed", "call_id": st.ID, "name": st.Name, "arguments": args}
+		if finishReason != "length" {
+			emit("response.function_call_arguments.done", map[string]any{"item_id": tcItemID[idx], "output_index": tcIndex[idx], "name": eventName, "arguments": args})
+		}
+		item := map[string]any{"id": tcItemID[idx], "type": "function_call", "status": itemStatus, "call_id": st.ID, "name": st.Name, "arguments": args}
 		if meta.Namespace != "" {
 			item["name"] = meta.Name
 			item["namespace"] = meta.Namespace
@@ -1188,17 +1244,28 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	final["status"] = "completed"
 	final["output"] = output
 	final["completed_at"] = time.Now().Unix()
+	terminalEvent := "response.completed"
+	if finishReason == "length" {
+		terminalEvent = "response.incomplete"
+		final["status"] = "incomplete"
+		final["completed_at"] = nil
+		final["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+	}
 	if usage != nil {
 		final["usage"] = toResponsesUsage(usage)
 	}
 	observeModelCredit(r, acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
-	emit("response.completed", map[string]any{"response": final})
+	emit(terminalEvent, map[string]any{"response": final})
 
 	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 	if scanErr == nil {
-		debugEvent(r, "info", "stream_response_completed", map[string]any{"status_code": http.StatusOK})
+		event := "stream_response_completed"
+		if finishReason == "length" {
+			event = "stream_response_incomplete"
+		}
+		debugEvent(r, "info", event, map[string]any{"status_code": http.StatusOK, "finish_reason": finishReason})
 	}
 	recordModelLatency(modelName, time.Since(startTime))
 	log.Printf("[#%d] Responses 流式输出完成 (账号 %s [%s], 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, time.Since(startTime), body.text())

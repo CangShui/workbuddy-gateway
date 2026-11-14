@@ -153,6 +153,28 @@ func ensureRuntimeConfigFile(path string) error {
 			break
 		}
 	}
+	if !hasKey(doc, "upstream") {
+		doc["upstream"] = json.RawMessage(`{"emptyResponseRecovery":false}`)
+		changed = true
+	} else {
+		for key, raw := range doc {
+			if !strings.EqualFold(key, "upstream") {
+				continue
+			}
+			var fields map[string]json.RawMessage
+			if json.Unmarshal(raw, &fields) == nil {
+				if fields == nil {
+					fields = map[string]json.RawMessage{}
+				}
+				if !hasKey(fields, "emptyResponseRecovery") {
+					fields["emptyResponseRecovery"] = json.RawMessage("false")
+					doc[key], _ = json.Marshal(fields)
+					changed = true
+				}
+			}
+			break
+		}
+	}
 	if !changed {
 		return nil
 	}
@@ -184,7 +206,7 @@ func ensureRuntimeConfigFile(path string) error {
 	if err := os.Rename(temporary, path); err != nil {
 		return err
 	}
-	log.Printf("[配置初始化] 已补充缺失的 identity/concurrent 默认配置；实验功能 identity.responseRestore 缺省补为 false，已有值和其他配置保留，后续修改仍可热加载")
+	log.Printf("[配置初始化] 已补充缺失默认配置；实验功能 identity.responseRestore 和 upstream.emptyResponseRecovery 缺省补为 false，已有值和其他配置保留，后续修改仍可热加载")
 	return nil
 }
 
@@ -375,6 +397,9 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	logIdentityRuntimeConfig(trace)
 	previousProfile := officialRequests.Load()
 	setRequestProfile(profile)
+	emptyResponseRecovery.Store(c.Upstream.EmptyResponseRecovery)
+	log.Printf("[空正文恢复配置] traceId=%s 实验功能=true 启用=%t 说明=默认关闭；开启后同账号同模型最多关思考重发一次，可能额外计费；首段正文出现前缓冲推理文本",
+		trace, c.Upstream.EmptyResponseRecovery)
 	// 未配置 upstream.requestProfile 时会回退 legacy，出站请求体因此不压缩。
 	// 该回退此前是静默的：升级后只能从「请求体没变小」间接推断，故启动时无条件打印一次。
 	profileSource := "config.json upstream.requestProfile"

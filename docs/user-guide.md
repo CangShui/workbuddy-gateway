@@ -644,7 +644,8 @@ workbuddy-gateway serve -models-refresh 0
     "idleTimeoutSeconds": 120,
     "transientRetries": 2,
     "streamKeepaliveSeconds": 15,
-    "enableFirstByteRetry": true
+    "enableFirstByteRetry": true,
+    "emptyResponseRecovery": false
   }
 }
 ```
@@ -658,6 +659,7 @@ workbuddy-gateway serve -models-refresh 0
 |---|---|---|
 | SSE 心跳 | 15 秒 | `upstream.streamKeepaliveSeconds` 可覆盖；省略或非正数使用默认值。等待首个有效 data 期间发送 `: keepalive` 注释，首个有效 data 后停止 |
 | 首字节前重放 | 开启 | `upstream.enableFirstByteRetry` 可显式设为 `false` 关闭。仅在客户端未收到任何有效 data、错误属于瞬时网络故障或上游空闲超时、且重放预算未用尽时，重新走账号池发一次 |
+| 实验性空正文恢复 | 关闭 | `upstream.emptyResponseRecovery:true` 允许国内 DeepSeek flash 在思考耗尽预算且没有正文或工具时，同账号、同模型关思考重发一次；可能额外计费，详见[恢复说明](outbound-compatibility.md#实验性空正文恢复) |
 | 重放上限 | 1 次 | 已下发任何有效 data、客户端主动取消、扫描器错误或非网络错误一律不重放 |
 
 心跳是标准 SSE 注释，不会产生伪 token。重放可能额外消耗一次上游额度，但不会向客户端

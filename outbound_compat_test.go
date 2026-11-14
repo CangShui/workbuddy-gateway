@@ -101,9 +101,9 @@ func TestOfficialBodyDefaultsPreserveExplicitValuesAndUserData(t *testing.T) {
 		model, body            string
 		temperature, verbosity bool
 	}{
-		{"deepseek-v4.1-flash", `{}`, true, true},
-		{"deepseek-v4.1-flash", `{"temperature":null,"verbosity":null,"stream_options":null}`, true, true},
-		{"deepseek-v4.1-flash", `{"top_p":0.9}`, false, true},
+		{"deepseek-v4.1-flash", `{}`, true, false},
+		{"deepseek-v4.1-flash", `{"temperature":null,"verbosity":null,"stream_options":null}`, true, false},
+		{"deepseek-v4.1-flash", `{"top_p":0.9}`, false, false},
 		{"unknown-model", `{}`, false, false},
 	} {
 		obj := decodeObject(t, []byte(tc.body))
@@ -324,7 +324,7 @@ func TestOfficialThreeProtocolsReachSameDecodedUpstream(t *testing.T) {
 	}
 	body := first
 	if body["reasoning_effort"] != "max" || body["temperature"] != float64(1) ||
-		body["verbosity"] != "high" || body["stream_options"].(map[string]any)["include_usage"] != true {
+		body["verbosity"] != nil || body["stream_options"].(map[string]any)["include_usage"] != true {
 		t.Fatal("official body defaults missing")
 	}
 	var outCount int
@@ -457,7 +457,10 @@ func TestOfficialPrivateCaptureReplay(t *testing.T) {
 			chat["reasoning_effort"] != legacy["reasoning_effort"] {
 			t.Fatal("private replay changed client messages, tools or explicit effort")
 		}
-		if model == "deepseek-v4.1-flash" && (chat["verbosity"] != "high" || chat["temperature"] != 1) {
+		if !reflect.DeepEqual(chat["verbosity"], legacy["verbosity"]) {
+			t.Fatal("private replay changed explicit verbosity")
+		}
+		if model == "deepseek-v4.1-flash" && chat["temperature"] == nil && chat["top_p"] == nil {
 			t.Fatal("private replay did not apply observed defaults")
 		}
 	}

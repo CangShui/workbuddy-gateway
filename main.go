@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/subtle"
@@ -1681,6 +1680,10 @@ func clearDisabledMarker(path string) {
 
 // isAuthFailure 判断上游响应是否为授权失效（401/403 / invalid token / 登录过期等）。
 func isAuthFailure(statusCode int, body string) bool {
+	// 11140 还用于模型限流和内容审核，不能仅凭 HTTP 403 禁用并轮转账号。
+	if envelope := parseRestrictionEnvelope([]byte(body)); envelope != nil && envelope.usesCode() {
+		return envelope.restricted()
+	}
 	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
 		return true
 	}
@@ -3648,6 +3651,12 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			log.Printf("[#%d] 账号 %s [%s] 上游返回 HTTP %d: %s (耗时 %v)", reqID, acc.Path, prof.Label, resp.StatusCode, errStr, time.Since(startTime))
 			log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=失败 账号=%s", traceID, reqID, prof.chatURL(), resp.StatusCode, acc.Path)
 
+			if isAccountRestrictionPayload(errBody) {
+				markAccountRestricted(r, acc, reqID, modelName)
+				writeUpstreamError(w, r, http.StatusForbidden, "account_restricted", errUpstreamAccountRestricted.Error())
+				return nil, nil, nil, false
+			}
+
 			if isQuotaExhausted(resp.StatusCode, errStr) {
 				markModelQuotaBlocked(acc, modelName, errStr)
 				if selection == selectionProbeExhausted {
@@ -3802,6 +3811,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	resp = recoverEmptyResponse(w, r, resp, acc, prof, upstreamBytes, modelName, reqID, startTime, isStream)
 	if isStream {
 		streamChatResponseResilient(w, r, resp, modelName, reqID, acc, prof, startTime, upstreamBytes)
 	} else {
@@ -3857,9 +3867,9 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 	for attempt := 0; ; attempt++ {
 		body := newTTFTReader(resp.Body, startTime)
 		finalBody = body
-		scanner := bufio.NewScanner(body)
-		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		scanner := newUpstreamSSEScanner(body, r)
 		var usage map[string]any
+		var output completionOutput
 		finishReason := ""
 		sawDone := false
 		commentLines, metadataLines := 0, 0
@@ -3899,10 +3909,16 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 			var chunk map[string]any
 			if json.Unmarshal([]byte(cleanData), &chunk) == nil {
 				observeFirstToken(body, chunk)
+				output.observe(chunk)
 				if u, ok := chunk["usage"].(map[string]any); ok {
 					usage = u
 				}
 				finishReason = noteFinishReason(finishReason, chunk)
+			}
+			if output.emptyLimit(finishReason) {
+				// 暂不发送空正文的 length 终止帧；继续读取独立 usage 帧，
+				// 收尾时只返回预算错误，避免客户端先把空结果当作成功。
+				continue
 			}
 			if restorePlan.active() {
 				if cleanedChunk := cleanChunkObject(cleanData, restorePlan, restorers); cleanedChunk != "" {
@@ -3948,6 +3964,23 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 
 		completeTokenStream(body, scanErr == nil && finishReason != "")
 		if scanErr != nil {
+			if errors.Is(scanErr, errUpstreamAccountRestricted) {
+				markAccountRestricted(r, acc, reqID, modelName)
+				payload, _ := json.Marshal(map[string]any{"error": accountRestrictionError()})
+				guard.writeData(string(payload))
+				statsObserveUsage(r, usage, false)
+				recordModelTokens(modelName, usage, reqID)
+				recordModelLatency(modelName, time.Since(startTime))
+				return
+			}
+			if failure := upstreamSSEClientError(scanErr); failure != nil {
+				payload, _ := json.Marshal(map[string]any{"error": failure})
+				guard.writeData(string(payload))
+				statsObserveUsage(r, usage, false)
+				recordModelTokens(modelName, usage, reqID)
+				recordModelLatency(modelName, time.Since(startTime))
+				return
+			}
 			// 流被中断（上游卡死 / 超时 / 客户端取消）时，绝不补发 [DONE]：
 			// 补发等于告诉下游「正常结束」，会让残缺的工具调用被当成完整结果执行。
 			debugEvent(r, "error", "stream_response_failed", map[string]any{
@@ -3986,20 +4019,28 @@ func streamChatResponseWithReplay(w http.ResponseWriter, r *http.Request, resp *
 			guard.writeData(string(errPayload))
 			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流结束 账号=%s 结果=拒绝当成成功 原因=连接正常关闭但没有非空 finish_reason 是否看到DONE=%t 业务影响=不补发 [DONE]，客户端收到 stream_closed_without_finish 是否已处理=是",
 				debugTraceID(r), reqID, acc.Path, sawDone)
+		} else if output.emptyLimit(finishReason) {
+			payload, _ := json.Marshal(outputBudgetErrorPayload(usage, false))
+			guard.writeData(string(payload))
 		} else {
 			if sawDone {
 				guard.writeData("[DONE]")
 			}
-			debugEvent(r, "info", "stream_response_completed", map[string]any{
+			event := "stream_response_completed"
+			if finishReason == "length" {
+				event = "stream_response_incomplete"
+			}
+			debugEvent(r, "info", event, map[string]any{
 				"status_code":   http.StatusOK,
 				"finish_reason": finishReason,
 				"saw_done":      sawDone,
 			})
 		}
 		if scanErr == nil && finishReason != "" {
+			logOutputBudget(r, reqID, modelName, finishReason, output, usage)
 			observeModelCredit(r, acc, modelName, usage, reqID)
 		}
-		statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
+		statsObserveUsage(r, usage, scanErr == nil && finishReason != "" && finishReason != "length")
 		recordModelTokens(modelName, usage, reqID)
 		recordModelLatency(modelName, time.Since(startTime))
 		if scanErr == nil && finishReason != "" {
@@ -4014,8 +4055,17 @@ func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	defer resp.Body.Close()
 	body := newTTFTReader(resp.Body, startTime)
 	defer finishFirstToken(r, modelName, reqID, body)
-	completionJSON, err := aggregateCompletion(body, modelName)
+	completionJSON, err := aggregateCompletion(body, modelName, r)
 	if err != nil {
+		if errors.Is(err, errUpstreamAccountRestricted) {
+			markAccountRestricted(r, acc, reqID, modelName)
+			writeUpstreamError(w, r, http.StatusForbidden, "account_restricted", err.Error())
+			return
+		}
+		if failure := upstreamSSEClientError(err); failure != nil {
+			writeUpstreamError(w, r, http.StatusBadGateway, "upstream_error", strOf(failure["message"]))
+			return
+		}
 		debugEvent(r, "error", "aggregate_response_failed", map[string]any{
 			"error_type": debugErrorType(err),
 			"error":      safeDebugError(err),
@@ -4026,14 +4076,24 @@ func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	}
 	completionJSON = restoreChatCompletionIdentity(r, completionJSON)
 	usage := usageFromCompletion(completionJSON)
-	statsObserveUsage(r, usage, true)
+	output, finish := completionOutputFromJSON(completionJSON)
+	statsObserveUsage(r, usage, finish != "length")
+	logOutputBudget(r, reqID, modelName, finish, output, usage)
 	observeModelCredit(r, acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
 	recordModelLatency(modelName, time.Since(startTime))
+	if output.emptyLimit(finish) {
+		writeOutputBudgetError(w, usage, false)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(completionJSON)
-	debugEvent(r, "info", "aggregate_response_completed", map[string]any{
+	event := "aggregate_response_completed"
+	if finish == "length" {
+		event = "aggregate_response_incomplete"
+	}
+	debugEvent(r, "info", event, map[string]any{
 		"status_code":    http.StatusOK,
 		"response_bytes": len(completionJSON),
 	})
@@ -4502,15 +4562,14 @@ func restoreChatCompletionIdentity(r *http.Request, completionJSON []byte) []byt
 	return out
 }
 
-func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
+func aggregateCompletion(r io.Reader, model string, requests ...*http.Request) ([]byte, error) {
 	var content, reasoning, role, respModel, respID, finish string
 	var created int64
 	var usage map[string]any
 	toolCalls := map[int]*mergedToolCall{}
 	var toolOrder []int
 
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	scanner := newUpstreamSSEScanner(r, requests...)
 	for scanner.Scan() {
 		data := stripDataPrefix(scanner.Text())
 		if data == "" || data == "[DONE]" {
@@ -4554,6 +4613,9 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		if len(requests) > 0 {
+			statsObserveUsage(requests[0], usage, false)
+		}
 		return nil, fmt.Errorf("读取上游流失败: %w", err)
 	}
 	if finish == "" {

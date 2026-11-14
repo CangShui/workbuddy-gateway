@@ -99,6 +99,8 @@ type runtimeFileConfig struct {
 		// EnableFirstByteRetry：是否允许首字节前对瞬时网络中断安全重放一次。
 		// 指针区分「未配置」（默认开启）与显式 false（关闭）。
 		EnableFirstByteRetry *bool `json:"enableFirstByteRetry"`
+		// EmptyResponseRecovery 实验性空正文恢复；默认关闭，允许同账号关思考重发一次。
+		EmptyResponseRecovery bool `json:"emptyResponseRecovery"`
 	} `json:"upstream"`
 	// Models 段可选，用于按模型名做黑白名单控制（大小写不敏感）。
 	Models struct {

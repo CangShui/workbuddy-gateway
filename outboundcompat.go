@@ -59,6 +59,7 @@ func requestProfileFor(r *http.Request) string {
 // 三个入口在协议转译后共用此处。不要提升 user 角色，不替换客户端指令或工具。
 func prepareUpstreamChatRequest(obj map[string]any, r *http.Request, requestID uint64, model string) {
 	profile := requestProfileFor(r)
+	snapshotEmptyResponseRecovery(r)
 	trace := debugTraceID(r)
 	applyThinkingRules(obj, model)
 	normalizeDeveloperRoles(obj, r, requestID)
@@ -102,7 +103,7 @@ func applyOfficialBodyDefaults(obj map[string]any, r *http.Request, id uint64, m
 			added = append(added, "stream_options.include_usage")
 		}
 	}
-	// 只有该模型有完整桌面样本。其他模型不猜测其 temperature/verbosity 支持范围。
+	// 只有该模型有完整桌面样本。其他模型不猜测 temperature 支持范围。
 	if normalizeModelName(model) == "deepseek-v4.1-flash" {
 		if !clientDeclaredOutputBudget(obj) {
 			put("max_tokens", 128000) // 目录尚未就绪时，使用已验证的样本输出上限。
@@ -110,7 +111,6 @@ func applyOfficialBodyDefaults(obj map[string]any, r *http.Request, id uint64, m
 		if obj["top_p"] == nil {
 			put("temperature", 1)
 		}
-		put("verbosity", "high")
 	}
 	sort.Strings(added)
 	log.Printf("[出站兼容] traceId=%s requestId=%d profile=official 阶段=正文准备 模型=%s 补入字段=%v 结果=完成 说明=保留显式档位、用户角色、原文与工具；不复制官方私有提示词",

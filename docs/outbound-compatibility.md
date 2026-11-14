@@ -43,7 +43,7 @@
 3. 在缺少该字段时补 `stream_options.include_usage=true`，不覆盖显式 false。
 4. 对已有完整样本的 `deepseek-v4.1-flash`：
    - 未指定 temperature，且未指定 top_p 时，补 temperature=1；
-   - 未指定 verbosity 时，补 verbosity=high；
+   - 不附加正文长度偏好；客户端显式指定的 verbosity 原样保留；
    - 未声明输出预算且模型目录还没有上限时，补已验证的 max_tokens=128000。
 5. Chat 的 max_completion_tokens 在没有 max_tokens 时转为 max_tokens；
    两者同时存在时不擅自覆盖客户端值。客户端仍应避免传入互相冲突的预算。
@@ -64,11 +64,28 @@ tool_choice 和 parallel_tool_calls 不因官方样本省略就被删除，工�
 | Responses parallel_tool_calls | parallel_tool_calls，保留 false |
 | Responses max_output_tokens | max_tokens |
 | Messages output_config.effort | reasoning_effort，优先于旧 thinking.effort 和预算推导 |
+| Messages output_config.format=json_schema | response_format.json_schema，保留 schema，补 name=response、strict=true |
 | Messages thinking.type=disabled | 继续关闭思考，不被 output_config 再次开启 |
 | Messages tool_choice.disable_parallel_tool_use | parallel_tool_calls 的反值 |
 
 不执行 `high→max` 的无条件升级。用户主动选 high、辅助标题任务使用 high，
 与前置代理错误降档不是一回事。
+
+Messages 未指定 `output_config.format` 时保持原行为；显式提供的格式必须是带对象
+`schema` 的 `json_schema`，不支持或格式错误返回 400，不静默丢弃约束。schema 的实际
+支持范围由上游模型决定，网关不删改其属性，也不把它改写成提示词。
+
+### 上游 SSE 和账号风控
+
+- Chat、Responses、Messages 的流式、聚合与空正文恢复共用粘帧解析规则：
+  同一 `data:` 行中的多个完整 JSON 对象按顺序分别处理，正文、工具参数和用量不丢失。
+  普通帧和心跳保持原有处理；不把字符串里的括号当作帧边界。
+- 错误信封不能被后续成功帧覆盖；失败不补成功终态，不作为网络故障自动重放。
+- 只有结构化业务码 `11140` 与账号专属限制文案同时匹配，才判为账号风控。
+  HTTP 错误、HTTP 200 内错误事件以及粘帧中的错误使用同一判据，正文和工具参数不参与匹配。
+- 命中时停止本次请求换号，仅将当前账号标记为不可调度，保留凭据和失效标记供用户处理。
+  不做额外凭据探测、不设置全池或站点暂停，下一条请求仍可选择健康账号。
+- 这些是直接生效的协议修复，不增加配置开关，不改变 MAX、客户端输出预算或实验恢复的默认关闭状态。
 
 ### 国内模型请求头及压缩
 
@@ -216,6 +233,50 @@ body_bytes = 未压缩JSON长度
 
 因此能直接比对完整 messages/tools，而不会把 gzip 二进制误当 JSON。
 这些是 HTTP 发送前快照，不是 TLS 抓包。排障后应关闭 fullRequests，完整业务正文依然敏感。
+
+## 输出预算耗尽
+
+上游以 `finish_reason:"length"` 结束表示输出预算耗尽，不等于任务已经完成。思考模型可能把预算全部用于推理，没有留下正文；“无限 token”之类的提示词不能改变实际预算。
+
+三个入口在 legacy / official 模式下采用相同处理：
+
+| 入口 | 只有推理或空白、没有正文和工具 | 已有正文或工具参数但被截断 |
+|---|---|---|
+| Chat Completions | 聚合返回 HTTP 400；流式返回 `error.code:"output_budget_exhausted"`，不再发送成功终止帧和 `[DONE]` | 保留已有增量和 `finish_reason:"length"` |
+| Responses | 返回 `status:"incomplete"`、`incomplete_details.reason:"max_output_tokens"`；流式用 `response.incomplete` 收尾 | 相同；输出条目标记为 `incomplete`，不发送工具参数完成事件 |
+| Messages | 聚合返回 HTTP 400；流式返回 `error` 事件，错误码为 `output_budget_exhausted`，不发送 `message_stop` | 保留已有块和 `stop_reason:"max_tokens"` |
+
+所有预算截断均不计为完整成功，但保留上游实际返回的 token 和费用统计。账号不会因此被禁用、冷却或标为余额不足。默认不恢复、不换号重试、不自动续写、不关闭思考，不修改用户指定的模型、MAX 档位或输出上限。
+
+客户端遇到预算耗尽时应向用户展示原因，而不是原样无限重试。可按任务需要主动降低思考档位、缩小单次交付范围，或在模型支持的范围内调整预算。已经收到的截断代码和工具参数不能当成完整交付。
+
+这修正的是失败识别和协议转译，不保证上游 MAX 一定在预算内输出正文，也没有加入未经上游验证的独立思考预算字段。
+
+## 实验性空正文恢复
+
+默认 `upstream.emptyResponseRecovery:false`。只有显式开启时才允许额外生成；关闭时不读取或缓存上游响应，不新增调用。先部署包含该字段的新构建，再修改配置；回退不认识该字段的旧构建前需移除新字段。
+
+在现有 `upstream` 对象中设置：
+
+```json
+{
+  "emptyResponseRecovery": true
+}
+```
+
+当前仅用于已确认可关闭思考的国内 `deepseek-v4.1-flash`，三个协议的流式与聚合入口共用：
+
+- 首轮仍保留客户端指定的 MAX 等档位。只有正常 `length` 结束、正文仅为空白或缺失、没有任何工具增量、客户端没有取消，才恢复。
+- 同账号、同模型、同任务、同输出预算，最多额外生成一次；恢复请求明确设置 `thinking.type=disabled`，去掉思考控制字段。不换账号、不改变工具或提示词、不扩大预算。
+- 每轮遵守原来的输出上限，但两轮合计用量可能超过单轮上限；恢复不是免费重发。
+- 已出现正文、工具身份片段或参数，或发生网络/授权/限流错误时，不进入空正文恢复。`n>1` 和极小探活预算保持原流程。
+- 恢复仍失败就结束，不形成重试循环，不把截断结果伪装成完整成品。
+- 失败首轮与恢复轮分别进入统计。返回用量汇总已知 token；只有两轮费用都已知时才返回合计 credit，缺失不当作免费。`usage.reasoning_recovery` 带两轮原始 usage、尝试数、实际关闭思考模式、恢复结果及费用完整性。Responses / Messages 的 usage 同样包含此扩展。
+- 配置热加载只影响新请求，在飞请求使用入口快照。日志沿用同一 TraceID，不记录提示词和思维链正文。
+
+**开启后的流式取舍：** 首段正文出现前暂存推理文本，并发送 SSE 心跳保活。一旦出现正文或工具，立即释放暂存并沿用原流；若触发恢复，首轮失败的推理不混入最终回答，恢复结果聚合完整后再发送。推理显示会延迟，不承诺降低总耗时；响应头 `X-Reasoning-Recovery-Policy` 标明允许的恢复策略。
+
+这是一项交付恢复，不是全程 MAX。它可能新增一次收费生成，不能把恢复后的成品标成纯 MAX，也不能保证恢复一定成功。生产网关不运行、修补或拼接生成的 HTML/JavaScript。
 
 ## 验证与边界
 

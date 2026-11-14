@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -67,7 +66,7 @@ func anthropicErrType(errType string) string {
 	switch errType {
 	case "no_auth", "invalid_api_key":
 		return "authentication_error"
-	case "model_disabled", "model_account_disabled":
+	case "model_disabled", "model_account_disabled", "account_restricted":
 		return "permission_error"
 	case "model_rate_limited", "all_accounts_cooldown":
 		return "rate_limit_error"
@@ -150,6 +149,12 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	chatReq, err := anthropicToChatRequest(msgReq, modelName)
 	if err != nil {
+		log.Printf("[协议转换] traceId=%s requestId=%d 入口=/v1/messages 结果=拒绝 原因=%v 业务影响=请求未发往上游，不记录schema或消息正文",
+			debugTraceID(r), reqID, err)
+		debugEvent(r, "warn", "messages_conversion_rejected", map[string]any{
+			"status_code": http.StatusBadRequest, "reason": err.Error(),
+			"business_impact": "协议参数无法转换，未调用上游",
+		})
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
@@ -166,16 +171,18 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	debugEvent(r, "info", "messages_request_converted", map[string]any{
-		"upstream_bytes":  len(upstreamBytes),
-		"business_impact": "Anthropic请求已转换并执行提示词、工具序列及推理历史规则，准备调用上游",
+		"upstream_bytes":    len(upstreamBytes),
+		"structured_output": chatReq["response_format"] != nil,
+		"business_impact":   "Anthropic请求已转换并执行提示词、工具序列及推理历史规则，准备调用上游",
 	})
-	log.Printf("[协议转换] traceId=%s requestId=%d 入口=/v1/messages 模型=%s 流式=%t 上游请求字节=%d 结果=已转换并应用统一规则，未记录提示词正文",
-		w.Header().Get("X-Trace-ID"), reqID, modelName, isStream, len(upstreamBytes))
+	log.Printf("[协议转换] traceId=%s requestId=%d 入口=/v1/messages 模型=%s 流式=%t 上游请求字节=%d 结构化输出=%t 结果=已转换并应用统一规则，未记录提示词或schema正文",
+		w.Header().Get("X-Trace-ID"), reqID, modelName, isStream, len(upstreamBytes), chatReq["response_format"] != nil)
 
 	resp, acc, prof, ok := upstreamChat(w, r, reqID, modelName, upstreamBytes, startTime)
 	if !ok {
 		return
 	}
+	resp = recoverEmptyResponse(w, r, resp, acc, prof, upstreamBytes, modelName, reqID, startTime, isStream)
 	if isStream {
 		streamMessagesResponse(w, r, resp, modelName, reqID, acc, prof, startTime, wantThinking)
 	} else {
@@ -190,6 +197,11 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 // anthropicToChatRequest 将 Anthropic Messages 请求体转换为上游 Chat 请求体。
 func anthropicToChatRequest(body map[string]any, modelName string) (map[string]any, error) {
 	chat := map[string]any{"model": modelName}
+	if format, err := messagesResponseFormat(body); err != nil {
+		return nil, err
+	} else if format != nil {
+		chat["response_format"] = format
+	}
 
 	messages := []any{}
 	if sys := extractAnthropicSystemText(body["system"]); sys != "" {
@@ -276,6 +288,32 @@ func anthropicToChatRequest(body map[string]any, modelName string) (map[string]a
 		}
 	}
 	return chat, nil
+}
+
+// messagesResponseFormat 仅转换协议外层，不改写客户端 JSON Schema。
+func messagesResponseFormat(body map[string]any) (map[string]any, error) {
+	if body["output_config"] == nil {
+		return nil, nil
+	}
+	output, ok := body["output_config"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("output_config 必须是对象")
+	}
+	if output["format"] == nil {
+		return nil, nil
+	}
+	format, ok := output["format"].(map[string]any)
+	if !ok || format["type"] != "json_schema" {
+		return nil, fmt.Errorf("output_config.format 仅支持 json_schema 对象")
+	}
+	schema, ok := format["schema"].(map[string]any)
+	if !ok || schema == nil {
+		return nil, fmt.Errorf("output_config.format.schema 必须是 JSON Schema 对象")
+	}
+	return map[string]any{
+		"type":        "json_schema",
+		"json_schema": map[string]any{"name": "response", "strict": true, "schema": schema},
+	}, nil
 }
 
 func strOf(v any) string {
@@ -569,6 +607,7 @@ type anthropicStreamState struct {
 	toolOrder    []int
 	finish       string
 	usage        map[string]any
+	output       completionOutput
 	// 身份还原：正文与推理正文两个文本通道各持有跨分片尾部缓存。
 	// 两者为 nil 表示未启用还原，文本块照旧立即收口，行为与引入前一致。
 	thinkingRestorer *identityRestorer
@@ -608,6 +647,7 @@ func (s *anthropicStreamState) emit(eventType string, data map[string]any) []byt
 // feed 消费一个上游 chunk，返回 0..n 个 Anthropic 事件。
 func (s *anthropicStreamState) feed(chunk map[string]any) []byte {
 	var out []byte
+	s.output.observe(chunk)
 	// 上游可能改写 model（别名解析等），message_start 用回显值
 	if m := strOf(chunk["model"]); m != "" {
 		s.model = m
@@ -842,12 +882,16 @@ func (s *anthropicStreamState) anthropicUsage() map[string]any {
 	if cached > in {
 		cached = in // 上游给了畸形命中数时钳到非负
 	}
-	return map[string]any{
+	result := map[string]any{
 		"input_tokens":                in - cached,
 		"cache_read_input_tokens":     cached,
 		"cache_creation_input_tokens": 0,
 		"output_tokens":               out,
 	}
+	if recovery := s.usage["reasoning_recovery"]; recovery != nil {
+		result["reasoning_recovery"] = recovery
+	}
+	return result
 }
 
 // finishEvents 关闭所有未收口块并输出 message_delta + message_stop。
@@ -923,9 +967,8 @@ func anthropicSignature(s string) string {
 
 // scanUpstreamSSE 逐行扫描上游 SSE 并把每个 chunk 喂给状态机。
 // 返回 scanner 错误（nil 表示干净 EOF）。
-func scanUpstreamSSE(body io.Reader, state *anthropicStreamState, sink func([]byte)) error {
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+func scanUpstreamSSE(body io.Reader, state *anthropicStreamState, sink func([]byte), requests ...*http.Request) error {
+	scanner := newUpstreamSSEScanner(body, requests...)
 	for scanner.Scan() {
 		data := stripDataPrefix(scanner.Text())
 		if data == "" || data == "[DONE]" {
@@ -970,9 +1013,20 @@ func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.R
 	state := newRestoringAnthropicStreamState(modelName, wantThinking, identityRestoreFor(r))
 	body := newTTFTReader(resp.Body, startTime)
 	defer finishFirstToken(r, modelName, reqID, body)
-	scanErr := scanUpstreamSSE(body, state, writeEvent)
-	statsObserveUsage(r, state.usage, scanErr == nil && state.finish != "")
+	scanErr := scanUpstreamSSE(body, state, writeEvent, r)
+	statsObserveUsage(r, state.usage, scanErr == nil && state.finish != "" && state.finish != "length")
 	if scanErr != nil {
+		if errors.Is(scanErr, errUpstreamAccountRestricted) {
+			markAccountRestricted(r, acc, reqID, modelName)
+			writeEvent(state.emit("error", map[string]any{"error": accountRestrictionError()}))
+			recordModelLatency(modelName, time.Since(startTime))
+			return
+		}
+		if failure := upstreamSSEClientError(scanErr); failure != nil {
+			writeEvent(state.emit("error", map[string]any{"error": failure}))
+			recordModelLatency(modelName, time.Since(startTime))
+			return
+		}
 		debugEvent(r, "error", "stream_response_failed", map[string]any{
 			"error_type": debugErrorType(scanErr),
 			"error":      safeDebugError(scanErr),
@@ -1005,12 +1059,20 @@ func streamMessagesResponse(w http.ResponseWriter, r *http.Request, resp *http.R
 		return
 	}
 
-	writeEvent(state.finishEvents())
+	logOutputBudget(r, reqID, modelName, state.finish, state.output, state.usage)
 	observeModelCredit(r, acc, modelName, state.usage, reqID)
-	statsObserveUsage(r, state.usage, true)
 	recordModelTokens(modelName, state.usage, reqID)
 	recordModelLatency(modelName, time.Since(startTime))
-	debugEvent(r, "info", "stream_response_completed", map[string]any{"status_code": http.StatusOK})
+	if state.output.emptyLimit(state.finish) {
+		writeEvent(state.emit("error", outputBudgetErrorPayload(state.anthropicUsage(), true)))
+		return
+	}
+	writeEvent(state.finishEvents())
+	event := "stream_response_completed"
+	if state.finish == "length" {
+		event = "stream_response_incomplete"
+	}
+	debugEvent(r, "info", event, map[string]any{"status_code": http.StatusOK, "finish_reason": state.finish})
 	log.Printf("[响应完成] traceId=%s requestId=%d Messages流式输出完成 账号=%s 站点=%s 耗时=%v 首Token(v2)=%s", debugTraceID(r), reqID, acc.Path, prof.Label, time.Since(startTime), body.text())
 }
 
@@ -1020,7 +1082,18 @@ func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.R
 	state := newRestoringAnthropicStreamState(modelName, wantThinking, identityRestoreFor(r))
 	body := newTTFTReader(resp.Body, startTime)
 	defer finishFirstToken(r, modelName, reqID, body)
-	if err := scanUpstreamSSE(body, state, nil); err != nil {
+	if err := scanUpstreamSSE(body, state, nil, r); err != nil {
+		if errors.Is(err, errUpstreamAccountRestricted) {
+			markAccountRestricted(r, acc, reqID, modelName)
+			statsObserveUsage(r, state.usage, false)
+			writeUpstreamError(w, r, http.StatusForbidden, "account_restricted", err.Error())
+			return
+		}
+		if failure := upstreamSSEClientError(err); failure != nil {
+			statsObserveUsage(r, state.usage, false)
+			writeUpstreamError(w, r, http.StatusBadGateway, "upstream_error", strOf(failure["message"]))
+			return
+		}
 		debugEvent(r, "error", "aggregate_response_failed", map[string]any{
 			"error_type": debugErrorType(err),
 			"error":      safeDebugError(err),
@@ -1037,6 +1110,15 @@ func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.R
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "上游流结束但没有 finish_reason，本次回复不完整")
 		return
 	}
+	logOutputBudget(r, reqID, modelName, state.finish, state.output, state.usage)
+	if state.output.emptyLimit(state.finish) {
+		observeModelCredit(r, acc, modelName, state.usage, reqID)
+		statsObserveUsage(r, state.usage, false)
+		recordModelTokens(modelName, state.usage, reqID)
+		recordModelLatency(modelName, time.Since(startTime))
+		writeOutputBudgetError(w, state.anthropicUsage(), true)
+		return
+	}
 	// 非流式聚合也要冲刷还原器暂存的尾部，否则 text/reasoning 结尾会被截断。
 	if state.thinkingRestorer != nil {
 		if tail := state.thinkingRestorer.Flush(); tail != "" && state.thinking != nil {
@@ -1050,7 +1132,7 @@ func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.R
 	}
 	msg := state.aggregate()
 	observeModelCredit(r, acc, modelName, state.usage, reqID)
-	statsObserveUsage(r, state.usage, true)
+	statsObserveUsage(r, state.usage, state.finish != "length")
 	recordModelTokens(modelName, state.usage, reqID)
 	recordModelLatency(modelName, time.Since(startTime))
 	out, err := json.Marshal(msg)
@@ -1061,7 +1143,11 @@ func writeMessagesAggregate(w http.ResponseWriter, r *http.Request, resp *http.R
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
-	debugEvent(r, "info", "aggregate_response_completed", map[string]any{
+	event := "aggregate_response_completed"
+	if state.finish == "length" {
+		event = "aggregate_response_incomplete"
+	}
+	debugEvent(r, "info", event, map[string]any{
 		"status_code":    http.StatusOK,
 		"response_bytes": len(out),
 	})
