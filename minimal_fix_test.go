@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-func isolateSecrets(t *testing.T) {
+func isolateSecrets(t testing.TB) {
 	t.Helper()
 	old := map[string]struct{}{}
 	sensitiveSecrets.Range(func(key, value any) bool {
@@ -25,6 +25,7 @@ func isolateSecrets(t *testing.T) {
 		sensitiveSecrets.Delete(key)
 		return true
 	})
+	invalidateRedactionBundle()
 	t.Cleanup(func() {
 		sensitiveSecrets.Range(func(key, _ any) bool {
 			sensitiveSecrets.Delete(key)
@@ -33,6 +34,7 @@ func isolateSecrets(t *testing.T) {
 		for key := range old {
 			sensitiveSecrets.Store(key, struct{}{})
 		}
+		invalidateRedactionBundle()
 	})
 }
 

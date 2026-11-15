@@ -28,6 +28,7 @@ go test -run 'TestOfficial|TestRequestProfile|TestHarnessProtocol' -count=1
 `*_test.go` 直接使用 `package main` 私有实现，不搬进普通子目录。Go 在 `go build .` 时会排除这些文件，标准测试命令仍运行完整测试，不需要额外加载器。
 
 测试进程使用临时工作目录，配置、凭据和上游响应均为合成数据，避免污染真实文件。
+`logredact_cache_test.go` 验证缓存与原规则输出一致、新秘密注册失效、重复注册复用、并发安全、旧令牌在统计落盘时继续脱敏，以及策略与诊断审计落盘。`go test -run '^$' -bench '^BenchmarkRedactionCache$' -benchmem` 对同一组合成数据比较缓存前后的时间和分配，不读取生产数据。
 跨编译后的测试程序若在另一台机器运行，应提供同一提交的源码目录，并用 `WORKBUDDY_TEST_SOURCE_ROOT` 指定其绝对路径；这样即使使用 `-trimpath`，示例配置等文件测试也能正确定位，不必跳过这些测试。
 出站兼容测试覆盖三协议 × 流式/聚合、gzip、显式参数保留、热加载及请求身份。
 `output_budget_test.go` 覆盖两种出站模式 × 三协议 × 流式/聚合 × 六类正文/工具结束，共 72 组，验证 MAX 和显式预算保留、只发一次上游请求、预算截断不记成功且费用不丢，以及自定义工具截断和审计脱敏。

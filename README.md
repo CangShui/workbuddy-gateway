@@ -23,6 +23,7 @@ Windows 可使用 `.\workbuddy-gateway.exe`。管理端口默认 `8316`，模型
 - 多 Harness 可使用 `upstream.requestProfile: "official"` 开启统一出站兼容；旧配置省略该项保持原行为。见[出站兼容说明](docs/outbound-compatibility.md)。
 - 输出预算耗尽不再记为完整成功：Responses 返回 `incomplete`；Chat / Messages 对无正文、无工具调用的预算截断返回 `output_budget_exhausted`。实测费用仍保留，默认不自动重试或关闭思考。见[预算耗尽说明](docs/outbound-compatibility.md#输出预算耗尽)。
 - **空正文恢复是实验功能，默认关闭**：`upstream.emptyResponseRecovery:false`。开启后，国内 `deepseek-v4.1-flash` 的思考空回复可在同账号、同模型、同预算下关闭思考重发一次，可能额外计费；已有正文或工具不重放。初装及升级补齐缺失开关为 `false`，已有值保留。见[恢复行为与费用](docs/outbound-compatibility.md#实验性空正文恢复)。
+- 日志脱敏替换器按秘密词表缓存，新秘密注册后重建，重复注册复用；旧令牌继续受保护，不淘汰秘密、不裁剪历史统计。脱敏规则与诊断内容保持原有语义。
 
 ## 文档
 

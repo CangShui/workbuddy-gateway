@@ -112,6 +112,8 @@ func TestEmptyRecoveryAllProtocols(t *testing.T) {
 					var first map[string]any
 					var firstHeaders http.Header
 					cfg.HttpClient = &http.Client{Transport: retryTransportFunc(func(req *http.Request) (*http.Response, error) {
+						// 时延指标用非零合成往返，跨平台时钟粒度下也能核对同一观测值。
+						time.Sleep(2 * time.Millisecond)
 						calls++
 						sent := decodeRecoverySent(t, req)
 						data := budgetFixture(`{}`, "length")

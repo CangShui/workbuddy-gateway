@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
 )
@@ -14,17 +15,44 @@ import (
 // 脱敏仅用于日志/调试展示。不得把脱敏后的错误送回业务分类或上游响应解析。
 var sensitiveSecrets sync.Map
 
+// 词表仍只增加；只缓存派生替换器，不改变任何秘密值的保护期。
+type redactionBundle struct {
+	replacer  *strings.Replacer
+	shortList []string
+}
+
+type redactionCache struct {
+	seq    uint64
+	bundle *redactionBundle
+}
+
+var (
+	redactionCachePtr atomic.Pointer[redactionCache]
+	redactionSeq      atomic.Uint64
+)
+
 var (
 	namedSecretPattern  = regexp.MustCompile(`(?i)(\b(?:access[_-]?token|refresh[_-]?token|admin[_-]?key|api[_-]?key|x-api-key|x-refresh-token|authorization)\b["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'[^']*'|(?:Bearer[ \t]+)?[^\s,;}\[\]]+)`)
 	bearerSecretPattern = regexp.MustCompile(`(?i)(\bBearer[ \t]+)[A-Za-z0-9._~+/=-]+`)
 )
 
 func registerSecrets(values ...string) {
+	changed := false
 	for _, value := range values {
 		if value != "" {
-			sensitiveSecrets.Store(value, struct{}{})
+			if _, loaded := sensitiveSecrets.LoadOrStore(value, struct{}{}); !loaded {
+				changed = true
+			}
 		}
 	}
+	if changed {
+		invalidateRedactionBundle()
+	}
+}
+
+func invalidateRedactionBundle() {
+	redactionSeq.Add(1)
+	redactionCachePtr.Store(nil)
 }
 
 func registerCredentialSecrets(auth *StoredAuth) {
@@ -33,7 +61,7 @@ func registerCredentialSecrets(auth *StoredAuth) {
 	}
 }
 
-func redactSensitiveText(text string) string {
+func buildRedactionBundle() *redactionBundle {
 	var secrets []string
 	sensitiveSecrets.Range(func(key, _ any) bool {
 		value := key.(string)
@@ -48,19 +76,43 @@ func redactSensitiveText(text string) string {
 	})
 	// 长值优先、一次替换，避免重叠秘密值导致部分泄漏或改写替换标记。
 	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+	bundle := &redactionBundle{}
 	var pairs []string
 	for _, secret := range secrets {
 		if len(secret) >= 8 {
 			pairs = append(pairs, secret, "[REDACTED]")
+		} else {
+			bundle.shortList = append(bundle.shortList, secret)
 		}
 	}
 	if len(pairs) > 0 {
-		text = strings.NewReplacer(pairs...).Replace(text)
+		bundle.replacer = strings.NewReplacer(pairs...)
 	}
-	for _, secret := range secrets {
-		if len(secret) < 8 {
-			text = redactShortSecret(text, secret)
+	return bundle
+}
+
+func currentRedactionBundle() *redactionBundle {
+	for {
+		seq := redactionSeq.Load()
+		if cache := redactionCachePtr.Load(); cache != nil && cache.seq == seq {
+			return cache.bundle
 		}
+		bundle := buildRedactionBundle()
+		if redactionSeq.Load() != seq {
+			continue
+		}
+		redactionCachePtr.Store(&redactionCache{seq: seq, bundle: bundle})
+		return bundle
+	}
+}
+
+func redactSensitiveText(text string) string {
+	bundle := currentRedactionBundle()
+	if bundle.replacer != nil {
+		text = bundle.replacer.Replace(text)
+	}
+	for _, secret := range bundle.shortList {
+		text = redactShortSecret(text, secret)
 	}
 	text = namedSecretPattern.ReplaceAllStringFunc(text, func(match string) string {
 		parts := namedSecretPattern.FindStringSubmatch(match)
