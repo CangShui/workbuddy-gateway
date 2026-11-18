@@ -16,12 +16,7 @@
   <div class="topbar-right">
     <span class="conn" id="conn">未连接</span>
     <div class="meta" id="meta"></div>
-    <span class="key-field">
-      <label for="apiKey">管理 Key</label>
-      <input id="apiKey" type="password" placeholder="独立管理 Key" autocomplete="off">
-    </span>
-    <button id="saveKey" type="button">登录</button>
-    <button id="logout" class="ghost" type="button">退出</button>
+    <button id="logout" class="ghost hidden" type="button">退出</button>
     <button id="themeToggle" class="ghost" type="button" title="切换主题">主题</button>
   </div>
 </header>
@@ -45,6 +40,15 @@
     ② 直接在服务器上编辑 config.json，把 gateway.adminKey 设为随机字符串，保存后约 1 秒生效。
     自动生成仅限本机，避免远程抢先初始化；设置完成后可从其他设备使用管理 Key 登录。</p>
   <button id="initializeAdmin" type="button">生成并保存管理 Key</button>
+</section>
+
+<section id="loginPanel" class="login-panel card hidden" aria-labelledby="loginPanelTitle">
+  <h2 id="loginPanelTitle">管理控制台登录</h2>
+  <p class="hint">请输入服务器 <code>config.json</code> 中的 <code>gateway.adminKey</code>。管理 Key 与模型 API Key 相互独立，仅保存在当前浏览器标签页会话中。</p>
+  <div class="login-panel-row">
+    <input id="apiKey" type="password" placeholder="输入独立管理 Key (gateway.adminKey)" autocomplete="off" aria-label="管理 Key">
+    <button id="saveKey" type="button">登录控制台</button>
+  </div>
 </section>
 
 <main id="dashboard" class="hidden">

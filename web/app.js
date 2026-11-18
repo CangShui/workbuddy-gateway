@@ -3,6 +3,7 @@
 
   var KEY_STORAGE = "wb_gateway_admin_key";
   var POLL_MS = 3000;
+  var EVENT_FLUSH_MS = 250;
   var LIST_FILTERS = [
     {kind: "accounts", id: "onlyUsableAccounts", cookie: "gateway_accounts_only_usable",
       route: "/admin/api/status", statusID: "accountFilterStatus"},
@@ -28,6 +29,8 @@
     logSettingsVersion: 0,
     settingsLoadVersion: 0,
     tasksLastPoll: 0,
+    logsLastPoll: 0,
+    logsSignature: "",
     configMode: "preview",
     configPending: false,
     configVersion: 0,
@@ -193,23 +196,74 @@
     return "web-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
   }
 
-  function reportUIEvent(event, path, status, trace, enabled) {
-    if (!state.apiKey || path === "/admin/api/setup") return;
-    var record = {event: event, route: path.split("?")[0], status: status};
-    if (typeof enabled === "boolean") record.enabled = enabled;
+  var pendingUIEvents = [];
+  var uiEventTimer = null;
+
+  function flushUIEvents() {
+    if (uiEventTimer !== null) {
+      clearTimeout(uiEventTimer);
+      uiEventTimer = null;
+    }
+    if (!pendingUIEvents.length || !state.apiKey) {
+      pendingUIEvents = [];
+      return;
+    }
+    var batch = pendingUIEvents.slice(0, 32);
+    pendingUIEvents = pendingUIEvents.slice(32);
+    var trace = batch[0].trace;
+    var body = batch.length === 1 ? batch[0].record : {events: batch.map(function (item) { return item.record; })};
     fetch("/admin/api/client-events", {
       method: "POST",
       headers: {"Authorization": "Bearer " + state.apiKey, "Content-Type": "application/json",
         "X-Workbuddy-Admin": "1", "X-Trace-ID": trace},
-      body: JSON.stringify(record)
+      body: JSON.stringify(body)
     }).catch(function () { /* 原请求失败仍由服务端审计记录，不递归发送失败事件。 */ });
+    if (pendingUIEvents.length) {
+      uiEventTimer = setTimeout(flushUIEvents, EVENT_FLUSH_MS);
+    }
+  }
+
+  function reportUIEvent(event, path, status, trace, enabled) {
+    if (!state.apiKey || path === "/admin/api/setup") return;
+    var record = {event: event, route: path.split("?")[0], status: status};
+    if (typeof enabled === "boolean") record.enabled = enabled;
+    if (!pendingUIEvents.length) {
+      pendingUIEvents.push({trace: trace, record: record});
+      flushUIEvents();
+      return;
+    }
+    if (pendingUIEvents[0].trace === trace && pendingUIEvents.length < 32) {
+      pendingUIEvents.push({trace: trace, record: record});
+      if (uiEventTimer === null) uiEventTimer = setTimeout(flushUIEvents, EVENT_FLUSH_MS);
+      return;
+    }
+    flushUIEvents();
+    pendingUIEvents.push({trace: trace, record: record});
+    flushUIEvents();
+  }
+
+  function syncAuthBar(loggedIn) {
+    var logoutBtn = $("logout");
+    if (logoutBtn) logoutBtn.classList.toggle("hidden", !loggedIn);
+    if ($("loginPanel") && loggedIn) $("loginPanel").classList.add("hidden");
   }
 
   function lockDashboard() {
+    pendingUIEvents = [];
+    if (uiEventTimer !== null) {
+      clearTimeout(uiEventTimer);
+      uiEventTimer = null;
+    }
+    syncAuthBar(false);
     resetConfigEditor();
     state.tasksLastPoll = 0;
+    state.logsLastPoll = 0;
+    state.logsSignature = "";
     $("tabs").classList.add("hidden");
     $("dashboard").classList.add("hidden");
+    if ($("loginPanel") && $("setupPanel") && $("setupPanel").classList.contains("hidden")) {
+      $("loginPanel").classList.remove("hidden");
+    }
     state.lastStatus = null;
     state.lastModels = null;
     state.rateDetails = null;
@@ -227,6 +281,7 @@
     ["usageSummary", "usageChart", "latencyChart", "statsInfo", "statsRange"].forEach(function (id) {
       $(id).textContent = "";
       $(id)._sourceHTML = "";
+      $(id)._chartModel = null;
     });
     if ($("latencyLegend")) {
       $("latencyLegend").textContent = "";
@@ -536,7 +591,8 @@
     var yLeft = function (v) { return top + plotH * (1 - v / leftMax); };
     var yRight = function (v) { return top + plotH * (1 - v / rightMax); };
     var out = '<div class="chart-canvas"><svg viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="' + esc(title) +
-      '" data-chart-model=""><title>' + esc(title) + '</title>';
+      '" data-chart-model="' + esc(JSON.stringify({width: width, height: height, left: left, top: top, plotW: plotW, plotH: plotH, count: buckets.length})) +
+      '"><title>' + esc(title) + '</title>';
     for (var n = 0; n <= 4; n++) {
       var yy = top + plotH * n / 4;
       out += '<line class="chart-grid" x1="' + left + '" y1="' + yy + '" x2="' + (width - right) + '" y2="' + yy + '"/>' +
@@ -656,16 +712,24 @@
     out += '</g><rect class="chart-hover-area" x="' + left + '" y="' + top + '" width="' + plotW + '" height="' + plotH +
       '" fill="transparent" pointer-events="all"/>';
     out += '</svg><div class="chart-tooltip" hidden></div></div>';
-    return out.replace('data-chart-model=""', 'data-chart-model="' + esc(JSON.stringify(model)) + '"');
+    lastBuiltChartModel = model;
+    if (buckets.length <= 96) {
+      return out.replace(/data-chart-model="[^"]*"/, 'data-chart-model="' + esc(JSON.stringify(model)) + '"');
+    }
+    return out;
   }
+
+  var lastBuiltChartModel = null;
 
   function bindStatsChartHover(container) {
     if (!container || !container.querySelector) return;
     var svg = container.querySelector("svg");
     var tooltip = container.querySelector(".chart-tooltip");
     if (!svg || !tooltip || !svg.getAttribute) return;
-    var model;
-    try { model = JSON.parse(svg.getAttribute("data-chart-model") || "{}"); } catch (_) { return; }
+    var model = container._chartModel || null;
+    if (!model) {
+      try { model = JSON.parse(svg.getAttribute("data-chart-model") || "{}"); } catch (_) { return; }
+    }
     if (!model.buckets || !model.buckets.length) return;
     var area = svg.querySelector(".chart-hover-area");
     var cross = svg.querySelector(".chart-crosshair");
@@ -886,8 +950,36 @@
   function renderStatsChart(id, buckets, opts) {
     var el = $(id);
     if (!el) return;
+    lastBuiltChartModel = null;
     el.innerHTML = statsComboChart(buckets, opts);
+    el._chartModel = lastBuiltChartModel;
+    lastBuiltChartModel = null;
     bindStatsChartHover(el);
+  }
+
+  function computeStatsRenderKey(data, accountChoice, chartWidth, chartNow) {
+    var rows = data.buckets || [];
+    var firstStart = rows.length ? rows[0].start : 0;
+    var lastStart = rows.length ? rows[rows.length - 1].start : 0;
+    var futureCount = 0;
+    for (var i = 0; i < rows.length; i++) {
+      if (statsBucketIsFuture(rows[i], chartNow)) futureCount++;
+    }
+    // Server-cached responses carry an explicit dataRevision; synthetic or legacy
+    // payloads without dataRevision fall back to structural digest so in-place test
+    // mutations are never skipped.
+    if (data.dataRevision !== undefined && data.dataRevision !== null && Number(data.dataRevision) > 0) {
+      return [
+        "rev", data.dataRevision, data.period || "", data.start || "", data.end || "",
+        data.account || "", data.site || "", accountChoice || "", chartWidth,
+        rows.length, firstStart, lastStart, futureCount
+      ].join("|");
+    }
+    var payload = {};
+    Object.keys(data).forEach(function (key) {
+      if (key !== "serverTime" && key !== "storage") payload[key] = data[key];
+    });
+    return JSON.stringify([payload, accountChoice, chartWidth, futureCount, firstStart, lastStart]);
   }
 
   function renderStats(data) {
@@ -899,14 +991,7 @@
     };
     var chartWidth = Math.min(chartBox("usageChart").w, chartBox("latencyChart").w);
     var chartNow = statsChartNow(data.serverTime);
-    var payload = {};
-    Object.keys(data).forEach(function (key) {
-      if (key !== "serverTime" && key !== "storage") payload[key] = data[key];
-    });
-    // A changing server clock alone is not new chart data. Still redraw at a
-    // future-bucket boundary, on a filter change, or when the viewport changes.
-    var renderKey = JSON.stringify([payload, state.statsAccount, chartWidth,
-      rows.map(function (row) { return statsBucketIsFuture(row, chartNow); })]);
+    var renderKey = computeStatsRenderKey(data, state.statsAccount, chartWidth, chartNow);
     $("statsInfo").textContent = store.message || "";
     if (renderKey === state.statsRenderKey) return;
     var currentTTFT = data.ttftMetric === "first_token_v2";
@@ -921,7 +1006,8 @@
     setHTMLIfChanged($("statsAccount"), scopeOption("", "全局 · 全部账号") +
       scopeOption("site:intl", "国际站 · 全部国际账号") + scopeOption("site:cn", "国内站 · 全部国内账号") +
       (data.accounts || []).map(function (a) {
-        return scopeOption(a.id, a.file + " · " + (a.edition === "intl" ? "国际" : "国内") + " · " + a.id.slice(0, 6));
+        var fileName = a.file.split(/[\\/]/).pop();
+        return scopeOption(a.id, fileName + " · " + (a.edition === "intl" ? "国际" : "国内") + " · " + a.id.slice(0, 6));
       }).join(""));
     if (!siteScope && !(data.accounts || []).some(function (a) { return a.id === choice; })) choice = "";
     $("statsAccount").value = choice;
@@ -1191,9 +1277,17 @@
   }
 
   function reportRestoredListFilters() {
-    LIST_FILTERS.forEach(function (filter) {
-      reportUIEvent("list_filter_restored", filter.route, 0, traceID(), $(filter.id).checked);
+    var sharedTrace = traceID();
+    var records = LIST_FILTERS.map(function (filter) {
+      return {event: "list_filter_restored", route: filter.route, status: 0, enabled: $(filter.id).checked};
     });
+    if (!state.apiKey || !records.length) return;
+    fetch("/admin/api/client-events", {
+      method: "POST",
+      headers: {"Authorization": "Bearer " + state.apiKey, "Content-Type": "application/json",
+        "X-Workbuddy-Admin": "1", "X-Trace-ID": sharedTrace},
+      body: JSON.stringify({events: records})
+    }).catch(function () {});
   }
 
   function changeListFilter(kind) {
@@ -1762,10 +1856,18 @@
         if (data.file) sel.value = data.file;
       }
       var box = $("logBox");
-      if (data.error) { box.textContent = "\u8bfb\u53d6\u65e5\u5fd7\u5931\u8d25: " + data.error; return; }
+      if (data.error) {
+        state.logsSignature = "";
+        box.textContent = "\u8bfb\u53d6\u65e5\u5fd7\u5931\u8d25: " + data.error;
+        return;
+      }
       var lines = (data.lines || []).slice().reverse();
+      var sig = (data.file || "") + "|" + lines.length + "|" + (lines[0] || "") + "|" + (lines[lines.length - 1] || "");
+      if (!initial && sig === state.logsSignature && box.textContent) return;
+      state.logsSignature = sig;
+      var keepScroll = !initial && box.scrollTop > 0 ? box.scrollTop : 0;
       box.textContent = lines.length ? lines.join("\n") : "\u8be5\u6587\u4ef6\u6682\u65e0\u65e5\u5fd7\u3002";
-      box.scrollTop = 0;
+      box.scrollTop = keepScroll;
       if (data.truncated) showAlert("\u65e5\u5fd7\u8fbe\u5230\u672c\u6b21\u8bfb\u53d6\u9884\u7b97\uff0c\u53ea\u5c55\u793a\u90e8\u5206\u884c\uff1b\u539f\u65e5\u5fd7\u6587\u4ef6\u672a\u4fee\u6539\u3002");
     }).catch(function () {
       if (!initial && file) return loadLogs(true);
@@ -2064,16 +2166,17 @@
     var classes = {success: "ok", failed: "danger", partial: "warn", cancelled: "warn", running: "warn"};
     $("tasksInfo").textContent = "服务器日志时区：" + (data.timezone || "-") + "（表内时间按浏览器时区显示） · 刷新 " + fmtTime(data.generatedAt) +
       (data.truncated ? " · 日志扫描达到预算，缺失记录不代表未执行。" : " · 执行记录以日志为准。");
-    $("tasksTable").querySelector("tbody").innerHTML = (data.tasks || []).map(function (task) {
+    updateTableBody($("tasksTable").querySelector("tbody"), (data.tasks || []).map(function (task, idx) {
       var next = task.nextRunAt ? fmtTime(task.nextRunAt) + (task.nextEstimated ? "（推算）" : "") :
         (!task.enabled ? "未启用" : task.oneShot && task.lastFinishedAt ? "本次启动已完成" : "等待调度日志");
-      return "<tr><td data-label='任务'>" + esc(task.name) + "</td><td data-label='启用'>" + (task.enabled ? "开启" : "关闭") +
+      var rowKey = task.id || task.name || String(idx);
+      return "<tr data-row-key='" + esc(rowKey) + "'><td data-label='任务'>" + esc(task.name) + "</td><td data-label='启用'>" + (task.enabled ? "开启" : "关闭") +
         "</td><td data-label='执行周期' class='task-description'>" + esc(task.schedule) + "</td><td data-label='上次执行记录'>" + esc(fmtTime(task.lastRunAt)) +
         "</td><td data-label='上次完成'>" + esc(fmtTime(task.lastFinishedAt)) + "</td><td data-label='执行结果'><span class='badge " +
         (classes[task.status] || "") + "'>" + esc(labels[task.status] || "无执行记录") +
         "</span></td><td data-label='下次预计执行'>" + esc(next) + "</td><td data-label='日志说明' class='task-description'>" + esc(task.detail || "当前服务尚无该任务日志，或日志已清理") +
         (task.logFile ? "<br><span class='mono'>" + esc(task.logFile) + "</span>" : "") + "</td></tr>";
-    }).join("");
+    }).join(""));
   }
 
   function loadLogSettings() {
@@ -2127,9 +2230,12 @@
 
   // ---- 路由与轮询 --------------------------------------------------------
   function refreshActive() {
+    if (typeof document !== "undefined" && document.hidden) return Promise.resolve();
     if (!state.apiKey || state.refreshPending || state.togglePending) return Promise.resolve();
     if (state.activeTab === "tasks" && Date.now() - state.tasksLastPoll < 15000) return Promise.resolve();
+    if (state.activeTab === "logs" && Date.now() - state.logsLastPoll < 6000) return Promise.resolve();
     if (state.activeTab === "tasks") state.tasksLastPoll = Date.now();
+    if (state.activeTab === "logs") state.logsLastPoll = Date.now();
     state.refreshPending = true;
     var policyVersion = state.policyVersion;
     var onErr = function () {
@@ -2172,6 +2278,7 @@
     if (name !== "overview") hideAllStatsChartHover();
     if (name !== "overview" && $("accountAlertTooltip")) $("accountAlertTooltip").hidden = true;
     if (name === "tasks") state.tasksLastPoll = 0;
+    if (name === "logs") state.logsLastPoll = 0;
     state.activeTab = name;
     Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (t) {
       t.classList.toggle("active", t.getAttribute("data-tab") === name);
@@ -2258,6 +2365,7 @@
       sessionStorage.setItem(KEY_STORAGE, key);
       reportRestoredListFilters();
       renderSettings(data);
+      syncAuthBar(true);
       $("tabs").classList.remove("hidden");
       $("dashboard").classList.remove("hidden");
       $("setupPanel").classList.add("hidden");
@@ -2289,6 +2397,7 @@
         state.apiKey = "";
         sessionStorage.removeItem(KEY_STORAGE);
         lockDashboard();
+        if ($("loginPanel")) $("loginPanel").classList.add("hidden");
         $("setupPanel").classList.remove("hidden");
         $("initializeAdmin").disabled = !data.canInitialize;
         setConn("等待初始化", "");
@@ -2301,6 +2410,7 @@
         saveKey();
       } else {
         lockDashboard();
+        if ($("loginPanel")) $("loginPanel").classList.remove("hidden");
         setConn("等待管理登录", "");
         showAlert("请输入 config.json 中的 gateway.adminKey。");
       }
@@ -2385,6 +2495,9 @@
     $("modelsTable").addEventListener("click", toggleRateDetail);
     $("logFile").addEventListener("change", function () { loadLogs(false); });
     $("logLines").addEventListener("change", function () { loadLogs(false); });
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden && state.apiKey) refreshActive();
+    });
 
     discoverSetup();
     state.timer = setInterval(refreshActive, POLL_MS);

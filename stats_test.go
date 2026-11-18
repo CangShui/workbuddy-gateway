@@ -19,13 +19,31 @@ func resetStatsState(t *testing.T) {
 	requestStats.document = statsDocument{Schema: statsSchema, Accounts: map[string]statsAccount{}, Requests: []statsRequest{}}
 	requestStats.revision, requestStats.saved, requestStats.lastSaved = 0, 0, 0
 	requestStats.blocked, requestStats.enabled, requestStats.mode, requestStats.problem = false, false, "pending", ""
+	requestStats.requestsOrder, requestStats.requestsOrderLen, requestStats.requestsLastAt = 0, 0, 0
 	requestStats.Unlock()
+	statsQueryCache.Lock()
+	statsQueryCache.revision, statsQueryCache.queryKey, statsQueryCache.nowBucketMS = 0, "", 0
+	statsQueryCache.secretSeq, statsQueryCache.redactedBase = 0, nil
+	statsQueryCache.basePayload, statsQueryCache.bucketsStart = nil, nil
+	statsQueryCache.Unlock()
+	modelWindowCache.Lock()
+	modelWindowCache.revision, modelWindowCache.windowKey, modelWindowCache.result = 0, 0, nil
+	modelWindowCache.Unlock()
 	t.Cleanup(func() {
 		requestStats.Lock()
 		requestStats.document = statsDocument{Schema: statsSchema, Accounts: map[string]statsAccount{}, Requests: []statsRequest{}}
 		requestStats.revision, requestStats.saved, requestStats.lastSaved = 0, 0, 0
 		requestStats.blocked, requestStats.enabled, requestStats.mode, requestStats.problem = false, false, "pending", ""
+		requestStats.requestsOrder, requestStats.requestsOrderLen, requestStats.requestsLastAt = 0, 0, 0
 		requestStats.Unlock()
+		statsQueryCache.Lock()
+		statsQueryCache.revision, statsQueryCache.queryKey, statsQueryCache.nowBucketMS = 0, "", 0
+		statsQueryCache.secretSeq, statsQueryCache.redactedBase = 0, nil
+		statsQueryCache.basePayload, statsQueryCache.bucketsStart = nil, nil
+		statsQueryCache.Unlock()
+		modelWindowCache.Lock()
+		modelWindowCache.revision, modelWindowCache.windowKey, modelWindowCache.result = 0, 0, nil
+		modelWindowCache.Unlock()
 	})
 }
 

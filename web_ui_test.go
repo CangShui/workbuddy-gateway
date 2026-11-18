@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -312,6 +314,155 @@ func TestWebUILogsRejectsIllegalName(t *testing.T) {
 			t.Fatalf("非法日志名 %q 状态码=%d，期望 400", bad, rec.Code)
 		}
 	}
+}
+
+func TestWebUIPerformanceAndSnapshotCacheConsistency(t *testing.T) {
+	isolateAdminFeatures(t)
+	resetStatsState(t)
+	loadOptionalStats()
+	catalogModels = map[string][]catalogModel{"cn": {{ID: "deepseek-v4.1-flash", HasMultiplier: true, Multiplier: 0}}}
+	acc := &Account{
+		Path:    "workbuddy-perf-a.json",
+		Edition: "cn",
+		Auth: &StoredAuth{
+			Edition: "cn",
+			Account: StoredAccount{UID: "u-perf", Nickname: "perf-user"},
+			Auth:    StoredTokens{AccessToken: "synthetic-perf-access-token", RefreshToken: "synthetic-perf-refresh-token", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+		},
+		QuotaKnown:     true,
+		QuotaTotal:     1000,
+		QuotaRemaining: 900,
+	}
+	registerCredentialSecrets(acc.Auth)
+	accounts = []*Account{acc}
+	if err := writeStatusSnapshot(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().In(statsZone)
+	accountMu.Lock()
+	accID, accView := statsAccountIDLocked(acc)
+	accountMu.Unlock()
+	requestStats.Lock()
+	requestStats.document.Accounts[accID] = accView
+	for i := 0; i < 500; i++ {
+		at := now.Add(-time.Duration(500-i) * time.Minute).UnixMilli()
+		tok := int64(100 + i)
+		cr := 0.01
+		ttft := 240.0
+		requestStats.document.Requests = append(requestStats.document.Requests, statsRequest{
+			Account: accID, Model: "deepseek-v4.1-flash", At: at, Status: 200, Complete: true,
+			TotalTokens: &tok, InputTokens: &tok, Credit: &cr, LatencyMS: 800, TTFTMS: &ttft, TTFTMetric: ttftMetric,
+		})
+	}
+	requestStats.revision = 1
+	requestStats.Unlock()
+
+	handler := newWebUIHandler()
+	// 首次统计聚合建立缓存，第二次命中缓存；结果必须一致且包含 dataRevision。
+	w1 := adminRequest(handler, http.MethodGet, "/admin/api/stats?period=day", "feature-admin-key", "")
+	w2 := adminRequest(handler, http.MethodGet, "/admin/api/stats?period=day", "feature-admin-key", "")
+	if w1.Code != http.StatusOK || w2.Code != http.StatusOK {
+		t.Fatalf("stats status: %d / %d", w1.Code, w2.Code)
+	}
+	var s1, s2 map[string]any
+	if err := json.Unmarshal(w1.Body.Bytes(), &s1); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(w2.Body.Bytes(), &s2); err != nil {
+		t.Fatal(err)
+	}
+	if s1["dataRevision"] != float64(1) || s2["dataRevision"] != float64(1) {
+		t.Fatalf("missing dataRevision: %v / %v", s1["dataRevision"], s2["dataRevision"])
+	}
+	if s1["summary"].(map[string]any)["requests"] != s2["summary"].(map[string]any)["requests"] {
+		t.Fatalf("cached stats summary mismatch: %v vs %v", s1["summary"], s2["summary"])
+	}
+
+	// 开关切换后立即刷新状态快照与内存缓存，下一次 /admin/api/status 立刻看到停用状态。
+	wt := adminRequest(handler, http.MethodPost, "/admin/api/account-toggle", "feature-admin-key", `{"target":"workbuddy-perf-a.json","enabled":false}`)
+	if wt.Code != http.StatusOK {
+		t.Fatalf("account toggle failed: %d %s", wt.Code, wt.Body.String())
+	}
+	ws := adminRequest(handler, http.MethodGet, "/admin/api/status", "feature-admin-key", "")
+	if ws.Code != http.StatusOK || !strings.Contains(ws.Body.String(), `"paused":1`) {
+		t.Fatalf("status snapshot was not immediately refreshed after policy toggle: %d %s", ws.Code, ws.Body.String())
+	}
+	if strings.Contains(ws.Body.String(), "synthetic-perf-access-token") {
+		t.Fatal("admin response leaked registered secret")
+	}
+
+	// 批量前端审计接口兼容单条与批量事件，同时拒绝越界或非法字段。
+	wb := adminRequest(handler, http.MethodPost, "/admin/api/client-events", "feature-admin-key",
+		`{"events":[{"event":"list_filter_restored","route":"/admin/api/status","status":0,"enabled":true},{"event":"list_filter_restored","route":"/admin/api/models","status":0,"enabled":false}]}`)
+	if wb.Code != http.StatusNoContent {
+		t.Fatalf("batched client events rejected: %d %s", wb.Code, wb.Body.String())
+	}
+	wBad := adminRequest(handler, http.MethodPost, "/admin/api/client-events", "feature-admin-key", `{"events":[]}`)
+	if wBad.Code != http.StatusBadRequest {
+		t.Fatalf("empty batched client events should return 400, got %d", wBad.Code)
+	}
+}
+
+func BenchmarkWebUIStatsCachedVsUncached(b *testing.B) {
+	oldWriter := log.Writer()
+	log.SetOutput(io.Discard)
+	defer log.SetOutput(oldWriter)
+	requestStats.Lock()
+	oldDoc, oldRev, oldEnabled, oldOrder := requestStats.document, requestStats.revision, requestStats.enabled, requestStats.requestsOrder
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, statsZone)
+	rows := make([]statsRequest, 50000)
+	for i := range rows {
+		at := now.Add(-time.Duration(len(rows)-i) * time.Minute).UnixMilli()
+		tok := int64(200 + (i % 50))
+		cr := 0.02
+		ttft := 300.0
+		rows[i] = statsRequest{
+			Account: "bench-acc", Model: "deepseek-v4.1-flash", At: at, Status: 200, Complete: true,
+			TotalTokens: &tok, InputTokens: &tok, Credit: &cr, LatencyMS: 950, TTFTMS: &ttft, TTFTMetric: ttftMetric,
+		}
+	}
+	requestStats.document = statsDocument{
+		Schema:    statsSchema,
+		StartedAt: rows[0].At,
+		Accounts:  map[string]statsAccount{"bench-acc": {File: "workbuddy-bench.json", Edition: "cn"}},
+		Requests:  rows,
+	}
+	requestStats.revision = 1
+	requestStats.enabled = true
+	requestStats.requestsOrder = 0
+	requestStats.Unlock()
+	defer func() {
+		requestStats.Lock()
+		requestStats.document, requestStats.revision, requestStats.enabled, requestStats.requestsOrder = oldDoc, oldRev, oldEnabled, oldOrder
+		requestStats.Unlock()
+		statsQueryCache.Lock()
+		statsQueryCache.basePayload, statsQueryCache.redactedBase, statsQueryCache.bucketsStart = nil, nil, nil
+		statsQueryCache.Unlock()
+	}()
+
+	b.Run("window_cold_binary_search", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			statsQueryCache.Lock()
+			statsQueryCache.basePayload, statsQueryCache.redactedBase = nil, nil
+			statsQueryCache.Unlock()
+			rec := httptest.NewRecorder()
+			handleWebUIStats(rec, httptest.NewRequest(http.MethodGet, "/admin/api/stats?period=hour", nil))
+			if rec.Code != http.StatusOK {
+				b.Fatalf("status=%d", rec.Code)
+			}
+		}
+	})
+	b.Run("window_warm_cache", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			rec := httptest.NewRecorder()
+			handleWebUIStats(rec, httptest.NewRequest(http.MethodGet, "/admin/api/stats?period=hour", nil))
+			if rec.Code != http.StatusOK {
+				b.Fatalf("status=%d", rec.Code)
+			}
+		}
+	})
 }
 
 func TestWebUILogsListsLogDir(t *testing.T) {

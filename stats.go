@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math"
@@ -56,17 +57,70 @@ type statsDocument struct {
 
 var requestStats = struct {
 	sync.Mutex
-	document  statsDocument
-	revision  uint64
-	saved     uint64
-	lastSaved int64
-	mode      string // pending / file / memory
-	problem   string // 安全的白话原因，不回传底层错误或用户文件内容
-	blocked   bool   // 坏文件或符号链接不得被自动覆盖
-	enabled   bool
+	document         statsDocument
+	revision         uint64
+	saved            uint64
+	lastSaved        int64
+	mode             string // pending / file / memory
+	problem          string // 安全的白话原因，不回传底层错误或用户文件内容
+	blocked          bool   // 坏文件或符号链接不得被自动覆盖
+	enabled          bool
+	requestsOrder    int // 0=未校验 1=按时间单调非降 -1=存在无序
+	requestsOrderLen int
+	requestsLastAt   int64
 }{document: statsDocument{Schema: statsSchema, Accounts: map[string]statsAccount{}, Requests: []statsRequest{}}, mode: "pending"}
 
 var statsWriteMu sync.Mutex
+
+var statsQueryCache struct {
+	sync.Mutex
+	revision     uint64
+	queryKey     string
+	nowBucketMS  int64
+	secretSeq    uint64
+	redactedBase map[string]any
+	basePayload  map[string]any
+	bucketsStart []int64
+}
+
+
+var modelWindowCache struct {
+	sync.Mutex
+	revision  uint64
+	windowKey int64
+	result    map[string]modelWindowStats
+}
+
+func statsSliceWindowIndicesLocked(rows []statsRequest, fromMS, toMS int64) (int, int, bool) {
+	n := len(rows)
+	if n == 0 {
+		return 0, 0, true
+	}
+	// 直接替换底层切片（如白盒测试注入）或首次加载文件时重新校验单调性；
+	// 正常运行中仅由 statsFinishAttempt 追加，按 O(1) 增量维护，不重复遍历 18 万条记录。
+	if requestStats.requestsOrder == 0 || requestStats.requestsOrderLen != n || rows[n-1].At != requestStats.requestsLastAt {
+		ordered := true
+		for i := 1; i < n; i++ {
+			if rows[i].At < rows[i-1].At {
+				ordered = false
+				break
+			}
+		}
+		if ordered {
+			requestStats.requestsOrder = 1
+		} else {
+			requestStats.requestsOrder = -1
+		}
+		requestStats.requestsOrderLen = n
+		requestStats.requestsLastAt = rows[n-1].At
+	}
+	if requestStats.requestsOrder != 1 {
+		return 0, n, false
+	}
+	start := sort.Search(n, func(i int) bool { return rows[i].At >= fromMS })
+	end := sort.Search(n, func(i int) bool { return rows[i].At >= toMS })
+	return start, end, true
+}
 
 // 调用方持有 accountMu。摘要不含 Token，续期不改变归属，企业/站点切换改变归属。
 func statsAccountIDLocked(acc *Account) (string, statsAccount) {
@@ -145,6 +199,7 @@ func loadOptionalStats() {
 	requestStats.document = statsDocument{Schema: statsSchema, StartedAt: time.Now().UnixMilli(), Accounts: map[string]statsAccount{}, Requests: []statsRequest{}}
 	requestStats.revision, requestStats.saved, requestStats.lastSaved = 0, 0, 0
 	requestStats.blocked, requestStats.mode, requestStats.problem = false, "pending", ""
+	requestStats.requestsOrder, requestStats.requestsOrderLen, requestStats.requestsLastAt = 1, 0, 0
 	requestStats.enabled = true
 	info, err := os.Lstat(statsFile)
 	if errors.Is(err, os.ErrNotExist) {
@@ -176,6 +231,7 @@ func loadOptionalStats() {
 		doc.Requests = []statsRequest{}
 	}
 	requestStats.document, requestStats.mode = doc, "file"
+	requestStats.requestsOrder, requestStats.requestsOrderLen, requestStats.requestsLastAt = 0, 0, 0
 	requestStats.lastSaved = info.ModTime().UnixMilli()
 	log.Printf("[统计文件] traceId=%s 阶段=启动读取 结果=成功 账号=%d 请求记录=%d 说明=不含凭据或正文", trace, len(doc.Accounts), len(doc.Requests))
 }
@@ -373,6 +429,17 @@ func statsFinishAttempt(r *http.Request, status int) {
 	if _, ok := requestStats.document.Accounts[p.id]; !ok {
 		requestStats.document.Accounts[p.id] = p.account
 	}
+	prevLen := len(requestStats.document.Requests)
+	if requestStats.requestsOrder != 0 && requestStats.requestsOrderLen == prevLen &&
+		(prevLen == 0 || requestStats.document.Requests[prevLen-1].At == requestStats.requestsLastAt) {
+		if prevLen > 0 && row.At < requestStats.requestsLastAt {
+			requestStats.requestsOrder = -1
+		}
+		requestStats.requestsOrderLen = prevLen + 1
+		requestStats.requestsLastAt = row.At
+	} else {
+		requestStats.requestsOrder = 0
+	}
 	requestStats.document.Requests = append(requestStats.document.Requests, row)
 	requestStats.revision++
 	requestStats.Unlock()
@@ -488,11 +555,28 @@ func aggregateModelStatsWindow(from, to time.Time) map[string]modelWindowStats {
 		requests, success, failed, tokens, ttftSamples, latencySamples int64
 		ttftSum, latencySum                                            float64
 	}
+	fromMS, toMS := from.UnixMilli(), to.UnixMilli()
 	requestStats.Lock()
-	defer requestStats.Unlock()
+	rev := requestStats.revision
+	rows := requestStats.document.Requests
+	if rev > 0 && len(rows) > 64 {
+		wKey := (fromMS / 1000) ^ ((toMS / 1000) << 20)
+		modelWindowCache.Lock()
+		if modelWindowCache.result != nil && modelWindowCache.revision == rev && modelWindowCache.windowKey == wKey {
+			cached := make(map[string]modelWindowStats, len(modelWindowCache.result))
+			for k, v := range modelWindowCache.result {
+				cached[k] = v
+			}
+			modelWindowCache.Unlock()
+			requestStats.Unlock()
+			return cached
+		}
+		modelWindowCache.Unlock()
+	}
 	acc := map[string]*accumulator{}
-	for _, row := range requestStats.document.Requests {
-		if row.At < from.UnixMilli() || row.At >= to.UnixMilli() {
+	lo, hi, ordered := statsSliceWindowIndicesLocked(rows, fromMS, toMS)
+	for _, row := range rows[lo:hi] {
+		if !ordered && (row.At < fromMS || row.At >= toMS) {
 			continue
 		}
 		a := acc[row.Model]
@@ -516,6 +600,7 @@ func aggregateModelStatsWindow(from, to time.Time) map[string]modelWindowStats {
 			a.ttftSamples++
 		}
 	}
+	requestStats.Unlock()
 	out := make(map[string]modelWindowStats, len(acc))
 	for model, a := range acc {
 		w := modelWindowStats{Requests: a.requests, Success: a.success, Failed: a.failed, Tokens: a.tokens}
@@ -528,6 +613,14 @@ func aggregateModelStatsWindow(from, to time.Time) map[string]modelWindowStats {
 			w.AvgLatencyMS = &v
 		}
 		out[model] = w
+	}
+	if rev > 0 {
+		wKey := (fromMS / 1000) ^ ((toMS / 1000) << 20)
+		modelWindowCache.Lock()
+		modelWindowCache.revision = rev
+		modelWindowCache.windowKey = wKey
+		modelWindowCache.result = out
+		modelWindowCache.Unlock()
 	}
 	return out
 }
@@ -639,6 +732,44 @@ func handleWebUIStats(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	rev := requestStats.revision
+	startedAt, mode, problem, savedAt := requestStats.document.StartedAt, requestStats.mode, requestStats.problem, requestStats.lastSaved
+	fromMS, toMS := from.UnixMilli(), to.UnixMilli()
+	nowBucketMS := statsBucketStart(now, period).UnixMilli()
+	queryKey := fmt.Sprintf("%s|%d|%d|%s|%s", period, fromMS, toMS, account, site)
+	if rev > 0 {
+		statsQueryCache.Lock()
+		curSeq := redactionSeq.Load()
+		if statsQueryCache.redactedBase != nil &&
+			statsQueryCache.revision == rev &&
+			statsQueryCache.queryKey == queryKey &&
+			statsQueryCache.nowBucketMS == nowBucketMS &&
+			statsQueryCache.secretSeq == curSeq {
+			cachedPayload := make(map[string]any, len(statsQueryCache.redactedBase)+2)
+			for k, v := range statsQueryCache.redactedBase {
+				cachedPayload[k] = v
+			}
+			bucketStarts := statsQueryCache.bucketsStart
+			statsQueryCache.Unlock()
+			requestStats.Unlock()
+			futureBuckets := 0
+			nowMS := now.UnixMilli()
+			for _, bs := range bucketStarts {
+				if bs > nowMS {
+					futureBuckets++
+				}
+			}
+			cachedPayload["serverTime"] = nowMS
+			cachedPayload["storage"] = map[string]any{"mode": mode, "message": redactSensitiveText(problem), "lastSavedAt": savedAt}
+			summary, _ := statsQueryCacheSummary(cachedPayload["summary"])
+			modelLatCount := statsQueryCacheSeriesCount(cachedPayload["modelLatency"])
+			log.Printf("[统计查询] traceId=%s 维度=%s 单账号=%t 时间桶=%d 尚未开始的桶=%d 图表截止毫秒=%d 请求记录=%d 耗时线条=%d 存储=%s 命中缓存=true 结果=成功 说明=统计版本未变化，直接复用聚合结果",
+				debugTraceID(r), period, account != "", len(bucketStarts), futureBuckets, nowMS, summary, modelLatCount, mode)
+			writePreRedactedAdminData(w, r, cachedPayload)
+			return
+		}
+		statsQueryCache.Unlock()
+	}
 	choices := []map[string]string{}
 	for id, a := range requestStats.document.Accounts {
 		choices = append(choices, map[string]string{"id": id, "file": a.File, "edition": a.Edition})
@@ -652,8 +783,10 @@ func handleWebUIStats(w http.ResponseWriter, r *http.Request) {
 	var summary statsTotals
 	byModel := map[string]*statsModelRow{}
 	latencyCells := map[string][]statsLatencyCell{}
-	for _, row := range requestStats.document.Requests {
-		if (account != "" && row.Account != account) || row.At < from.UnixMilli() || row.At >= to.UnixMilli() {
+	rows := requestStats.document.Requests
+	lo, hi, ordered := statsSliceWindowIndicesLocked(rows, fromMS, toMS)
+	for _, row := range rows[lo:hi] {
+		if (account != "" && row.Account != account) || (!ordered && (row.At < fromMS || row.At >= toMS)) {
 			continue
 		}
 		if site != "" && requestStats.document.Accounts[row.Account].Edition != site {
@@ -681,7 +814,6 @@ func handleWebUIStats(w http.ResponseWriter, r *http.Request) {
 			cells[i].ttftN++
 		}
 	}
-	startedAt, mode, problem, savedAt := requestStats.document.StartedAt, requestStats.mode, requestStats.problem, requestStats.lastSaved
 	requestStats.Unlock()
 	summary.average()
 	for i := range buckets {
@@ -725,17 +857,59 @@ func handleWebUIStats(w http.ResponseWriter, r *http.Request) {
 		modelLatency = append(modelLatency, statsModelLatency{Model: m.Model, AvgLatencyMS: points, AvgTTFTMS: ttftPoints})
 	}
 	futureBuckets := 0
-	for _, bucket := range buckets {
+	bucketStarts := make([]int64, len(buckets))
+	for idx, bucket := range buckets {
+		bucketStarts[idx] = bucket.Start
 		if bucket.Start > now.UnixMilli() {
 			futureBuckets++
 		}
 	}
-	log.Printf("[统计查询] traceId=%s 维度=%s 单账号=%t 时间桶=%d 尚未开始的桶=%d 图表截止毫秒=%d 请求记录=%d 耗时线条=%d 存储=%s 结果=成功 说明=未来桶保留时间轴但不画点线柱、不补零；当前桶与过去零值正常展示；耗时按模型分别平均；UTC+8，周一开周；仅读内存聚合，不请求上游", debugTraceID(r), period, account != "", len(buckets), futureBuckets, now.UnixMilli(), summary.Requests, len(modelLatency), mode)
-	writeAdminData(w, r, map[string]any{
+	basePayload := map[string]any{
 		"period": period, "account": account, "site": site, "timezone": "Asia/Shanghai",
 		"start": from.Format("2006-01-02"), "end": to.AddDate(0, 0, -1).Format("2006-01-02"),
 		"startedAt": startedAt, "accounts": choices, "summary": summary, "buckets": buckets, "models": models, "modelLatency": modelLatency,
-		"ttftMetric": ttftMetric, "serverTime": now.UnixMilli(),
+		"ttftMetric": ttftMetric, "serverTime": now.UnixMilli(), "dataRevision": rev,
 		"storage": map[string]any{"mode": mode, "message": problem, "lastSavedAt": savedAt},
-	})
+	}
+	seqBefore := redactionSeq.Load()
+	redactedPayload, _ := redactDebugValue(basePayload).(map[string]any)
+	if rev > 0 {
+		statsQueryCache.Lock()
+		statsQueryCache.revision = rev
+		statsQueryCache.queryKey = queryKey
+		statsQueryCache.nowBucketMS = nowBucketMS
+		statsQueryCache.secretSeq = seqBefore
+		statsQueryCache.basePayload = basePayload
+		statsQueryCache.redactedBase = redactedPayload
+		statsQueryCache.bucketsStart = bucketStarts
+		statsQueryCache.Unlock()
+	}
+	log.Printf("[统计查询] traceId=%s 维度=%s 单账号=%t 时间桶=%d 尚未开始的桶=%d 图表截止毫秒=%d 请求记录=%d 耗时线条=%d 存储=%s 命中缓存=false 结果=成功 说明=未来桶保留时间轴但不画点线柱、不补零；当前桶与过去零值正常展示；耗时按模型分别平均；UTC+8，周一开周；仅读内存聚合，不请求上游", debugTraceID(r), period, account != "", len(buckets), futureBuckets, now.UnixMilli(), summary.Requests, len(modelLatency), mode)
+	if redactedPayload != nil && redactionSeq.Load() == seqBefore {
+		writePreRedactedAdminData(w, r, redactedPayload)
+		return
+	}
+	writeAdminData(w, r, basePayload)
+}
+
+func statsQueryCacheSummary(v any) (int64, bool) {
+	switch s := v.(type) {
+	case statsTotals:
+		return s.Requests, true
+	case map[string]any:
+		if req, ok := s["requests"].(int64); ok {
+			return req, true
+		}
+	}
+	return 0, false
+}
+
+func statsQueryCacheSeriesCount(v any) int {
+	switch s := v.(type) {
+	case []statsModelLatency:
+		return len(s)
+	case []any:
+		return len(s)
+	}
+	return 0
 }

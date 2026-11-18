@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -107,6 +110,9 @@ func currentRedactionBundle() *redactionBundle {
 }
 
 func redactSensitiveText(text string) string {
+	if text == "" {
+		return ""
+	}
 	bundle := currentRedactionBundle()
 	if bundle.replacer != nil {
 		text = bundle.replacer.Replace(text)
@@ -114,18 +120,69 @@ func redactSensitiveText(text string) string {
 	for _, secret := range bundle.shortList {
 		text = redactShortSecret(text, secret)
 	}
-	text = namedSecretPattern.ReplaceAllStringFunc(text, func(match string) string {
-		parts := namedSecretPattern.FindStringSubmatch(match)
-		value := "[REDACTED]"
-		if parts[2][0] == '"' {
-			value = `"[REDACTED]"`
-		} else if parts[2][0] == '\'' {
-			value = "'[REDACTED]'"
+	if mayContainNamedOrBearerSecret(text) {
+		text = namedSecretPattern.ReplaceAllStringFunc(text, func(match string) string {
+			parts := namedSecretPattern.FindStringSubmatch(match)
+			value := "[REDACTED]"
+			if parts[2][0] == '"' {
+				value = `"[REDACTED]"`
+			} else if parts[2][0] == '\'' {
+				value = "'[REDACTED]'"
+			}
+			return parts[1] + value
+		})
+		text = bearerSecretPattern.ReplaceAllString(text, "${1}[REDACTED]")
+	}
+	if containsASCIIFold(text, "eyj") {
+		text = bearerLikeRe.ReplaceAllString(text, "[REDACTED]")
+	}
+	return text
+}
+
+// mayContainNamedOrBearerSecret 在进入重度回溯正则前先做零分配的 ASCII 子串初筛；
+// 仅排除绝对不含 token/key/authorization/bearer 的纯普通文本，不改变任何命中语义。
+func mayContainNamedOrBearerSecret(s string) bool {
+	return containsASCIIFold(s, "token") ||
+		containsASCIIFold(s, "key") ||
+		containsASCIIFold(s, "authorization") ||
+		containsASCIIFold(s, "bearer")
+}
+
+func containsASCIIFold(s, needleLower string) bool {
+	n := len(needleLower)
+	if n == 0 {
+		return true
+	}
+	if len(s) < n {
+		return false
+	}
+	c0 := needleLower[0]
+	c0Upper := c0
+	if c0 >= 'a' && c0 <= 'z' {
+		c0Upper = c0 - ('a' - 'A')
+	}
+	limit := len(s) - n
+	for i := 0; i <= limit; i++ {
+		b := s[i]
+		if b != c0 && b != c0Upper {
+			continue
 		}
-		return parts[1] + value
-	})
-	text = bearerSecretPattern.ReplaceAllString(text, "${1}[REDACTED]")
-	return bearerLikeRe.ReplaceAllString(text, "[REDACTED]")
+		matched := true
+		for j := 1; j < n; j++ {
+			ch := s[i+j]
+			if ch >= 'A' && ch <= 'Z' {
+				ch += 'a' - 'A'
+			}
+			if ch != needleLower[j] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
 }
 
 // 短秘密值仅替换完整词，避免短测试密钥吞掉普通错误原因中的单个字母。
@@ -167,11 +224,16 @@ func (w *redactingLogWriter) Write(data []byte) (int, error) {
 }
 
 func redactDebugValue(value any) any {
+	if value == nil {
+		return nil
+	}
 	switch v := value.(type) {
 	case string:
 		return redactSensitiveText(v)
 	case error:
 		return safeDebugError(v)
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+		return v
 	case map[string]any:
 		out := make(map[string]any, len(v))
 		for key, item := range v {
@@ -205,13 +267,230 @@ func redactDebugValue(value any) any {
 		}
 		return out
 	default:
-		return value
+		return redactReflectValue(reflect.ValueOf(value))
 	}
 }
 
+// redactReflectValue 在不经过 JSON 二次反序列化树的前提下，递归脱敏任意结构体、切片、指针和 map 副本。
+// 保持与 json.Marshal 相同的导出字段/标签规则，同时避免为大响应重复构造 map[string]any。
+func redactReflectValue(rv reflect.Value) any {
+	if !rv.IsValid() {
+		return nil
+	}
+	for rv.Kind() == reflect.Interface || rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil
+		}
+		rv = rv.Elem()
+	}
+	if rv.CanInterface() {
+		if m, ok := rv.Interface().(json.Marshaler); ok {
+			raw, err := m.MarshalJSON()
+			if err != nil {
+				return nil
+			}
+			var parsed any
+			dec := json.NewDecoder(bytes.NewReader(raw))
+			dec.UseNumber()
+			if dec.Decode(&parsed) == nil {
+				return redactDebugValue(parsed)
+			}
+			return redactSensitiveText(string(raw))
+		}
+		if errVal, ok := rv.Interface().(error); ok {
+			return safeDebugError(errVal)
+		}
+	}
+	switch rv.Kind() {
+	case reflect.String:
+		return redactSensitiveText(rv.String())
+	case reflect.Bool:
+		return rv.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return rv.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return rv.Uint()
+	case reflect.Float32, reflect.Float64:
+		return rv.Float()
+	case reflect.Slice:
+		if rv.IsNil() {
+			return nil
+		}
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return rv.Interface()
+		}
+		n := rv.Len()
+		out := make([]any, n)
+		for i := 0; i < n; i++ {
+			out[i] = redactReflectValue(rv.Index(i))
+		}
+		return out
+	case reflect.Array:
+		n := rv.Len()
+		out := make([]any, n)
+		for i := 0; i < n; i++ {
+			out[i] = redactReflectValue(rv.Index(i))
+		}
+		return out
+	case reflect.Map:
+		if rv.IsNil() {
+			return nil
+		}
+		if rv.Type().Key().Kind() != reflect.String {
+			return rv.Interface()
+		}
+		out := make(map[string]any, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			k := iter.Key().String()
+			if secretLogField(k) {
+				out[k] = "[REDACTED]"
+			} else {
+				out[k] = redactReflectValue(iter.Value())
+			}
+		}
+		return out
+	case reflect.Struct:
+		if !typeMayContainStringsOrMaps(rv.Type()) {
+			if rv.CanInterface() {
+				return rv.Interface()
+			}
+		}
+		out := make(map[string]any, rv.NumField())
+		collectRedactedStructFields(rv, out)
+		return out
+	default:
+		if rv.CanInterface() {
+			return rv.Interface()
+		}
+		return nil
+	}
+}
+
+// typeMayContainStringsOrMaps 判断结构体是否可能包含需要脱敏的字符串、错误或动态容器字段。
+// 纯数值结构体直接交由标准库编码，既省分配又严格保持标准 JSON 字段语义。
+func typeMayContainStringsOrMaps(rt reflect.Type) bool {
+	for rt.Kind() == reflect.Pointer || rt.Kind() == reflect.Slice || rt.Kind() == reflect.Array {
+		rt = rt.Elem()
+	}
+	switch rt.Kind() {
+	case reflect.String, reflect.Interface, reflect.Map:
+		return true
+	case reflect.Struct:
+		for i := 0; i < rt.NumField(); i++ {
+			sf := rt.Field(i)
+			if (sf.PkgPath != "" && !sf.Anonymous) || sf.Tag.Get("json") == "-" {
+				continue
+			}
+			name, _, _ := strings.Cut(sf.Tag.Get("json"), ",")
+			if sf.PkgPath != "" && name != "" {
+				continue
+			}
+			if name == "" {
+				name = sf.Name
+			}
+			if secretLogField(name) || typeMayContainStringsOrMaps(sf.Type) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func collectRedactedStructFields(rv reflect.Value, out map[string]any) {
+	rt := rv.Type()
+	for i := 0; i < rt.NumField(); i++ {
+		sf := rt.Field(i)
+		if sf.PkgPath != "" && !sf.Anonymous {
+			continue
+		}
+		tag := sf.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		name, opts, _ := strings.Cut(tag, ",")
+		omitEmpty := hasJSONTagOption(opts, "omitempty")
+		fv := rv.Field(i)
+		if sf.Anonymous && name == "" && !omitEmpty {
+			embedded := fv
+			for embedded.Kind() == reflect.Pointer {
+				if embedded.IsNil() {
+					embedded = reflect.Value{}
+					break
+				}
+				embedded = embedded.Elem()
+			}
+			if embedded.IsValid() && embedded.Kind() == reflect.Struct {
+				collectRedactedStructFields(embedded, out)
+				continue
+			}
+		}
+		if sf.PkgPath != "" {
+			continue
+		}
+		if omitEmpty && isEmptyJSONReflectValue(fv) {
+			continue
+		}
+		if name == "" {
+			name = sf.Name
+		}
+		if secretLogField(name) {
+			out[name] = "[REDACTED]"
+		} else {
+			out[name] = redactReflectValue(fv)
+		}
+	}
+}
+
+func hasJSONTagOption(opts, target string) bool {
+	for opts != "" {
+		opt, rest, _ := strings.Cut(opts, ",")
+		if opt == target {
+			return true
+		}
+		opts = rest
+	}
+	return false
+}
+
+func isEmptyJSONReflectValue(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+		return v.Len() == 0
+	case reflect.Bool:
+		return !v.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int() == 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v.Uint() == 0
+	case reflect.Float32, reflect.Float64:
+		return v.Float() == 0
+	case reflect.Interface, reflect.Pointer:
+		return v.IsNil()
+	}
+	return false
+}
+
 func secretLogField(key string) bool {
-	key = strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(key))
-	switch key {
+	var buf [32]byte
+	n := 0
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if c == '_' || c == '-' {
+			continue
+		}
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if n >= len(buf) {
+			return false
+		}
+		buf[n] = c
+		n++
+	}
+	switch string(buf[:n]) {
 	case "accesstoken", "refreshtoken", "adminkey", "apikey", "xapikey", "xrefreshtoken", "authorization":
 		return true
 	default:

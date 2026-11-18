@@ -219,6 +219,9 @@ func savePolicyToggle(kind, target string, enabled bool, trace string) error {
 	}
 	runtimeAppliedHash, runtimeHasAppliedHash = sha256.Sum256(append(data, '\n')), true
 	log.Printf("[管理开关] traceId=%s 结果=成功 类型=%s 目标=%q 启用=%t 说明=配置已保存且立即生效，已有上游请求不被强行中断", trace, kind, target, enabled)
+	if err := writeStatusSnapshot(); err != nil {
+		log.Printf("[管理开关] traceId=%s 阶段=刷新状态快照 结果=失败 原因=%s 说明=配置与调度规则已生效，等待后台周期重试快照", trace, safeDebugError(err))
+	}
 	return nil
 }
 

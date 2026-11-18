@@ -75,7 +75,7 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map(),
     jsonHighlightHTML, renderConfigEditorHighlight,
     initListFilters, changeListFilter, reportRestoredListFilters,
     rateCell, rateKey, rateDetailHTML, ensureRateDetails, toggleRateDetail, restoreRateDetails
-    , renderStats, loadStats, changeStatsFilter, loadLogs, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
+    , renderStats, renderTasks, loadStats, changeStatsFilter, loadLogs, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
     , openAddAccount, startAddAccount, pollAddAccount, closeAddAccount, accountRowActions
     , initStatsFilter, writeStatsFilterCookie, readStatsFilterCookie, bindStatsChartHover
   };})();`);
@@ -1315,6 +1315,22 @@ test("模型用量排名按服务端顺序渲染，并跟随账号选择", () =>
   audit("模型用量排名渲染通过", {server_order_kept: true, no_time_column: true, empty_state: true});
 });
 
+test("统计范围凭据只显示文件名，保留各统计档案的 ID", () => {
+  const f = fixture();
+  f.review.renderStats(statsPayload({account: "linux-account", accounts: [
+    {id: "linux-account", file: "/opt/workbuddy-gateway/workbuddy4.json", edition: "cn"},
+    {id: "windows-account", file: "C:\\gateway\\workbuddy5.json", edition: "intl"},
+    {id: "relative-account", file: "workbuddy4.json", edition: "cn"},
+  ]}));
+  const select = f.element("statsAccount");
+  assert.match(select.innerHTML, /value="linux-account" selected>workbuddy4\.json · 国内 · linux-/);
+  assert.match(select.innerHTML, /value="windows-account">workbuddy5\.json · 国际 · window/);
+  assert.match(select.innerHTML, /value="relative-account">workbuddy4\.json · 国内 · relati/);
+  assert.doesNotMatch(select.innerHTML, /[/\\]workbuddy[45]\.json/);
+  assert.equal(select.value, "linux-account");
+  audit("统计范围文件名显示通过", {directory_hidden: true, account_ids_kept: true});
+});
+
 // 回归：统计请求变慢或挂起时，状态轮询必须照常完成，不能被统计拖住。
 test("统计加载不阻塞状态轮询", async () => {
   let releaseStatus;
@@ -1934,4 +1950,47 @@ test("告警条目排成一行且不再有日志跳转；统计范围可按站�
   assert(meta.includes('target="_blank"'), "必须在新标签页打开");
   assert(meta.includes('rel="noreferrer"'), "必须带 rel=noreferrer");
   audit("告警行重排与站点筛选通过", {jump_removed: true, site_scope: true, chip_link: true});
+});
+
+test("登录态切换：未登录独立卡片、已登录显示退出；后台隐藏标签页暂停轮询；定时任务与日志增量防抖", async () => {
+  let calls = [];
+  const f = fixture(async (url) => {
+    calls.push(url);
+    if (url === "/admin/api/setup") return response(200, {setupRequired: false, canInitialize: true});
+    if (url === "/admin/api/settings") return response(200, {apiKeyEnabled: true, apiKeyConfigured: true, apiPort: 8317, webPort: 8316});
+    if (url === "/admin/api/status") return response(200, {gateway: {version: "1.14.47", listen: "127.0.0.1:8317"}, updatedAt: 1791980005, accounts: [], models: []});
+    if (url.startsWith("/admin/api/logs?")) return response(200, {files: [{name: "gateway-2026-11-18.log"}], file: "gateway-2026-11-18.log", lines: ["l1", "l2"]});
+    return response(204, {});
+  });
+  await f.review.discoverSetup();
+  assert(!f.element("loginPanel").classList.contains("hidden"), "未登录且已初始化时应展示独立登录卡片");
+  assert(f.element("logout").classList.contains("hidden"), "未登录不应常驻退出按钮");
+
+  f.element("apiKey").value = "synthetic-admin-key";
+  await f.review.saveKey();
+  assert(f.element("loginPanel").classList.contains("hidden"), "登录成功后隐藏登录卡片");
+  assert(!f.element("logout").classList.contains("hidden"), "登录成功后显示退出按钮");
+
+  // 标签页隐藏时暂停后台轮询，避免白白消耗内存和 CPU。
+  await new Promise(resolve => setImmediate(resolve));
+  calls = [];
+  f.document.hidden = true;
+  await f.review.refreshActive();
+  assert.equal(calls.filter(u => u !== "/admin/api/client-events").length, 0, "隐藏标签页不应发起后台数据轮询");
+  f.document.hidden = false;
+
+  // 日志内容不变时不覆盖用户阅读滚动位置。
+  f.element("logLines").value = "200";
+  await f.review.loadLogs(true);
+  const logBox = f.element("logBox");
+  logBox.scrollTop = 88;
+  await f.review.loadLogs(false);
+  assert.equal(logBox.scrollTop, 88, "日志未变化时应保留滚动条位置");
+
+  // 定时任务表带稳定 data-row-key，支持局部按行更新。
+  f.review.renderTasks({timezone: "CST +08:00", generatedAt: 1791980005, tasks: [
+    {id: "config_reload", name: "配置热加载", enabled: true, schedule: "每1秒", status: "success", detail: "正常"}
+  ]});
+  assert.match(f.element("tasksTable").querySelector("tbody").innerHTML, /data-row-key=['"]config_reload['"]/);
+  audit("登录态与后台节流验证通过", {login_card: true, hidden_tab_paused: true, log_scroll_preserved: true});
 });

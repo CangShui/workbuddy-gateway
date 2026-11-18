@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -200,30 +199,39 @@ func readAccountAlertLogs() (accountAlertScan, error) {
 		}
 		size := min(info.Size(), budget)
 		start := info.Size() - size
-		data := make([]byte, size)
-		n, readErr := f.ReadAt(data, start)
-		f.Close()
-		if (readErr != nil && readErr != io.EOF) || int64(n) != size {
-			return scan, errors.New("账号告警日志读取中变化，请重试")
-		}
-		scan.Scanned += size
-		if start > 0 {
-			scan.Truncated = true
-			if end := bytes.IndexByte(data, '\n'); end >= 0 {
-				data = data[end+1:]
-			} else {
-				data = nil
-			}
-		}
-		// 忽略最后尚未写完整的一行。
-		lines := bytes.Split(data, []byte{'\n'})
-		for _, line := range lines[:len(lines)-1] {
-			if event, ok := parseAccountLogEvent(string(line), name); ok {
-				key := event.Account + "\x00" + event.State
-				if old, exists := scan.Events[key]; !exists || event.At > old.At {
-					scan.Events[key] = event
+		var prevLine string
+		var hasPrev bool
+		partRead, scanErr := scanLogRangeLines(f, start, size, start > 0, func(raw []byte) {
+			if hasPrev {
+				if event, ok := parseAccountLogEvent(prevLine, name); ok {
+					key := event.Account + "\x00" + event.State
+					if old, exists := scan.Events[key]; !exists || event.At > old.At {
+						scan.Events[key] = event
+					}
 				}
 			}
+			prevLine = string(raw)
+			hasPrev = true
+		})
+		// 若文件末尾以 '\n' 正常结束，最后一行也是完整行；否则忽略尚未写完整的尾部。
+		var tailByte [1]byte
+		if scanErr == nil && hasPrev && size > 0 {
+			if n, err := f.ReadAt(tailByte[:], start+size-1); n == 1 && (err == nil || errors.Is(err, io.EOF)) && tailByte[0] == '\n' {
+				if event, ok := parseAccountLogEvent(prevLine, name); ok {
+					key := event.Account + "\x00" + event.State
+					if old, exists := scan.Events[key]; !exists || event.At > old.At {
+						scan.Events[key] = event
+					}
+				}
+			}
+		}
+		f.Close()
+		if scanErr != nil {
+			return scan, errors.New("账号告警日志读取中变化，请重试")
+		}
+		scan.Scanned += partRead
+		if start > 0 {
+			scan.Truncated = true
 		}
 	}
 	return scan, nil

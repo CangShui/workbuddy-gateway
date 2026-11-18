@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -201,15 +200,38 @@ func handleWebUIClientEvent(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "仅支持 POST")
 		return
 	}
-	var input struct {
+	type clientAuditRecord struct {
 		Event   string `json:"event"`
 		Route   string `json:"route"`
 		Status  int    `json:"status"`
 		Enabled *bool  `json:"enabled,omitempty"`
 	}
-	if err := decodeAdminJSON(w, r, &input); err != nil {
+	var rawBody json.RawMessage
+	if err := decodeAdminJSON(w, r, &rawBody); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "无效的前端审计事件")
 		return
+	}
+	var batchPayload struct {
+		Events []clientAuditRecord `json:"events"`
+	}
+	var records []clientAuditRecord
+	decBatch := json.NewDecoder(strings.NewReader(string(rawBody)))
+	decBatch.DisallowUnknownFields()
+	if decBatch.Decode(&batchPayload) == nil && ensureJSONEOF(decBatch) == nil && batchPayload.Events != nil {
+		if len(batchPayload.Events) == 0 || len(batchPayload.Events) > 32 {
+			writeJSONError(w, http.StatusBadRequest, "前端审计批次条数无效")
+			return
+		}
+		records = batchPayload.Events
+	} else {
+		var single clientAuditRecord
+		decSingle := json.NewDecoder(strings.NewReader(string(rawBody)))
+		decSingle.DisallowUnknownFields()
+		if err := decSingle.Decode(&single); err != nil || ensureJSONEOF(decSingle) != nil {
+			writeJSONError(w, http.StatusBadRequest, "无效的前端审计事件")
+			return
+		}
+		records = []clientAuditRecord{single}
 	}
 	allowed := map[string]bool{"request_completed": true, "request_failed": true, "settings_validation_failed": true, "credential_validation_failed": true, "log_validation_failed": true,
 		"config_edit_warning": true, "config_edit_acknowledged": true, "config_edit_cancelled": true, "config_validation_failed": true,
@@ -229,46 +251,50 @@ func handleWebUIClientEvent(w http.ResponseWriter, r *http.Request) {
 		"/admin/api/account-cancel": true,
 		"/admin/api/account-delete": true,
 	}
-	if !allowed[input.Event] || !routes[input.Route] || input.Status < 0 || input.Status > 599 {
-		writeJSONError(w, http.StatusBadRequest, "不接受未定义的前端审计事件")
-		return
+	for _, input := range records {
+		if !allowed[input.Event] || !routes[input.Route] || input.Status < 0 || input.Status > 599 {
+			writeJSONError(w, http.StatusBadRequest, "不接受未定义的前端审计事件")
+			return
+		}
+		filterEvent := strings.HasPrefix(input.Event, "list_filter_")
+		if strings.HasPrefix(input.Event, "stats_chart_hover_") && (input.Route != "/admin/api/stats" || input.Status != 0 || input.Enabled != nil) {
+			log.Printf("[管理前端] traceId=%s 阶段=图表交互审计校验 结果=拒绝 状态码=400 说明=只接受固定统计图表事件，不接受坐标、数值、正文或凭据", debugTraceID(r))
+			writeJSONError(w, http.StatusBadRequest, "图表交互审计只能用于统计图表")
+			return
+		}
+		if filterEvent && (input.Enabled == nil || input.Route != "/admin/api/status" && input.Route != "/admin/api/models") ||
+			!filterEvent && input.Enabled != nil {
+			log.Printf("[管理前端] traceId=%s 阶段=筛选偏好校验 结果=拒绝 状态码=400 说明=只接受账号或模型列表的布尔筛选状态，不接受任意内容", debugTraceID(r))
+			writeJSONError(w, http.StatusBadRequest, "筛选审计必须提供对应列表的布尔状态")
+			return
+		}
 	}
-	filterEvent := strings.HasPrefix(input.Event, "list_filter_")
-	if strings.HasPrefix(input.Event, "stats_chart_hover_") && (input.Route != "/admin/api/stats" || input.Status != 0 || input.Enabled != nil) {
-		log.Printf("[管理前端] traceId=%s 阶段=图表交互审计校验 结果=拒绝 状态码=400 说明=只接受固定统计图表事件，不接受坐标、数值、正文或凭据", debugTraceID(r))
-		writeJSONError(w, http.StatusBadRequest, "图表交互审计只能用于统计图表")
-		return
+	for _, input := range records {
+		if strings.HasPrefix(input.Event, "list_filter_") {
+			log.Printf("[管理前端筛选] traceId=%s 事件=%s 列表=%s 只显示可用=%t 状态码=%d 说明=仅改变网页显示偏好，不修改配置、调度规则或历史统计，不记录Cookie正文和Key",
+				debugTraceID(r), input.Event, input.Route, *input.Enabled, input.Status)
+			continue
+		}
+		log.Printf("[管理前端] traceId=%s 事件=%s 接口=%s 状态码=%d 说明=前端请求或参数校验结果已落盘，不含Key与业务正文",
+			debugTraceID(r), input.Event, input.Route, input.Status)
 	}
-	if filterEvent && (input.Enabled == nil || input.Route != "/admin/api/status" && input.Route != "/admin/api/models") ||
-		!filterEvent && input.Enabled != nil {
-		log.Printf("[管理前端] traceId=%s 阶段=筛选偏好校验 结果=拒绝 状态码=400 说明=只接受账号或模型列表的布尔筛选状态，不接受任意内容", debugTraceID(r))
-		writeJSONError(w, http.StatusBadRequest, "筛选审计必须提供对应列表的布尔状态")
-		return
-	}
-	if filterEvent {
-		log.Printf("[管理前端筛选] traceId=%s 事件=%s 列表=%s 只显示可用=%t 状态码=%d 说明=仅改变网页显示偏好，不修改配置、调度规则或历史统计，不记录Cookie正文和Key",
-			debugTraceID(r), input.Event, input.Route, *input.Enabled, input.Status)
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	log.Printf("[管理前端] traceId=%s 事件=%s 接口=%s 状态码=%d 说明=前端请求或参数校验结果已落盘，不含Key与业务正文",
-		debugTraceID(r), input.Event, input.Route, input.Status)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // 只脱敏输出副本，不能修改用于业务判断的原始状态或磁盘文件。
 func writeAdminData(w http.ResponseWriter, r *http.Request, value any) {
-	raw, err := json.Marshal(value)
-	var copyValue any
-	if err == nil {
-		decoder := json.NewDecoder(bytes.NewReader(raw))
-		decoder.UseNumber()
-		err = decoder.Decode(&copyValue)
-	}
+	safe := redactDebugValue(value)
+	writePreRedactedAdminData(w, r, safe)
+}
+
+func writePreRedactedAdminData(w http.ResponseWriter, r *http.Request, safe any) {
+	raw, err := json.Marshal(safe)
 	if err != nil {
 		log.Printf("[管理响应] traceId=%s 阶段=编码 结果=失败 原因=%v", debugTraceID(r), err)
 		writeJSONError(w, http.StatusInternalServerError, "管理数据编码失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, redactDebugValue(copyValue))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(append(raw, '\n'))
 }

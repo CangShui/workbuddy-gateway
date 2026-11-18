@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"embed"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -224,6 +226,7 @@ func readTaskEvents() ([]scheduledTaskEvent, int64, bool, error) {
 	var events []scheduledTaskEvent
 	var scanned int64
 	truncated := false
+	tag := []byte("[定时任务] ")
 	for index, name := range names {
 		budget := taskLogReadBudget - scanned
 		if budget <= 0 {
@@ -240,42 +243,94 @@ func readTaskEvents() ([]scheduledTaskEvent, int64, bool, error) {
 			return nil, scanned, true, errors.New("任务日志不是可读普通文件")
 		}
 		size := min(st.Size(), budget)
-		data := make([]byte, int(size))
 		start := st.Size() - size
-		count, readErr := f.ReadAt(data, start)
-		f.Close()
-		if readErr != nil && readErr != io.EOF {
-			return nil, scanned, true, readErr
-		}
-		if int64(count) != size {
-			return nil, scanned, true, errors.New("任务日志读取期间被截断，请重试")
-		}
-		scanned += size
-		if start > 0 {
-			truncated = true
-			if end := bytes.IndexByte(data, '\n'); end >= 0 {
-				data = data[end+1:]
-			} else {
-				data = nil
-			}
-		}
-		for _, line := range bytes.Split(data, []byte{'\n'}) {
-			marker := bytes.Index(line, []byte("[定时任务] "))
+		partRead, scanErr := scanLogRangeLines(f, start, size, start > 0, func(line []byte) {
+			marker := bytes.Index(line, tag)
 			if marker < 0 {
-				continue
+				return
 			}
 			var event scheduledTaskEvent
-			if json.Unmarshal(line[marker+len("[定时任务] "):], &event) != nil || event.Task == "" || event.At <= 0 {
-				continue
+			if json.Unmarshal(line[marker+len(tag):], &event) != nil || event.Task == "" || event.At <= 0 {
+				return
 			}
 			event.File = name
 			events = append(events, event)
+		})
+		f.Close()
+		if scanErr != nil {
+			return nil, scanned, true, scanErr
+		}
+		scanned += partRead
+		if start > 0 {
+			truncated = true
 		}
 		if scanned >= taskLogReadBudget && index < len(names)-1 {
 			truncated = true
 		}
 	}
 	return events, scanned, truncated, nil
+}
+
+// scanLogRangeLines 以固定缓冲顺序扫描文件尾部区间，避免一次性分配 16 MiB 缓冲和整块 bytes.Split 切片。
+// skipPartialFirst 为 true 时丢弃截断处的首个不完整行，与原整块读取语义完全一致。
+func scanLogRangeLines(f *os.File, start, size int64, skipPartialFirst bool, visit func([]byte)) (int64, error) {
+	if size <= 0 {
+		return 0, nil
+	}
+	sr := io.NewSectionReader(f, start, size)
+	br := bufio.NewReaderSize(sr, 64<<10)
+	var total int64
+	if skipPartialFirst {
+		skipped, err := br.ReadBytes('\n')
+		total += int64(len(skipped))
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if total != size {
+					return total, errors.New("日志读取期间被截断，请重试")
+				}
+				return total, nil
+			}
+			return total, err
+		}
+	}
+	var longLine []byte
+	for {
+		frag, isPrefix, err := br.ReadLine()
+		if len(frag) > 0 || isPrefix {
+			if isPrefix || len(longLine) > 0 {
+				longLine = append(longLine, frag...)
+			}
+		}
+		if !isPrefix && (len(frag) > 0 || len(longLine) > 0 || err == nil) {
+			line := frag
+			if len(longLine) > 0 {
+				line = longLine
+			}
+			total += int64(len(line))
+			if err == nil {
+				total++ // '\n'（若为 CRLF 则在下方修正字节数检查）
+			}
+			if len(line) > 0 {
+				visit(line)
+			}
+			longLine = longLine[:0]
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return total, err
+		}
+	}
+	// SectionReader 精确限制了最多读取 size 字节；用 Seek 当前偏移校验文件在读取期间未被并发截断。
+	readBytes, seekErr := sr.Seek(0, io.SeekCurrent)
+	if seekErr != nil {
+		return total, seekErr
+	}
+	if readBytes != size {
+		return readBytes, errors.New("日志读取期间被截断，请重试")
+	}
+	return readBytes, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -492,41 +547,32 @@ func readRateEvents() (rateLogScan, error) {
 			return scan, errors.New("倍率日志不是可读普通文件")
 		}
 		size := min(st.Size(), budget)
-		data := make([]byte, int(size))
 		start := st.Size() - size
-		count, readErr := f.ReadAt(data, start)
-		f.Close()
-		if readErr != nil && readErr != io.EOF {
-			scan.Truncated = true
-			return scan, readErr
-		}
-		if int64(count) != size {
-			scan.Truncated = true
-			return scan, errors.New("倍率日志读取期间被截断，请重试")
-		}
-		scan.Scanned += size
-		if start > 0 {
-			scan.Truncated = true
-			if end := bytes.IndexByte(data, '\n'); end >= 0 {
-				data = data[end+1:]
-			} else {
-				data = nil
-			}
-		}
-		for _, raw := range bytes.Split(data, []byte{'\n'}) {
-			if len(raw) == 0 {
-				continue
-			}
-			line := string(raw)
-			// 探测调度状态：用于告诉用户「未知」时怎么刷新，同样取自普通日志。
-			if !scan.AutoProbeKnown && strings.Contains(line, "阶段=自动探测调度") {
-				if m := rateProbeModeRe.FindStringSubmatch(line); m != nil {
+		tagModels := []byte("[Models] 官方倍率")
+		tagPrice := []byte("[ModelPrice]")
+		tagCost := []byte("[ModelCost]")
+		tagAutoProbe := []byte("阶段=自动探测调度")
+		partRead, scanErr := scanLogRangeLines(f, start, size, start > 0, func(raw []byte) {
+			if !scan.AutoProbeKnown && bytes.Contains(raw, tagAutoProbe) {
+				if m := rateProbeModeRe.FindStringSubmatch(string(raw)); m != nil {
 					scan.AutoProbeEnabled, scan.AutoProbeKnown = m[1] == "已开启", true
 				}
 			}
-			if record, ok := parseRateLine(line, name); ok {
+			if !bytes.Contains(raw, tagModels) && !bytes.Contains(raw, tagPrice) && !bytes.Contains(raw, tagCost) {
+				return
+			}
+			if record, ok := parseRateLine(string(raw), name); ok {
 				scan.Records = append(scan.Records, record)
 			}
+		})
+		f.Close()
+		if scanErr != nil {
+			scan.Truncated = true
+			return scan, scanErr
+		}
+		scan.Scanned += partRead
+		if start > 0 {
+			scan.Truncated = true
 		}
 		if scan.Scanned >= rateLogReadBudget && index < len(names)-1 {
 			scan.Truncated = true
@@ -672,12 +718,73 @@ func rateRefreshHint(autoProbeEnabled bool) string {
 	return "后台自动探测已关闭。可用该站点账号请求一次模型；只有完整回复中的有效 usage.credit 才会更新实测来源，未返回 usage 时保留上次结论，不能由积分推算倍率。"
 }
 
+// 短暂缓存任务日志扫描结果：避免连续轮询或刷新重复扫描 16 MiB 普通日志。
+var taskEventsCache struct {
+	sync.Mutex
+	at        time.Time
+	logKey    string
+	events    []scheduledTaskEvent
+	scanned   int64
+	truncated bool
+}
+
+const taskEventsCacheTTL = 2 * time.Second
+
+func currentLatestGatewayLogStamp() string {
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		return ""
+	}
+	latest := ""
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.Type().IsRegular() && strings.HasPrefix(name, "gateway-") && logFilePattern.MatchString(name) && name > latest {
+			latest = name
+		}
+	}
+	if latest == "" {
+		return "empty"
+	}
+	info, err := os.Stat(filepath.Join(logDir, latest))
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d:%d", latest, info.Size(), info.ModTime().UnixNano())
+}
+
 func handleWebUITasks(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "只读页面，仅支持 GET")
 		return
 	}
-	events, scanned, truncated, err := readTaskEvents()
+	stamp := currentLatestGatewayLogStamp()
+	var (
+		events    []scheduledTaskEvent
+		scanned   int64
+		truncated bool
+		err       error
+		hitCache  bool
+	)
+	taskEventsCache.Lock()
+	if stamp != "" && stamp == taskEventsCache.logKey && !taskEventsCache.at.IsZero() && time.Since(taskEventsCache.at) < taskEventsCacheTTL {
+		events = taskEventsCache.events
+		scanned = taskEventsCache.scanned
+		truncated = taskEventsCache.truncated
+		hitCache = true
+	}
+	taskEventsCache.Unlock()
+	if !hitCache {
+		events, scanned, truncated, err = readTaskEvents()
+		if err == nil && stamp != "" {
+			taskEventsCache.Lock()
+			taskEventsCache.at = time.Now()
+			taskEventsCache.logKey = stamp
+			taskEventsCache.events = events
+			taskEventsCache.scanned = scanned
+			taskEventsCache.truncated = truncated
+			taskEventsCache.Unlock()
+		}
+	}
 	if err != nil {
 		log.Printf("[管理定时任务] traceId=%s 结果=读取失败 原因=%s 说明=保留页面上次数据，不伪装成任务成功", debugTraceID(r), safeDebugError(err))
 		writeJSONError(w, http.StatusServiceUnavailable, "任务日志暂不可读，请稍后重试")
@@ -685,7 +792,7 @@ func handleWebUITasks(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	rows := aggregateTaskViews(events, now, os.Getpid(), taskLogBootAt)
-	log.Printf("[管理定时任务] traceId=%s 结果=读取成功 任务数=%d 日志记录=%d 扫描字节=%d 截断=%t 说明=仅读现有日志，不触发任务或修改调度", debugTraceID(r), len(rows), len(events), scanned, truncated)
+	log.Printf("[管理定时任务] traceId=%s 结果=读取成功 命中缓存=%t 任务数=%d 日志记录=%d 扫描字节=%d 截断=%t 说明=仅读现有日志，不触发任务或修改调度", debugTraceID(r), hitCache, len(rows), len(events), scanned, truncated)
 	writeAdminData(w, r, map[string]any{"tasks": rows, "generatedAt": now.Unix(), "timezone": now.Format("MST -07:00"), "readBytes": scanned, "readBudgetBytes": taskLogReadBudget, "truncated": truncated, "source": "gateway 日志；仅当前服务进程", "note": "高频本地任务每60秒记录最近一次执行，状态变化即时记录；下次时间按日志中的定时计划推算，事件触发可能提前。无日志时不判定成功。"})
 }
 
@@ -764,8 +871,98 @@ type webStatusResponse struct {
 	Health      accountHealth             `json:"health"`
 }
 
+var statusSnapshotMemCache struct {
+	sync.Mutex
+	absPath     string
+	size        int64
+	modTimeNano int64
+	valid       bool
+	snap        statusSnapshot
+}
+
+func cloneStatusSnapshot(src statusSnapshot) statusSnapshot {
+	out := src
+	if src.Accounts != nil {
+		out.Accounts = make([]accountSnapshot, len(src.Accounts))
+		for i, a := range src.Accounts {
+			cp := a
+			if a.Alerts != nil {
+				cp.Alerts = append([]accountAlertMark(nil), a.Alerts...)
+			}
+			if a.SchedulingEnabled != nil {
+				v := *a.SchedulingEnabled
+				cp.SchedulingEnabled = &v
+			}
+			if a.ModelStates != nil {
+				cp.ModelStates = make(map[string]modelStateSnapshot, len(a.ModelStates))
+				for k, st := range a.ModelStates {
+					cp.ModelStates[k] = st
+				}
+			}
+			out.Accounts[i] = cp
+		}
+	}
+	if src.Models != nil {
+		out.Models = make([]modelStatSnapshot, len(src.Models))
+		for i, m := range src.Models {
+			cp := m
+			if m.Enabled != nil {
+				v := *m.Enabled
+				cp.Enabled = &v
+			}
+			out.Models[i] = cp
+		}
+	}
+	if src.ModelCatalog != nil {
+		out.ModelCatalog = make([]modelStatSnapshot, len(src.ModelCatalog))
+		for i, m := range src.ModelCatalog {
+			cp := m
+			if m.Enabled != nil {
+				v := *m.Enabled
+				cp.Enabled = &v
+			}
+			out.ModelCatalog[i] = cp
+		}
+	}
+	return out
+}
+
+func cacheStatusSnapshotFromDisk(filePath string, snap statusSnapshot) {
+	abs, err := filepath.Abs(filePath)
+	if err != nil {
+		return
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.Mode().IsRegular() || snap.UpdatedAt <= 0 {
+		return
+	}
+	cloned := cloneStatusSnapshot(snap)
+	statusSnapshotMemCache.Lock()
+	statusSnapshotMemCache.absPath = abs
+	statusSnapshotMemCache.size = info.Size()
+	statusSnapshotMemCache.modTimeNano = info.ModTime().UnixNano()
+	statusSnapshotMemCache.snap = cloned
+	statusSnapshotMemCache.valid = true
+	statusSnapshotMemCache.Unlock()
+}
+
 // readStatusSnapshot 读取 serve 周期写入的状态快照（与 monitor 命令同一数据源）。
+// 当快照文件的绝对路径、大小和修改时间未变时直接克隆内存缓存，避免轮询重复读盘与反序列化。
 func readStatusSnapshot() (statusSnapshot, error) {
+	abs, absErr := filepath.Abs(statusSnapshotFile)
+	info, statErr := os.Stat(statusSnapshotFile)
+	if absErr == nil && statErr == nil && info.Mode().IsRegular() {
+		statusSnapshotMemCache.Lock()
+		if statusSnapshotMemCache.valid &&
+			statusSnapshotMemCache.absPath == abs &&
+			statusSnapshotMemCache.size == info.Size() &&
+			statusSnapshotMemCache.modTimeNano == info.ModTime().UnixNano() {
+			cached := cloneStatusSnapshot(statusSnapshotMemCache.snap)
+			statusSnapshotMemCache.Unlock()
+			return cached, nil
+		}
+		statusSnapshotMemCache.Unlock()
+	}
 	data, err := os.ReadFile(statusSnapshotFile)
 	if err != nil {
 		return statusSnapshot{}, err
@@ -776,6 +973,17 @@ func readStatusSnapshot() (statusSnapshot, error) {
 	}
 	if snap.UpdatedAt <= 0 {
 		return statusSnapshot{}, errors.New("状态快照没有有效更新时间")
+	}
+	if absErr == nil {
+		if freshInfo, freshErr := os.Stat(statusSnapshotFile); freshErr == nil && freshInfo.Mode().IsRegular() && int64(len(data)) == freshInfo.Size() {
+			statusSnapshotMemCache.Lock()
+			statusSnapshotMemCache.absPath = abs
+			statusSnapshotMemCache.size = freshInfo.Size()
+			statusSnapshotMemCache.modTimeNano = freshInfo.ModTime().UnixNano()
+			statusSnapshotMemCache.snap = cloneStatusSnapshot(snap)
+			statusSnapshotMemCache.valid = true
+			statusSnapshotMemCache.Unlock()
+		}
 	}
 	return snap, nil
 }
