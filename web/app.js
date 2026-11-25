@@ -2294,9 +2294,12 @@
 
   function renderSettings(data) {
     state.settings = data;
-    $("apiKeyEnabled").checked = data.apiKeyEnabled;
-    $("modelAPIKey").value = "";
-    $("apiKeyState").textContent = data.apiKeyConfigured ? "已配置 API Key，留空将保留原值。" : "尚未配置 API Key。";
+    $("apiKeyEnabled").checked = !!data.apiKeyEnabled;
+    var keys = data.apiKeys || [];
+    $("apiKeyState").textContent = !keys.length ? "尚未配置 Key；开启校验前请先添加至少一条。" :
+      "已配置 " + keys.length + " 条 Key" + (data.apiKeyMaxCount ? "（上限 " + data.apiKeyMaxCount + "）" : "") +
+      "；开启校验时客户端需匹配其中任意一条。";
+    renderAPIKeyRows(keys);
     $("apiPortValue").textContent = data.apiPort;
     $("webPortValue").textContent = data.webPort;
     $("configuredApiPort").value = data.configuredApiPort || data.apiPort;
@@ -2317,20 +2320,120 @@
   }
 
   function setSettingsBusy(busy) {
-    ["apiKeyEnabled", "modelAPIKey", "configuredApiPort", "configuredWebPort", "saveAPISettings", "savePortSettings"]
+    ["apiKeyEnabled", "newAPIKeyLabel", "newAPIKeyValue", "generateAPIKey", "addAPIKey",
+      "configuredApiPort", "configuredWebPort", "saveAPISettings", "savePortSettings"]
       .forEach(function (id) { $(id).disabled = busy; });
+  }
+
+  function renderAPIKeyRows(keys) {
+    var body = $("apiKeyTable").querySelector("tbody");
+    var revealed = state.apiKeyRevealed || {};
+    var keep = {};
+    keys.forEach(function (item) { if (item.id) keep[item.id] = true; });
+    // 已删除的 Key 不再保留任何明文，避免列表变化后残留。
+    Object.keys(revealed).forEach(function (id) { if (!keep[id]) delete revealed[id]; });
+    state.apiKeyRevealed = revealed;
+    if (!keys.length) {
+      body.innerHTML = '<tr><td colspan="4" class="hint">还没有模型 API Key。</td></tr>';
+      return;
+    }
+    body.innerHTML = keys.map(function (item) {
+      var shown = !!(item.id && revealed[item.id]);
+      var value = shown ? revealed[item.id] : (item.apiKeyMasked || "****");
+      return '<tr>' +
+        '<td>' + esc(item.label || "未命名") + '</td>' +
+        '<td class="api-key-value">' + esc(value) + '</td>' +
+        '<td>' + esc(formatKeyCreatedAt(item.createdAt)) + '</td>' +
+        '<td><div class="api-key-actions">' +
+        '<button type="button" data-reveal="' + esc(item.id || "") + '">' + (shown ? "隐藏" : "显示") + '</button>' +
+        '<button type="button" class="danger" data-delete="' + esc(item.id || "") + '" data-label="' +
+        esc(item.label || "未命名") + '" data-last="' + (keys.length === 1 ? "1" : "0") + '">删除</button>' +
+        '</div></td></tr>';
+    }).join("");
+  }
+
+  function formatKeyCreatedAt(value) {
+    if (!value) return "—";
+    var date = new Date(value);
+    if (!date || isNaN(date.getTime())) return value;
+    return date.toLocaleString("zh-CN", {hour12: false});
+  }
+
+  function handleAPIKeyTableClick(event) {
+    var button = event.target;
+    while (button && button.tagName !== "BUTTON") button = button.parentNode;
+    if (!button || button.disabled) return;
+    var revealID = button.getAttribute("data-reveal");
+    if (revealID) { toggleAPIKeyReveal(revealID); return; }
+    var deleteID = button.getAttribute("data-delete");
+    if (deleteID) {
+      removeAPIKey(deleteID, button.getAttribute("data-label") || "未命名", button.getAttribute("data-last") === "1");
+    }
+  }
+
+  // 明文只保存在当前页面的内存里，不写 sessionStorage / localStorage / console。
+  function toggleAPIKeyReveal(id) {
+    var revealed = state.apiKeyRevealed || {};
+    if (Object.prototype.hasOwnProperty.call(revealed, id)) {
+      delete revealed[id];
+      renderAPIKeyRows((state.settings && state.settings.apiKeys) || []);
+      return Promise.resolve();
+    }
+    setSettingsBusy(true);
+    return api("/admin/api/api-key-reveal", {method: "POST", body: {id: id}}).then(function (data) {
+      state.apiKeyRevealed = state.apiKeyRevealed || {};
+      state.apiKeyRevealed[id] = data.apiKey;
+      renderAPIKeyRows((state.settings && state.settings.apiKeys) || []);
+    }).catch(function () {}).then(function () { setSettingsBusy(false); });
+  }
+
+  function removeAPIKey(id, label, last) {
+    var message = last ?
+      "这是最后一条模型 API Key。删除后会同时关闭模型 API Key 校验，任何客户端都能直接调用模型；管理页仍需要管理 Key。确定删除？" :
+      "删除 Key「" + label + "」后立即失效，使用它的客户端将无法调用模型。确定删除？";
+    if (!window.confirm(message)) return Promise.resolve();
+    setSettingsBusy(true);
+    return api("/admin/api/api-key-delete", {method: "POST", body: {id: id}}).then(function (data) {
+      renderSettings(data.settings || state.settings || {apiKeys: []});
+      showAlert(data.authDisabledByRemoval ?
+        "已删除最后一条 Key，模型 API Key 校验已同时关闭。" : "已删除该 Key，立即失效。", true);
+    }).catch(function () {}).then(function () { setSettingsBusy(false); });
+  }
+
+  function addAPIKey() {
+    var label = $("newAPIKeyLabel").value.trim();
+    var key = $("newAPIKeyValue").value;
+    setSettingsBusy(true);
+    return api("/admin/api/api-key-create", {method: "POST", body: {label: label, apiKey: key}}).then(function (data) {
+      $("newAPIKeyLabel").value = "";
+      $("newAPIKeyValue").value = "";
+      $("newAPIKeyValue").type = "password";
+      if (data.settings) renderSettings(data.settings);
+      // 原文仅本次提示显示，不写浏览器存储。
+      window.alert((data.generated ? "已自动生成并添加一条 Key：\n\n" : "已添加一条 Key：\n\n") + data.apiKey +
+        "\n\n请复制保存。之后可在列表中点「显示」再次查看。");
+    }).catch(function () {}).then(function () { setSettingsBusy(false); });
+  }
+
+  function generateAPIKeyValue() {
+    var entropy = new Uint8Array(16);
+    window.crypto.getRandomValues(entropy);
+    var text = "";
+    for (var i = 0; i < entropy.length; i++) text += ("0" + entropy[i].toString(16)).slice(-2);
+    $("newAPIKeyValue").value = text;
+    $("newAPIKeyValue").type = "text";
   }
 
   function saveAPISettings() {
     var enabled = $("apiKeyEnabled").checked;
-    var key = $("modelAPIKey").value;
-    if (enabled && !key && !(state.settings && state.settings.apiKeyConfigured)) {
-      showAlert("开启 API Key 校验前必须输入一个 Key。");
+    var keys = (state.settings && state.settings.apiKeys) || [];
+    if (enabled && !keys.length) {
+      showAlert("开启模型 API Key 校验前必须至少添加一条 Key。");
       reportUIEvent("settings_validation_failed", "/admin/api/settings", 0, traceID());
       return;
     }
     setSettingsBusy(true);
-    return api("/admin/api/settings", {method: "POST", body: {apiKeyEnabled: enabled, apiKey: key}})
+    return api("/admin/api/settings", {method: "POST", body: {apiKeyEnabled: enabled}})
       .then(function (data) {
         renderSettings(data);
         showAlert("已写入 config.json，API 鉴权设置立即生效；管理鉴权未改变。", true);
@@ -2461,6 +2564,9 @@
     });
     $("initializeAdmin").addEventListener("click", initializeAdmin);
     $("saveAPISettings").addEventListener("click", saveAPISettings);
+    $("addAPIKey").addEventListener("click", addAPIKey);
+    $("generateAPIKey").addEventListener("click", generateAPIKeyValue);
+    $("apiKeyTable").addEventListener("click", handleAPIKeyTableClick);
     $("savePortSettings").addEventListener("click", savePortSettings);
     bindAccountAlertTooltip();
     $("editConfig").addEventListener("click", showConfigWarning);

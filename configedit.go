@@ -62,6 +62,11 @@ func validateConfigEditorDocument(content string) (runtimeFileConfig, error) {
 			return c, gatewayValidationError("不能把脱敏占位符 [REDACTED] 保存为 Key，请重新加载编辑原文")
 		}
 	}
+	for _, k := range c.Gateway.APIKeys {
+		if k.APIKey == "[REDACTED]" {
+			return c, gatewayValidationError("不能把脱敏占位符 [REDACTED] 保存为 Key，请重新加载编辑原文")
+		}
+	}
 	return c, nil
 }
 

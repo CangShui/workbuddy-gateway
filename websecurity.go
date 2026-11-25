@@ -250,6 +250,9 @@ func handleWebUIClientEvent(w http.ResponseWriter, r *http.Request) {
 		"/admin/api/account-add":    true,
 		"/admin/api/account-cancel": true,
 		"/admin/api/account-delete": true,
+		"/admin/api/api-key-create": true,
+		"/admin/api/api-key-delete": true,
+		"/admin/api/api-key-reveal": true,
 	}
 	for _, input := range records {
 		if !allowed[input.Event] || !routes[input.Route] || input.Status < 0 || input.Status > 599 {

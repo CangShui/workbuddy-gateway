@@ -151,7 +151,8 @@ workbuddy-gateway serve -webui -allow-price-probes
     "webPort": 8316,
     "adminKey": "",
     "apiKeyEnabled": false,
-    "apiKey": ""
+    "apiKey": "",
+    "apiKeys": []
   }
 }
 ```
@@ -161,12 +162,15 @@ workbuddy-gateway serve -webui -allow-price-probes
 | `apiPort` | `8317` | 模型 API 监听端口，省略或 `0` 使用默认值；也可用 `-port` 临时覆盖 |
 | `webPort` | `8316` | 网页控制台监听端口，省略或 `0` 使用默认值；仅在显式 `-webui` 时监听 |
 | `adminKey` | `""` | 网页控制台管理 Key，有两种设置方式：**① 页面一键生成**——为空时在服务器本机（或 SSH 本地端口转发）打开网页，生成 32 字符随机 Key 写入本文件，并在弹窗中**仅展示一次**；**② 手动编辑本文件**——直接把本字段改成任意随机字符串（建议 32 位），保存后约 1 秒热生效。设置完成后可从其他设备用该 Key 登录 |
-| `apiKeyEnabled` | `false` | 模型 API 是否校验 Key。关闭时不带 Key 或任意 Key 均可调用模型；开启时必须匹配 `apiKey` |
-| `apiKey` | `""` | 模型 API Key。开启校验时必须非空；关闭时保留原值，重新开启即可继续使用 |
+| `apiKeyEnabled` | `false` | 模型 API 是否校验 Key。关闭时不带 Key 或任意 Key 均可调用模型；开启时必须匹配 `apiKeys` 中任意一条 |
+| `apiKeys` | `[]` | 模型 API Key 数组，每条为 `{"id":"…","label":"…","apiKey":"…","createdAt":"…"}`；最多 64 条。`id` 与 `createdAt` 由服务端生成，手写时可省略 `id`（会按 Key 值推导稳定 id）。空数组会被省略，因此 `config.example.json` 里没有这个字段，照抄示例不影响使用 |
+| `apiKey` | `""` | **旧单 Key 字段，仅为读取兼容**：`apiKeys` 为空时把这里的值当作一条 Key 加载（内存中合成 `id=legacy`、标签「默认」，不写盘）；`apiKeys` 非空时该字段被忽略。从网页「访问设置」页做任何保存（新增/删除 Key、改开关或端口）时，`apiKey` 会被清空并改写成 `apiKeys` 数组；用「配置编辑器」保存则按原文写入、不做改写。旧版网页或脚本若仍提交该字段，沿用旧语义：与现有条目同值则忽略，换值则**整体替换** `apiKeys`（确保被轮换掉的 Key 立即失效） |
 
-网页控制台也可在「访问设置」页切换 `apiKeyEnabled` 并设置 `apiKey`，保存后立即生效并写回本文件。`gateway.apiPort` / `gateway.webPort` 也支持热切换：先校验并绑定新端口，再关闭旧监听；已有连接和正在输出的流不主动中断。管理 Key 与模型 API Key **相互独立**：关闭模型 API 鉴权不会关闭管理鉴权，模型 API Key 也不能登录网页控制台。为避免他人抢先生成，**页面一键生成**管理 Key 只允许本机访问；**手动编辑 `config.json` 设置 `gateway.adminKey`** 不受此限制，效果与一键生成完全相同。
+网页控制台「访问设置」页可以新增 / 显示 / 删除模型 API Key：新增时可填自定义标签与 Key 值，Key 值留空则由服务端生成 32 字符随机 Key；列表只显示掩码，点「显示」才单独向服务端请求一次明文（响应禁止缓存，明文不写日志、不写浏览器存储）。删除后该 Key 立即失效；**删除最后一条 Key 会同时关闭 `apiKeyEnabled`**，因为「开启校验但没有任何 Key」会让模型 API 无法调用。`gateway.apiPort` / `gateway.webPort` 也支持热切换：先校验并绑定新端口，再关闭旧监听；已有连接和正在输出的流不主动中断。管理 Key 与模型 API Key **相互独立**：关闭模型 API 鉴权不会关闭管理鉴权，模型 API Key 也不能登录网页控制台。为避免他人抢先生成，**页面一键生成**管理 Key 只允许本机访问；**手动编辑 `config.json` 设置 `gateway.adminKey`** 不受此限制，效果与一键生成完全相同。
 
 > **升级顺序（重要）**：新版本能读取不含 `gateway` 段的旧配置，但**旧版本二进制遇到含 `gateway` 段的新配置会启动失败**（`json: unknown field "gateway"`）。请**先替换二进制、再添加 `gateway` 配置**。
+>
+> **回滚提示（`apiKeys`）**：旧版本同样不认识 `gateway.apiKeys`（`json: unknown field "apiKeys"`），回退到旧版本时服务会直接启动失败并退出，**不会删改配置**。恢复办法：把 `apiKeys` 中要用的那条 `apiKey` 值写回 `gateway.apiKey`，删掉 `apiKeys` 段，再启动旧版本。升级前建议先备份一份 `config.json`。
 
 ### JSON 调试日志
 
@@ -476,7 +480,7 @@ workbuddy-gateway serve -keepalive-hours ""
 | 配置 | 生效方式 |
 |---|---|
 | 模型名单、`models.accounts`（含 `all`） | 热生效，控制后续调度 |
-| `gateway.adminKey` / `apiKeyEnabled` / `apiKey` | 热生效；管理 Key 改变后需使用新 Key 登录 |
+| `gateway.adminKey` / `apiKeyEnabled` / `apiKey` / `apiKeys` | 热生效；管理 Key 改变后需使用新 Key 登录。`apiKey` 只是旧字段，从「访问设置」页保存后会被改写成 `apiKeys` 数组 |
 | `concurrent.MaxAcc` / `MaxGlobal` | 热生效；新请求立即按新并发上限排队，已有请求不中断 |
 | `systemPrompt` / `identity` / `debug.enabled` / `debug.fullRequests` | 热生效；仅影响后续请求 |
 | `logs.retentionDays` | 热生效；下一次清理调度立即使用新保留天数 |
@@ -868,8 +872,8 @@ systemctl restart workbuddy-gateway
 |---|---|
 | 入口 | `GET /ui/`（独立管理端口，静态外壳不含任何数据） |
 | 数据接口 | `GET /admin/api/status`、`/admin/api/models`、`/admin/api/logs`、`/admin/api/config`、`/admin/api/tasks`，**一律需要 `Authorization: Bearer <adminKey>`** |
-| 写入接口 | `POST /admin/api/setup`（仅本机首次生成管理 Key）、`POST /admin/api/settings`（模型 API 鉴权与端口）、`POST /admin/api/account-toggle` / `model-toggle`（账号/模型开关）、`POST /admin/api/credential-edit`（凭据 JSON）、`POST /admin/api/log-settings` / `log-cleanup`（保留设置与过期清理） |
-| 页面 | 总览（用量趋势、账号池健康度与日志告警）、账号池（全局调度开关）、模型列表（启停开关，含停用模型）、日志（保留天数与清理）、配置（Key 脱敏预览；确认警告后可编辑完整配置，systemPrompt 正文直接展示）、定时任务（只读日志视图）、访问设置（鉴权与端口编辑）。网页不再提供凭据列表或编辑器 |
+| 写入接口 | `POST /admin/api/setup`（仅本机首次生成管理 Key）、`POST /admin/api/settings`（模型 API 鉴权与端口）、`POST /admin/api/api-key-create` / `api-key-delete` / `api-key-reveal`（模型 API Key 的新增、删除与显式查看明文）、`POST /admin/api/account-toggle` / `model-toggle`（账号/模型开关）、`POST /admin/api/credential-edit`（凭据 JSON）、`POST /admin/api/log-settings` / `log-cleanup`（保留设置与过期清理） |
+| 页面 | 总览（用量趋势、账号池健康度与日志告警）、账号池（全局调度开关）、模型列表（启停开关，含停用模型）、日志（保留天数与清理）、配置（Key 脱敏预览；确认警告后可编辑完整配置，systemPrompt 正文直接展示）、定时任务（只读日志视图）、访问设置（鉴权开关、模型 API Key 列表与端口编辑）。网页不再提供凭据列表或编辑器 |
 | 数据来源 | 复用 `serve` 的状态快照、完整模型目录、`logs/` 日志与本地配置/凭据文件；开关受控写入配置并应用原有调度过滤 |
 | 定时任务 | 周期、启用状态、最近执行、完成时间、执行结果、下次预计执行与日志说明；仅展示、不触发任务或修改调度 |
 
@@ -993,7 +997,7 @@ workbuddy4.json        intl   hy3      paid     0.42    820     usage.credit=0.4
 | `skipped` | 账号失效或无凭据 |
 | `error` | 网络 / 协议错误 |
 
-> 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源；模型 API 启用 Key 校验时同样需要携带 `gateway.apiKey`。
+> 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源；模型 API 启用 Key 校验时同样需要携带 `gateway.apiKeys` 中的任意一条 Key（旧字段 `gateway.apiKey` 亦可）。
 
 ---
 
@@ -1350,8 +1354,10 @@ sudo systemctl disable workbuddy-gateway
 对外开放时（例如局域网其他设备）把 `-addr` 改为 `0.0.0.0`，并在 `config.json` 中开启模型 API Key 校验：
 
 ```json
-{"gateway":{"apiKeyEnabled":true,"apiKey":"sk-changeme"}}
+{"gateway":{"apiKeyEnabled":true,"apiKeys":[{"apiKey":"sk-changeme","label":"对外访问"}]}}
 ```
+
+（旧写法 `{"gateway":{"apiKeyEnabled":true,"apiKey":"sk-changeme"}}` 仍然可读，下次从「访问设置」页保存时会自动改成上面的数组形式。）
 
 ```ini
 ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
@@ -1405,7 +1411,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 
 - `workbuddy*.json` 包含真实访问凭据（Access Token / Refresh Token），**严禁提交到 Git 或公开分享**；本仓库 `.gitignore` 已排除。
 - 网关默认只监听 `127.0.0.1`。需要局域网 / 公网访问时改用 `-addr 0.0.0.0`，并在 `config.json` 中开启模型 API Key 校验（`gateway.apiKeyEnabled`），或置于反向代理之后。
-- `config.json` 中的 `gateway.adminKey` 与 `gateway.apiKey` 按要求明文保存，请限制该文件权限；网页配置预览隐藏 Key，管理员明确确认编辑警告后才在编辑器显示真实 Key。不要分享编辑器截图或在公共设备上编辑，完整配置只保留在当前页面内存中，不进入审计日志。
+- `config.json` 中的 `gateway.adminKey` 与 `gateway.apiKeys`（旧字段 `gateway.apiKey`）按要求明文保存，请限制该文件权限；网页「访问设置」页的 Key 列表只显示掩码，点「显示」才单独请求一次明文，明文不写日志、不写浏览器存储；网页配置预览隐藏 Key，管理员明确确认编辑警告后才在编辑器显示真实 Key。不要分享编辑器截图或在公共设备上编辑，完整配置只保留在当前页面内存中，不进入审计日志。
 - `/admin/probe` 仅接受回环来源调用。
 - 不再需要某账号授权时，删除对应凭据文件并在 CodeBuddy 控制台撤销授权。
 
