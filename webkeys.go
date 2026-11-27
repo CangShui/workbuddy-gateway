@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -40,7 +39,7 @@ func writeGatewayKeyError(w http.ResponseWriter, trace, action string, err error
 	if errors.As(err, &validation) {
 		status = http.StatusBadRequest
 	}
-	if errors.Is(err, errConfigChange) {
+	if errors.Is(err, errConfigChange) || errors.Is(err, errEnabledWithoutAPIKey) {
 		status = http.StatusConflict
 	}
 	log.Printf("[模型Key管理] traceId=%s 阶段=%s 结果=失败 状态码=%d 原因=%v 业务影响=Key列表与鉴权状态未变化", trace, action, status, err)
@@ -85,12 +84,6 @@ func handleWebUIAPIKeyCreate(w http.ResponseWriter, r *http.Request) {
 	created := newGatewayAPIKey(key, label)
 	total := 0
 	err := mutateGatewayAPIKeys(trace, func(g *gatewayFileConfig) error {
-		if gatewayAPIKeyIndex(g.APIKeys, key) >= 0 {
-			return gatewayValidationError("该 Key 值已存在，未重复添加")
-		}
-		if len(g.APIKeys) >= maxGatewayAPIKeys {
-			return gatewayValidationError(fmt.Sprintf("最多允许配置 %d 条 Key", maxGatewayAPIKeys))
-		}
 		g.APIKeys = append(g.APIKeys, created)
 		g.APIKey = ""
 		total = len(g.APIKeys)
@@ -128,7 +121,6 @@ func handleWebUIAPIKeyDelete(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(input.ID)
 	remaining := 0
 	enabledNow := false
-	authDisabledByRemoval := false
 	err := mutateGatewayAPIKeys(trace, func(g *gatewayFileConfig) error {
 		idx := gatewayAPIKeyIndexOfID(g.APIKeys, id)
 		if idx < 0 {
@@ -137,12 +129,7 @@ func handleWebUIAPIKeyDelete(w http.ResponseWriter, r *http.Request) {
 		g.APIKeys = append(g.APIKeys[:idx], g.APIKeys[idx+1:]...)
 		g.APIKey = ""
 		remaining = len(g.APIKeys)
-		// 启用校验必须至少保留一条 Key：删掉最后一条时同时关闭校验，
-		// 否则配置文件会进入「开启校验但没有可用 Key」的不可用状态。
-		if remaining == 0 && g.APIKeyEnabled {
-			g.APIKeyEnabled = false
-			authDisabledByRemoval = true
-		}
+		// 删除不改变鉴权开关；公共配置校验在同一把写锁内拒绝启用鉴权的空列表。
 		enabledNow = g.APIKeyEnabled
 		return nil
 	})
@@ -150,13 +137,12 @@ func handleWebUIAPIKeyDelete(w http.ResponseWriter, r *http.Request) {
 		writeGatewayKeyError(w, trace, "删除", err)
 		return
 	}
-	log.Printf("[模型Key管理] traceId=%s 阶段=删除 结果=成功 剩余条数=%d 同时关闭鉴权=%t 说明=删除后旧Key立即失效，已建立的连接不受影响", trace, remaining, authDisabledByRemoval)
+	log.Printf("[模型Key管理] traceId=%s 阶段=删除 结果=成功 剩余条数=%d 鉴权启用=%t 说明=已移除指定Key，鉴权开关未改变", trace, remaining, enabledNow)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"deleted":               true,
-		"remaining":             remaining,
-		"apiKeyEnabled":         enabledNow,
-		"authDisabledByRemoval": authDisabledByRemoval,
-		"settings":              gatewaySettingsView(),
+		"deleted":       true,
+		"remaining":     remaining,
+		"apiKeyEnabled": enabledNow,
+		"settings":      gatewaySettingsView(),
 	})
 }
 

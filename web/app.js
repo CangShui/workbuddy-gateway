@@ -2388,15 +2388,16 @@
   }
 
   function removeAPIKey(id, label, last) {
-    var message = last ?
-      "这是最后一条模型 API Key。删除后会同时关闭模型 API Key 校验，任何客户端都能直接调用模型；管理页仍需要管理 Key。确定删除？" :
-      "删除 Key「" + label + "」后立即失效，使用它的客户端将无法调用模型。确定删除？";
+    if (last && state.settings && state.settings.apiKeyEnabled) {
+      showAlert("要删除最后一条 Key，请先关闭模型 API Key 校验并保存。");
+      return Promise.resolve();
+    }
+    var message = "确定删除模型 API Key「" + label + "」？";
     if (!window.confirm(message)) return Promise.resolve();
     setSettingsBusy(true);
     return api("/admin/api/api-key-delete", {method: "POST", body: {id: id}}).then(function (data) {
       renderSettings(data.settings || state.settings || {apiKeys: []});
-      showAlert(data.authDisabledByRemoval ?
-        "已删除最后一条 Key，模型 API Key 校验已同时关闭。" : "已删除该 Key，立即失效。", true);
+      showAlert("已删除该 Key，鉴权开关未改变。", true);
     }).catch(function () {}).then(function () { setSettingsBusy(false); });
   }
 

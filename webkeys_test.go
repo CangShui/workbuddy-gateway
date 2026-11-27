@@ -166,7 +166,7 @@ func TestGatewayAPIKeyMultipleKeysAllAccepted(t *testing.T) {
 	}
 }
 
-func TestGatewayAPIKeyDeleteLastDisablesAuth(t *testing.T) {
+func TestGatewayAPIKeyDeleteLastRequiresExplicitAuthDisable(t *testing.T) {
 	isolatedGatewayConfig(t)
 	handler := newWebUIHandler()
 	admin := initTestAdmin(t, handler)
@@ -180,15 +180,82 @@ func TestGatewayAPIKeyDeleteLastDisablesAuth(t *testing.T) {
 		t.Fatalf("开启校验失败: 状态码=%d body=%s", w.Code, w.Body.String())
 	}
 	w = adminRequest(handler, http.MethodPost, "/admin/api/api-key-delete", admin, `{"id":"`+id+`"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("鉴权开启时删除最后一条 Key 应被拒绝，状态码=%d body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "only-client-key-01") {
+		t.Fatal("删除最后一条 Key 的错误不能回显 Key 原文")
+	}
+	api := newAPIHandler()
+	if adminRequest(api, http.MethodPost, "/v1/messages/count_tokens", "", `{"messages":[]}`).Code != http.StatusUnauthorized ||
+		adminRequest(api, http.MethodPost, "/v1/messages/count_tokens", "only-client-key-01", `{"messages":[]}`).Code != http.StatusOK {
+		t.Fatal("拒绝删除后必须保留原 Key，并继续拒绝匿名请求")
+	}
+	if w := adminRequest(handler, http.MethodPost, "/admin/api/settings", admin, `{"apiKeyEnabled":false}`); w.Code != http.StatusOK {
+		t.Fatalf("显式关闭校验失败: 状态码=%d body=%s", w.Code, w.Body.String())
+	}
+	w = adminRequest(handler, http.MethodPost, "/admin/api/api-key-delete", admin, `{"id":"`+id+`"}`)
 	if w.Code != http.StatusOK {
-		t.Fatalf("删除最后一条 Key 状态码=%d body=%s", w.Code, w.Body.String())
+		t.Fatalf("关闭校验后删除最后一条 Key 应成功，状态码=%d body=%s", w.Code, w.Body.String())
 	}
 	result := decodeAPIKeyJSON(t, w.Body.Bytes())
-	if result["authDisabledByRemoval"] != true || result["apiKeyEnabled"] != false {
-		t.Fatalf("删除最后一条 Key 必须同时关闭校验，实际 %v", result)
+	if result["remaining"] != float64(0) || result["apiKeyEnabled"] != false {
+		t.Fatalf("显式关闭后删除不应再次报告关闭鉴权，实际 %v", result)
 	}
 	if code := adminRequest(newAPIHandler(), http.MethodPost, "/v1/messages/count_tokens", "", `{"messages":[]}`).Code; code != http.StatusOK {
 		t.Fatalf("关闭校验后不带 Key 应可用，实际 %d", code)
+	}
+}
+
+func TestGatewayAPIKeyConfigRejectsDuplicateValuesAndIDs(t *testing.T) {
+	isolatedGatewayConfig(t)
+	if err := applyGatewayConfig(gatewayFileConfig{APIKeyEnabled: true, APIKey: "previous-key"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ field, entries string }{
+		{"apiKey", `[{"apiKey":"same-secret"},{"id":"two","apiKey":"same-secret"}]`},
+		{"id", `[{"id":"same-id","apiKey":"first-secret"},{"id":"same-id","apiKey":"other-secret"}]`},
+	} {
+		content := `{"gateway":{"apiKeyEnabled":true,"apiKeys":` + tc.entries + `}}`
+		if err := os.WriteFile(runtimeConfigFile, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		startErr := loadRuntimeConfig(runtimeConfigFile)
+		watcher := runtimeConfigWatcher{}
+		if watcher.reload() {
+			t.Fatal("不能应用重复条目")
+		}
+		_, editorErr := validateConfigEditorDocument(content)
+		want := "gateway.apiKeys[1]." + tc.field + " 与 gateway.apiKeys[0]." + tc.field + " 重复"
+		if startErr == nil || startErr.Error() != "解析配置文件 "+runtimeConfigFile+": "+want ||
+			watcher.lastError == nil || watcher.lastError.Error() != want || editorErr == nil || editorErr.Error() != want {
+			t.Fatalf("启动、热加载与网页编辑错误必须只报告冲突位置：%v / %v / %v", startErr, watcher.lastError, editorErr)
+		}
+		if currentAPIKey() != "previous-key" {
+			t.Fatal("配置被拒绝后必须保留原鉴权状态")
+		}
+	}
+}
+
+func TestGatewayAPIKeyConfigDerivesStableIDsForOmittedIDs(t *testing.T) {
+	input := gatewayFileConfig{APIPort: 8317, WebPort: 8316, APIKeys: []gatewayAPIKey{
+		{Label: "一", APIKey: "stable-value-01"},
+		{Label: "二", APIKey: "stable-value-02"},
+	}}
+	secondInput := input
+	secondInput.APIKeys = append([]gatewayAPIKey(nil), input.APIKeys...)
+	first, err := normalizeGatewayConfig(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := normalizeGatewayConfig(secondInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range first.APIKeys {
+		if first.APIKeys[i].ID != apiKeyIDFor(first.APIKeys[i].APIKey) || first.APIKeys[i].ID != second.APIKeys[i].ID {
+			t.Fatalf("省略 id 时必须稳定派生，第一次=%q 第二次=%q", first.APIKeys[i].ID, second.APIKeys[i].ID)
+		}
 	}
 }
 

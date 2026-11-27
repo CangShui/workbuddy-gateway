@@ -57,6 +57,8 @@ type gatewayFileConfig struct {
 
 type gatewayValidationError string
 
+const errEnabledWithoutAPIKey gatewayValidationError = "启用 API Key 校验时必须至少保留一条模型 Key；要删除最后一条，请先显式关闭鉴权"
+
 func (e gatewayValidationError) Error() string { return string(e) }
 
 var (
@@ -87,7 +89,10 @@ func normalizeGatewayConfig(g gatewayFileConfig) (gatewayFileConfig, error) {
 	if len(g.APIKeys) > maxGatewayAPIKeys {
 		return g, gatewayValidationError(fmt.Sprintf("gateway.apiKeys 最多允许 %d 条", maxGatewayAPIKeys))
 	}
-	for _, k := range g.APIKeys {
+	g = migrateLegacyAPIKey(g)
+	values := make(map[string]int, len(g.APIKeys))
+	ids := make(map[string]int, len(g.APIKeys))
+	for i, k := range g.APIKeys {
 		if k.APIKey == "" {
 			return g, gatewayValidationError("gateway.apiKeys[].apiKey 不能为空")
 		}
@@ -97,11 +102,21 @@ func normalizeGatewayConfig(g gatewayFileConfig) (gatewayFileConfig, error) {
 		if err := validateGatewayAPIKeyLabel(k.Label); err != nil {
 			return g, err
 		}
+		if first, exists := values[k.APIKey]; exists {
+			return g, gatewayValidationError(fmt.Sprintf("gateway.apiKeys[%d].apiKey 与 gateway.apiKeys[%d].apiKey 重复", i, first))
+		}
+		values[k.APIKey] = i
+		if k.ID == "" {
+			k.ID = apiKeyIDFor(k.APIKey)
+			g.APIKeys[i].ID = k.ID
+		}
+		if first, exists := ids[k.ID]; exists {
+			return g, gatewayValidationError(fmt.Sprintf("gateway.apiKeys[%d].id 与 gateway.apiKeys[%d].id 重复", i, first))
+		}
+		ids[k.ID] = i
 	}
-	g = migrateLegacyAPIKey(g)
-	g.APIKeys = normalizeGatewayAPIKeyIDs(g.APIKeys)
 	if g.APIKeyEnabled && len(g.APIKeys) == 0 {
-		return g, gatewayValidationError("启用 API Key 校验时必须至少设置一条 gateway.apiKeys（旧字段 gateway.apiKey 仍可写入）")
+		return g, errEnabledWithoutAPIKey
 	}
 	return g, nil
 }
@@ -165,26 +180,6 @@ func newGatewayAPIKey(key, label string) gatewayAPIKey {
 func apiKeyIDFor(key string) string {
 	sum := sha256.Sum256([]byte("workbuddy-gateway/api-key/" + key))
 	return hex.EncodeToString(sum[:8])
-}
-
-// normalizeGatewayAPIKeyIDs 补齐手写条目缺失的 id，并保证 id 唯一（重复时改用新的随机 id）。
-func normalizeGatewayAPIKeyIDs(keys []gatewayAPIKey) []gatewayAPIKey {
-	if len(keys) == 0 {
-		return keys
-	}
-	seen := make(map[string]bool, len(keys))
-	for i := range keys {
-		id := keys[i].ID
-		if id == "" {
-			id = apiKeyIDFor(keys[i].APIKey)
-		}
-		for seen[id] {
-			id = uuid.NewString()
-		}
-		seen[id] = true
-		keys[i].ID = id
-	}
-	return keys
 }
 
 // gatewayAPIKeyIndex 返回指定 Key 值在数组中的下标，未找到返回 -1。

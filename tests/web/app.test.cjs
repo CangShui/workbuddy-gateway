@@ -501,7 +501,7 @@ test("模型Key列表：默认只显示掩码、点显示才取明文、删除�
     calls.push({route, options});
     if (route === "/admin/api/api-key-reveal") return response(200, {id: "key-1", label: "笔记本", apiKey: revealed});
     if (route === "/admin/api/api-key-delete") return response(200,
-      {deleted: true, remaining: 0, apiKeyEnabled: false, authDisabledByRemoval: true, settings: emptyView});
+      {deleted: true, remaining: 0, apiKeyEnabled: false, settings: emptyView});
     if (route === "/admin/api/api-key-create") return response(201,
       {id: "key-2", label: "新设备", apiKey: created, apiKeyMasked: "synth****", generated: true, settings: oneKeyView});
     return response(204, {});
@@ -523,9 +523,13 @@ test("模型Key列表：默认只显示掩码、点显示才取明文、删除�
   assert(![...f.local.values()].includes(revealed), "明文不能写进本地存储");
 
   await f.review.removeAPIKey("key-1", "笔记本", true);
+  assert.match(f.element("alert").textContent, /先关闭.*并保存/);
+  assert(!calls.some(c => c.route === "/admin/api/api-key-delete"));
+  f.review.renderSettings({...oneKeyView, apiKeyEnabled: false});
+  await f.review.removeAPIKey("key-1", "笔记本", true);
   assert.match(tbody.innerHTML, /colspan="4"/, "删除最后一条后应回到空列表提示");
   assert.match(tbody.innerHTML, /还没有模型 API Key/);
-  assert.match(f.element("alert").textContent, /校验已同时关闭/);
+  assert.match(f.element("alert").textContent, /鉴权开关未改变/);
 
   f.element("newAPIKeyLabel").value = "新设备";
   await f.review.addAPIKey();

@@ -299,7 +299,7 @@
         <thead><tr><th>标签</th><th>Key</th><th>创建时间</th><th>操作</th></tr></thead>
         <tbody></tbody>
       </table></div>
-      <p class="hint">Key 明文默认隐藏，点「显示」可查看；明文只显示在当前页面，不写入浏览器存储或日志。删除后立即失效；删除最后一条时会同时关闭模型 API Key 校验。</p>
+      <p class="hint">Key 明文默认隐藏，点「显示」可查看；明文只显示在当前页面，不写入浏览器存储或日志。删除后立即失效；鉴权开启时不能删除最后一条 Key，必须先显式关闭鉴权并保存。</p>
       <p class="hint">关闭时，客户端不带 Key 或使用任意 Key 均可调用模型。开启时必须匹配下面任意一条 Key；保存后立即生效，已有流式请求不被主动中断。</p>
       <button id="saveAPISettings" type="button">保存 API 访问设置</button>
       <div class="settings-ports">
