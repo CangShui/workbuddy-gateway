@@ -283,11 +283,24 @@
         <label for="apiKeyEnabled"><input id="apiKeyEnabled" type="checkbox"> 开启模型 API Key 校验</label>
       </div>
       <div class="settings-row">
-        <label for="modelAPIKey">模型 API Key</label>
-        <input id="modelAPIKey" type="password" autocomplete="new-password" placeholder="开启校验时必须设置；已有 Key 可留空保留">
-        <span id="apiKeyState" class="hint"></span>
+        <label for="newAPIKeyLabel">Key 标签</label>
+        <input id="newAPIKeyLabel" type="text" maxlength="64" autocomplete="off" placeholder="可选，例如：笔记本 / 手机 / CI">
       </div>
-      <p class="hint">关闭时，客户端不带 Key 或使用任意 Key 均可调用模型。开启时必须匹配已保存的 API Key；保存后立即生效，已有流式请求不被主动中断。</p>
+      <div class="settings-row">
+        <label for="newAPIKeyValue">Key 值</label>
+        <input id="newAPIKeyValue" type="password" autocomplete="new-password" placeholder="留空则自动生成 32 位随机 Key">
+        <div class="api-key-actions">
+          <button id="generateAPIKey" type="button">随机生成</button>
+          <button id="addAPIKey" type="button">添加 Key</button>
+        </div>
+      </div>
+      <p id="apiKeyState" class="hint" role="status">加载 Key 列表…</p>
+      <div class="table-wrap"><table id="apiKeyTable">
+        <thead><tr><th>标签</th><th>Key</th><th>创建时间</th><th>操作</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <p class="hint">Key 明文默认隐藏，点「显示」可查看；明文只显示在当前页面，不写入浏览器存储或日志。删除后立即失效；鉴权开启时不能删除最后一条 Key，必须先显式关闭鉴权并保存。</p>
+      <p class="hint">关闭时，客户端不带 Key 或使用任意 Key 均可调用模型。开启时必须匹配下面任意一条 Key；保存后立即生效，已有流式请求不被主动中断。</p>
       <button id="saveAPISettings" type="button">保存 API 访问设置</button>
       <div class="settings-ports">
         <div>API 监听端口：<strong id="apiPortValue">-</strong></div>

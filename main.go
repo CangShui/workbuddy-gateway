@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
@@ -448,6 +449,7 @@ type Config struct {
 	AuthExplicit       bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
 	LoginIntl          bool // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
 	APIKey             string
+	APIKeys            []string // 运行时生效的多条模型 Key；cfg.APIKey 是第一条的兼容镜像
 	ProxyURL           string
 	Verbose            bool
 	DebugEnabled       bool   // 仅由工作目录 config.json 的 debug.enabled 控制
@@ -702,8 +704,15 @@ func main() {
 // initFileLogging 将运行日志同时写入控制台和按日期命名的项目日志文件。
 func initFileLogging(command string) func() {
 	gatewayConfigMu.RLock()
-	registerSecrets(cfg.APIKey, cfg.AdminKey, gatewaySettings.APIKey)
+	secrets := append([]string{cfg.AdminKey}, activeAPIKeysLocked()...)
+	if gatewaySettings.APIKey != "" {
+		secrets = append(secrets, gatewaySettings.APIKey)
+	}
+	for _, k := range gatewaySettings.APIKeys {
+		secrets = append(secrets, k.APIKey)
+	}
 	gatewayConfigMu.RUnlock()
+	registerSecrets(secrets...)
 	// 文件初始化失败时，控制台仍要隐藏秘密值。
 	log.SetOutput(&redactingLogWriter{writer: os.Stderr})
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
@@ -3358,6 +3367,10 @@ func runServe() {
 }
 
 func printAPIAuthBanner(w io.Writer) {
+	if count := len(currentAPIKeys()); count > 1 {
+		fmt.Fprintf(w, "   API 鉴权:      已启用 (%d 条密钥已隐藏)\n", count)
+		return
+	}
 	fmt.Fprintln(w, "   API 鉴权:      已启用 (密钥已隐藏)")
 }
 
@@ -3478,17 +3491,34 @@ func isAuthExemptPath(p string) bool {
 	return p == "/health" || p == "/ping" || p == "/"
 }
 
+// apiKeyAccepted 判断请求携带的 Key 是否命中任意一条已配置 Key。
+// 先各自做 SHA-256 再常量时间比较：比较开销与 Key 长度、命中位置无关。
+func apiKeyAccepted(token string, keys []string) bool {
+	if token == "" {
+		return false
+	}
+	digest := sha256.Sum256([]byte(token))
+	matched := 0
+	for _, key := range keys {
+		candidate := sha256.Sum256([]byte(key))
+		if subtle.ConstantTimeCompare(digest[:], candidate[:]) == 1 {
+			matched = 1
+		}
+	}
+	return matched == 1
+}
+
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		apiKey := currentAPIKey()
-		if apiKey != "" && !isAuthExemptPath(r.URL.Path) {
+		apiKeys := currentAPIKeys()
+		if len(apiKeys) > 0 && !isAuthExemptPath(r.URL.Path) {
 			authHeader := r.Header.Get("Authorization")
 			token := strings.TrimPrefix(authHeader, "Bearer ")
 			// Anthropic 客户端（Claude Code 等）用 x-api-key 头携带密钥。
 			if token == "" {
 				token = r.Header.Get("x-api-key")
 			}
-			if subtle.ConstantTimeCompare([]byte(token), []byte(apiKey)) != 1 {
+			if !apiKeyAccepted(token, apiKeys) {
 				debugEvent(r, "warn", "authentication_rejected", map[string]any{
 					"status_code":     http.StatusUnauthorized,
 					"reason":          "invalid_api_key",

@@ -39,6 +39,7 @@ go test -run 'TestOfficial|TestRequestProfile|TestHarnessProtocol' -count=1
 `identity_wildcard_test.go` 验证单个 `(.*)`、非空首尾、偏移零、非贪婪、单行/256 字符上限、Unicode、无正则展开、非法规则忽略且不回退默认、优先级、映射自身停用、热加载及日志不泄露正文；并验证旧硬编码规则只在配置且开启时执行，普通模板不会再改 user/tool，15 条默认规则（含默认通配）的新装/旧版升级保留自定义值及关闭状态、可幂等重启。真实上游渠道校验尚未验证。
 `identity_restore_regression_test.go` 覆盖明确且唯一的身份声明、否定/普通提及、角色顺序与声明冲突，URL/域名/路径的任意三段切分、三协议 × 流式/聚合的正文及推理文本保护，关闭时 SSE 字节不变、热加载请求快照和审计落盘。新装/升级自动写入 `responseRestore:false`、已有设置保留及重复启动幂等性由 `identity_config_file_test.go` 验证。
 `stream_test.go` 覆盖空工具身份字段、参数片段和扩展字段保护，以及交错工具分片与多段推理文本经 Chat 请求回传；`messages_test.go` 验证 thinking 开始事件包含字符串 `signature`，并保持签名增量与结束事件顺序。测试使用本地合成上游，实际服务验证范围见出站兼容说明。
+`webkeys_test.go` 覆盖模型 API Key 多值管理：新增（自定义值与服务端随机生成 32 字符值）、按 id 显示明文（响应禁止缓存、未知 id 404）、删除（被删 Key 立即 401、未被删的仍可用、鉴权开启时拒绝删除最后一条，关闭鉴权后才可删除）、公共配置校验拒绝重复值和重复显式 id、重复值与含空白值拒绝、标签长度与控制字符校验、过短的 Key 整体掩码、未知字段与错误方法拒绝；并验证旧单 Key 字段的读取兼容（内存合成 `id=legacy`、热加载不改写磁盘、网页保存后落盘为 `apiKeys` 数组）、旧字段写入沿用替换语义（轮换后旧 Key 立即失效、同值重复提交保持幂等）以及无 Key / 错误 Key / 管理 Key 的鉴权隔离。全部使用临时工作目录与合成配置，不调用上游。
 可选历史采集离线重放见[出站兼容说明](../docs/outbound-compatibility.md#验证与边界)，默认不会读取私有材料。
 
 ## 网页
@@ -50,6 +51,7 @@ node --test tests/web/app.test.cjs
 
 `tests/web/app.test.cjs` 加载真实 `web/app.js`，使用合成 DOM / fetch 响应，不需要浏览器依赖、不调用生产接口。审计写入 `logs/webui-frontend-tests-dev-YYYY-MM-DD.jsonl`。
 配置页测试同时覆盖 JSON 高亮的键、字符串、数字、布尔值、null、HTML 转义和编辑内容不变。
+模型 API Key 列表同样使用合成 DOM：默认只渲染掩码、点「显示」才请求明文、明文不进入浏览器存储、鉴权开启时删除最后一条给出“先关闭鉴权并保存”的提示、随机生成值形如 32 字符十六进制。
 
 可选真实浏览器回归需要 Python Playwright 和可用 Chromium，不纳入默认测试入口：
 

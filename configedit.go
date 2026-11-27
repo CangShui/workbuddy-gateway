@@ -54,11 +54,21 @@ func validateConfigEditorDocument(content string) (runtimeFileConfig, error) {
 	}
 	c, err := parseRuntimeConfig([]byte(content))
 	if err != nil {
+		var validation gatewayValidationError
+		if errors.As(err, &validation) {
+			// 配置规则只返回字段名、位置或约束；不透传 JSON 解码器的原始错误。
+			return c, validation
+		}
 		// 解析错误可能携带用户输入的字段名或值，不把其原文写入响应或审计日志。
 		return c, gatewayValidationError("配置校验失败：必须是单个 JSON 对象；字段名、类型、端口、日志天数及账号/模型名单须符合配置规则")
 	}
 	for _, key := range []string{c.Gateway.AdminKey, c.Gateway.APIKey} {
 		if key == "[REDACTED]" {
+			return c, gatewayValidationError("不能把脱敏占位符 [REDACTED] 保存为 Key，请重新加载编辑原文")
+		}
+	}
+	for _, k := range c.Gateway.APIKeys {
+		if k.APIKey == "[REDACTED]" {
 			return c, gatewayValidationError("不能把脱敏占位符 [REDACTED] 保存为 Key，请重新加载编辑原文")
 		}
 	}

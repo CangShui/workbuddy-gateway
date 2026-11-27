@@ -291,11 +291,13 @@ td.empty, .empty { color: var(--text-muted); text-align: center; padding: 20px; 
 }
 .settings-card { max-width: none; }
 .settings-row { display: grid; gap: 8px; margin: 18px 0; }
-.settings-row input[type="password"] {
+.settings-row input[type="password"], .settings-row input[type="text"] {
   width: 100%; max-width: 520px; box-sizing: border-box; padding: 10px 12px;
   background: var(--surface-muted); color: var(--text);
   border: 1px solid var(--border); border-radius: 8px; font: inherit;
 }
+.api-key-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.api-key-value { font-family: var(--mono); font-size: 12px; word-break: break-all; }
 .settings-ports { border-top: 1px solid var(--border); margin-top: 24px; padding-top: 18px; display: grid; gap: 12px; justify-items: start; }
 button:disabled { opacity: .55; cursor: not-allowed; }
 .hidden { display: none !important; }

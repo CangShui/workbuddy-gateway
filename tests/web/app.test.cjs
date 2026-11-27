@@ -45,7 +45,8 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map(),
   const context = {
     document: {readyState: "loading", addEventListener() {}, getElementById: element, querySelectorAll: () => []},
     sessionStorage: storage(session), localStorage: storage(local),
-    window: {alert: message => alerts.push(message), confirm: () => true, addEventListener() {}, location: {protocol: "http:", reload() {}}},
+    window: {alert: message => alerts.push(message), confirm: () => true, addEventListener() {}, location: {protocol: "http:", reload() {}},
+      crypto: {getRandomValues(array) { for (let i = 0; i < array.length; i++) array[i] = (i * 31 + 7) & 255; return array; }}},
     TextEncoder, fetch: fetchImpl, setInterval: () => 1,
     setTimeout: (fn) => { timers.set(++timerID, fn); return timerID; },
     clearTimeout: id => timers.delete(id),
@@ -70,7 +71,8 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map(),
   source = source.replace(/\}\)\(\);\s*$/, `globalThis.review = {
     state, api, showAlert, hideAlert, togglePolicy, renderAccounts, renderModels, renderStatus, refreshActive,
     renderPoolHealth, renderAccountAlerts, bindAccountAlertTooltip, loadAccountAlerts, lockDashboard,
-    saveKey, saveAPISettings, initializeAdmin, discoverSetup,
+    saveKey, saveAPISettings, renderSettings, addAPIKey, removeAPIKey, renderAPIKeyRows, toggleAPIKeyReveal,
+    generateAPIKeyValue, initializeAdmin, discoverSetup,
     showConfigWarning, loadConfig, loadConfigEditor, saveConfigEditor, exitConfigEdit, setTab, lockDashboard,
     jsonHighlightHTML, renderConfigEditorHighlight,
     initListFilters, changeListFilter, reportRestoredListFilters,
@@ -454,7 +456,7 @@ test("首次初始化只弹窗一次，并使用返回的管理Key登录", async
       setups++;
       return response(201, {adminKey: key});
     }
-    if (route === "/admin/api/settings") return response(200, {apiKeyEnabled: false, apiKeyConfigured: false, apiPort: 8317, webPort: 8316});
+    if (route === "/admin/api/settings") return response(200, {apiKeyEnabled: false, apiKeyConfigured: false, apiKeys: [], apiPort: 8317, webPort: 8316});
     if (route === "/admin/api/status") return response(200, {gateway: {}, accounts: []});
     return response(204, {});
   });
@@ -467,25 +469,80 @@ test("首次初始化只弹窗一次，并使用返回的管理Key登录", async
   audit("初始化弹窗与登录通过", {key_length: key.length, saved_to_localStorage: false});
 });
 
-test("没有API Key时阻止开启；关闭开关可以保存", async () => {
+test("Key列表为空时阻止开启校验；关闭开关只提交开关本身", async () => {
   const calls = [];
   const f = fixture(async (route, options) => {
     calls.push({route, options});
-    if (route === "/admin/api/settings") return response(200, {apiKeyEnabled: false, apiKeyConfigured: false});
+    if (route === "/admin/api/settings") return response(200, {apiKeyEnabled: false, apiKeyConfigured: false, apiKeys: [], apiKeyCount: 0});
     return response(204, {});
   });
   f.review.state.apiKey = "synthetic-admin-key";
-  f.review.state.settings = {apiKeyConfigured: false};
+  f.review.state.settings = {apiKeyConfigured: false, apiKeys: []};
   f.element("apiKeyEnabled").checked = true;
   f.review.saveAPISettings();
   assert.equal(calls.filter(c => c.route === "/admin/api/settings").length, 0);
-  assert.match(f.element("alert").textContent, /必须输入/);
+  assert.match(f.element("alert").textContent, /必须至少添加一条/);
   f.element("apiKeyEnabled").checked = false;
-  f.review.saveAPISettings();
-  await new Promise(resolve => setImmediate(resolve));
+  await f.review.saveAPISettings();
   const saved = calls.find(c => c.route === "/admin/api/settings");
   assert.equal(JSON.parse(saved.options.body).apiKeyEnabled, false);
+  assert(!Object.prototype.hasOwnProperty.call(JSON.parse(saved.options.body), "apiKey"), "开关保存不应再提交 Key 值");
   audit("API鉴权开关表单通过");
+});
+
+test("模型Key列表：默认只显示掩码、点显示才取明文、删除最后一条提示关闭校验、可自动生成", async () => {
+  const revealed = "synthetic-revealed-model-key-01";
+  const created = "synthetic-generated-model-key-02";
+  const calls = [];
+  const oneKeyView = {apiKeyEnabled: true, apiKeyConfigured: true, apiKeyCount: 1, apiKeyMaxCount: 64,
+    apiKeys: [{id: "key-1", label: "笔记本", apiKeyMasked: "abc123****", createdAt: "2026-11-18T09:00:00Z"}]};
+  const emptyView = {apiKeyEnabled: false, apiKeyConfigured: false, apiKeyCount: 0, apiKeyMaxCount: 64, apiKeys: []};
+  const f = fixture(async (route, options) => {
+    calls.push({route, options});
+    if (route === "/admin/api/api-key-reveal") return response(200, {id: "key-1", label: "笔记本", apiKey: revealed});
+    if (route === "/admin/api/api-key-delete") return response(200,
+      {deleted: true, remaining: 0, apiKeyEnabled: false, settings: emptyView});
+    if (route === "/admin/api/api-key-create") return response(201,
+      {id: "key-2", label: "新设备", apiKey: created, apiKeyMasked: "synth****", generated: true, settings: oneKeyView});
+    return response(204, {});
+  });
+  f.review.state.apiKey = "synthetic-admin-key";
+  f.review.renderSettings(oneKeyView);
+  const tbody = f.element("apiKeyTable").querySelector("tbody");
+  assert.match(tbody.innerHTML, /abc123\*\*\*\*/, "列表默认只能显示掩码");
+  assert(!tbody.innerHTML.includes(revealed), "未点显示前不能出现明文");
+  assert.match(tbody.innerHTML, /data-reveal="key-1"/);
+  assert(f.element("apiKeyState").textContent.includes("已配置 1 条 Key"));
+
+  await f.review.toggleAPIKeyReveal("key-1");
+  assert(tbody.innerHTML.includes(revealed), "点显示后才取明文");
+  assert.match(tbody.innerHTML, /隐藏/, "显示后按钮应变为隐藏");
+  await f.review.toggleAPIKeyReveal("key-1");
+  assert.match(tbody.innerHTML, /abc123\*\*\*\*/, "再点一次应收起明文");
+  assert(![...f.session.values()].includes(revealed), "明文不能写进会话存储");
+  assert(![...f.local.values()].includes(revealed), "明文不能写进本地存储");
+
+  await f.review.removeAPIKey("key-1", "笔记本", true);
+  assert.match(f.element("alert").textContent, /先关闭.*并保存/);
+  assert(!calls.some(c => c.route === "/admin/api/api-key-delete"));
+  f.review.renderSettings({...oneKeyView, apiKeyEnabled: false});
+  await f.review.removeAPIKey("key-1", "笔记本", true);
+  assert.match(tbody.innerHTML, /colspan="4"/, "删除最后一条后应回到空列表提示");
+  assert.match(tbody.innerHTML, /还没有模型 API Key/);
+  assert.match(f.element("alert").textContent, /鉴权开关未改变/);
+
+  f.element("newAPIKeyLabel").value = "新设备";
+  await f.review.addAPIKey();
+  const createCall = calls.find(c => c.route === "/admin/api/api-key-create");
+  assert.equal(JSON.parse(createCall.options.body).label, "新设备");
+  assert.equal(JSON.parse(createCall.options.body).apiKey, "", "Key 值留空时应由服务端生成");
+  assert(f.alerts.some(message => message.includes(created)), "新增后应提示一次明文");
+  assert.equal(f.element("newAPIKeyValue").value, "", "提交后应清空输入框");
+
+  f.review.generateAPIKeyValue();
+  assert.match(f.element("newAPIKeyValue").value, /^[0-9a-f]{32}$/, "随机生成应为 32 位十六进制");
+  assert.equal(f.element("newAPIKeyValue").type, "text", "生成后应临时以明文展示，方便复制");
+  audit("模型Key列表交互通过", {masked_by_default: true, reveal_on_demand: true, last_key_warns: true});
 });
 
 const configContent = JSON.stringify({gateway: {adminKey: "synthetic-admin-key", apiKey: "synthetic-private-api-key"}, systemPrompt: {force: "synthetic-private-prompt"}}, null, 2);
@@ -500,7 +557,7 @@ function configFixture(fetchImpl) {
     }
     if (route.startsWith("/admin/api/config-edit?")) return response(200, {content: configContent, revision: "original-revision"});
     if (route === "/admin/api/config") return response(200, {exists: true, content: '{\n  "gateway": {"adminKey": "[REDACTED]", "apiPort": 8317},\n  "identity": {"responseRestore": false}\n}'});
-    if (route === "/admin/api/settings") return response(200, {apiKeyConfigured: true, apiPort: 8317, webPort: 8316});
+    if (route === "/admin/api/settings") return response(200, {apiKeyConfigured: true, apiKeys: [], apiPort: 8317, webPort: 8316});
     return response(200, {saved: true, adminKeyChanged: false, settings: {}});
   });
   f.review.state.apiKey = "synthetic-admin-key";
@@ -1957,7 +2014,7 @@ test("登录态切换：未登录独立卡片、已登录显示退出；后台�
   const f = fixture(async (url) => {
     calls.push(url);
     if (url === "/admin/api/setup") return response(200, {setupRequired: false, canInitialize: true});
-    if (url === "/admin/api/settings") return response(200, {apiKeyEnabled: true, apiKeyConfigured: true, apiPort: 8317, webPort: 8316});
+    if (url === "/admin/api/settings") return response(200, {apiKeyEnabled: true, apiKeyConfigured: true, apiKeys: [], apiPort: 8317, webPort: 8316});
     if (url === "/admin/api/status") return response(200, {gateway: {version: "1.14.47", listen: "127.0.0.1:8317"}, updatedAt: 1791980005, accounts: [], models: []});
     if (url.startsWith("/admin/api/logs?")) return response(200, {files: [{name: "gateway-2026-11-18.log"}], file: "gateway-2026-11-18.log", lines: ["l1", "l2"]});
     return response(204, {});
