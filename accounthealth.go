@@ -53,6 +53,7 @@ type accountAlertRule struct {
 }
 
 var accountAlertRules = map[string]accountAlertRule{
+	"auth_invalid":   {"登录失效", "urgent", "上游确认登录态已失效，账号已停止调度，请重新登录。"},
 	"disabled":       {"账号失效", "urgent", "登录授权已失效，账号已停止调度，请重新登录。"},
 	"expired":        {"账号过期", "important", "访问令牌已过期，请检查自动续期结果或重新登录。"},
 	"paid_exhausted": {"积分用尽", "important", "已确认账号额度耗尽，收费模型暂不可用；等待额度恢复。"},
@@ -124,6 +125,10 @@ func parseAccountLogEvent(line, file string) (accountLogEvent, bool) {
 			}
 		}
 	case strings.HasPrefix(body, "[Auth] "):
+		if name := accountBetween(" 登录失效，已立即停止调度"); name != "" {
+			event.Account, event.State = name, "auth_invalid"
+			break
+		}
 		for _, suffix := range []string{" 判定登录态失效", " 授权失效，已禁止调度", " 已停止调度；"} {
 			if name := accountBetween(suffix); name != "" {
 				event.Account, event.State = name, "disabled"

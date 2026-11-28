@@ -50,7 +50,7 @@ func TestAutomaticPriceProbeFlagsRequireExplicitOptIn(t *testing.T) {
 			}
 			if !tc.allowed {
 				now := time.Now()
-				row = taskByID(t, aggregateTaskViews(nil, now, os.Getpid(), now.UnixMilli()), "price_probe")
+				row = taskByID(t, aggregateTaskViews(nil, now, os.Getpid(), now.UnixMilli(), scheduledTaskEvent{}), "price_probe")
 				if row.Status != "disabled" || row.NextRunAt != 0 || row.Success != nil {
 					t.Fatalf("未授权探测不应显示计划或成功: %+v", row)
 				}

@@ -723,6 +723,13 @@ test("清空管理Key需要额外确认，取消不发起保存", async () => {
   audit("管理Key清空额外确认通过");
 });
 
+test("登录失效优先于停用、额度和签到结果", () => {
+  const f = fixture();
+  f.review.renderAccounts([{path: "workbuddy4.json", state: "auth_invalid", schedulingEnabled: false,
+    quotaKnown: true, quotaRemaining: 0, checkin: {status: "failed"}}]);
+  assert.match(f.element("accountsTable").innerHTML, /class='badge danger'>登录失效</);
+});
+
 test("账号池筛选只保留可用且已开启调度的账号，取消后恢复全部", () => {
   const f = fixture();
   f.review.initListFilters();
@@ -2050,4 +2057,15 @@ test("登录态切换：未登录独立卡片、已登录显示退出；后台�
   ]});
   assert.match(f.element("tasksTable").querySelector("tbody").innerHTML, /data-row-key=['"]config_reload['"]/);
   audit("登录态与后台节流验证通过", {login_card: true, hidden_tab_paused: true, log_scroll_preserved: true});
+});
+
+test("主动续期结果明确标记为重启前，启动补跑独立显示", () => {
+  const f = fixture();
+  f.review.renderTasks({truncated: true, tasks: [
+    {id: "keepalive", name: "主动续期保活", enabled: true, status: "partial", lastRunAt: 1791980000, previousProcess: true},
+    {id: "keepalive_catchup", name: "启动续期补跑", enabled: true, status: "skipped", lastRunAt: 1791980080}
+  ]});
+  const html = f.element("tasksTable").querySelector("tbody").innerHTML;
+  assert.match(html, /重启前[\s\S]*部分失败[\s\S]*启动续期补跑[\s\S]*跳过/);
+  assert.match(f.element("tasksInfo").textContent, /缺失记录不代表未执行/);
 });

@@ -37,7 +37,7 @@ func TestTaskLogAggregationNoFalseSuccessOrCrossProcess(t *testing.T) {
 		{Task: "keepalive_catchup", Phase: "completed", Status: "skipped", PID: pid, At: at - 9000, StartedAt: at - 9500},
 		{Task: "daily_checkin", Phase: "scheduled", PID: pid, At: at - 30000, NextAt: at - 1000},
 	}
-	rows := aggregateTaskViews(events, now, pid, at-60000)
+	rows := aggregateTaskViews(events, now, pid, at-60000, scheduledTaskEvent{})
 	if len(rows) != 11 {
 		t.Fatalf("任务数=%d", len(rows))
 	}
@@ -60,9 +60,101 @@ func TestTaskLogAggregationNoFalseSuccessOrCrossProcess(t *testing.T) {
 	if row := taskByID(t, rows, "price_probe"); row.Enabled || row.Status != "disabled" || row.NextRunAt != 0 {
 		t.Fatal("关闭的价格探测不应显示计划")
 	}
-	beforeBoot := aggregateTaskViews(events, now, pid, at+1)
+	beforeBoot := aggregateTaskViews(events, now, pid, at+1, scheduledTaskEvent{})
 	if taskByID(t, beforeBoot, "quota_scan").LastRunAt != 0 {
 		t.Fatal("服务启动前记录不能充当当前执行")
+	}
+}
+
+func TestKeepaliveHistoryDoesNotOverrideLiveRunOrSchedule(t *testing.T) {
+	isolateAdminFeatures(t)
+	cfg.KeepaliveHours = []int{22}
+	now := time.Now().Truncate(time.Second)
+	at := now.UnixMilli()
+	pid := os.Getpid()
+	saved := scheduledTaskEvent{Task: "keepalive", Phase: "completed", Status: "partial",
+		PID: pid - 1, Trace: "previous", At: at - 120000, StartedAt: at - 121000, NextAt: at + 35000}
+	events := []scheduledTaskEvent{
+		{Task: "keepalive", Phase: "scheduled", PID: pid, At: at - 20000, NextAt: at + 60000},
+		{Task: "keepalive", Phase: "started", Status: "running", PID: pid - 1, At: at - 100000},
+		{Task: "keepalive_catchup", Phase: "completed", Status: "success", PID: pid, At: at - 15000},
+	}
+	get := func() scheduledTaskView {
+		return taskByID(t, aggregateTaskViews(events, now, pid, at-30000, saved), "keepalive")
+	}
+	if row := get(); row.Status != "partial" || !row.PreviousProcess || row.LastFinishedAt != saved.At/1000 ||
+		row.Success == nil || *row.Success || row.NextRunAt != now.Unix()+60 || row.NextEstimated {
+		t.Fatalf("历史结果、启动补跑、当前计划不可混用：%+v", row)
+	}
+	events = append(events, scheduledTaskEvent{Task: "keepalive", Phase: "started", Status: "running",
+		PID: pid, Trace: "current", At: at - 1000, StartedAt: at - 1000})
+	if row := get(); row.Status != "running" || row.PreviousProcess || row.Success != nil {
+		t.Fatalf("历史结果不应覆盖当前运行：%+v", row)
+	}
+	saved = scheduledTaskEvent{Task: "keepalive", Phase: "completed", Status: "success",
+		PID: pid, Trace: "current", At: at - 1000, StartedAt: at - 1000}
+	if row := get(); row.Status != "success" || row.PreviousProcess || row.Success == nil || !*row.Success {
+		t.Fatalf("同一轮已落盘结果不应仍显示执行中：%+v", row)
+	}
+}
+
+func TestKeepaliveRestoresLegacyCompletionOutsideScanBudget(t *testing.T) {
+	isolateAdminFeatures(t)
+	cfg.KeepaliveHours = []int{22}
+	now := time.Now().Truncate(time.Second)
+	old := now.AddDate(0, 0, -1)
+	event := scheduledTaskEvent{Task: "keepalive", Phase: "completed", Status: "partial",
+		PID: os.Getpid() - 1, Trace: "legacy-completion", At: old.UnixMilli()}
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldLog := "gateway-" + old.Format("2006-01-02") + ".log"
+	if err := os.WriteFile(filepath.Join(logDir, oldLog), append(append([]byte("[定时任务] "), raw...), '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	todayLog := filepath.Join(logDir, "gateway-"+now.Format("2006-01-02")+".log")
+	f, err := os.OpenFile(todayLog, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := strings.Repeat(strings.Repeat("x", 1023)+"\n", 1024)
+	for i := int64(0); i <= taskLogReadBudget/int64(len(block)); i++ {
+		if _, err := f.WriteString(block); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restoreKeepaliveResult()
+	handler := newWebUIHandler()
+	get := func() scheduledTaskView {
+		t.Helper()
+		w := adminRequest(handler, "GET", "/admin/api/tasks", "feature-admin-key", "")
+		var response struct {
+			Tasks     []scheduledTaskView `json:"tasks"`
+			Truncated bool                `json:"truncated"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &response); w.Code != 200 || err != nil || !response.Truncated {
+			t.Fatalf("应返回超出普通扫描窗口的测试数据：HTTP %d，%v", w.Code, err)
+		}
+		return taskByID(t, response.Tasks, "keepalive")
+	}
+	if row := get(); row.Status != "partial" || !row.PreviousProcess || row.TraceID != event.Trace || row.LogFile != oldLog ||
+		!row.NextEstimated || row.NextRunAt <= now.Unix() {
+		t.Fatalf("应从仍存在的历史日志恢复结果，不沿用旧计划：%+v", row)
+	}
+	logScheduledTask("keepalive", "completed", "success", "new-completion", now, time.Time{}, "定时成功")
+	logScheduledTask("keepalive_catchup", "completed", "failed", "catchup", now, time.Time{}, "补跑失败")
+	saved, err := readKeepaliveResult()
+	if err != nil || saved.Trace != "new-completion" || saved.Status != "success" {
+		t.Fatalf("仅定时完成结果应更新落盘记录：%+v %v", saved, err)
+	}
+	// 模拟同一进程的普通日志已滚出扫描窗口。
+	if row := taskByID(t, aggregateTaskViews(nil, time.Now(), os.Getpid(), taskLogBootAt, saved), "keepalive"); row.Status != "success" || row.PreviousProcess {
+		t.Fatalf("日志超出预算不应丢掉本进程的结果：%+v", row)
 	}
 }
 
@@ -118,7 +210,7 @@ func TestTaskLogMissingCorruptAndBudget(t *testing.T) {
 	}
 	_, _ = file.WriteString("2026/10/11 00:00:00 [定时任务] broken json\n")
 	_ = file.Close()
-	if _, _, _, err := readTaskEvents(); err != nil {
+	if _, _, _, err := readTaskEvents(false); err != nil {
 		t.Fatal("坏行应跳过而非报成功或整个失败")
 	}
 	large := filepath.Join(logDir, "gateway-2099-01-01.log")
@@ -130,7 +222,7 @@ func TestTaskLogMissingCorruptAndBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	events, size, truncated, err := readTaskEvents()
+	events, size, truncated, err := readTaskEvents(false)
 	if err != nil || size > taskLogReadBudget || !truncated || len(events) != 0 {
 		t.Fatalf("预算或缺失处理错误: records=%d size=%d truncated=%v err=%v", len(events), size, truncated, err)
 	}
@@ -147,7 +239,7 @@ func TestTaskLoggingWorksWithoutDebugAndIsSampled(t *testing.T) {
 	logFrequentTask("credential_reload", "success", "扫描成功", now, now.Add(5*time.Second), &last, &previous, false)
 	logFrequentTask("credential_reload", "success", "扫描成功", now, now.Add(5*time.Second), &last, &previous, false)
 	logFrequentTask("credential_reload", "failed", "扫描失败", now, now.Add(5*time.Second), &last, &previous, false)
-	events, _, _, err := readTaskEvents()
+	events, _, _, err := readTaskEvents(false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +263,7 @@ func TestConfigTaskRecordsFailedValidation(t *testing.T) {
 	defer func() { cancel(); <-done }()
 	deadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(deadline) {
-		events, _, _, _ := readTaskEvents()
+		events, _, _, _ := readTaskEvents(false)
 		for _, event := range events {
 			if event.Task == "config_reload" && event.Phase == "completed" && event.Status == "failed" {
 				return

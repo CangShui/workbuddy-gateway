@@ -2,12 +2,16 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -54,6 +58,7 @@ var sessionDeadMarkers = []string{
 	"12153",
 	"offline user session not found",
 	"invalid_grant",
+	"refresh token revoked",
 	"token is not active",
 	"refresh token failed",
 	"session not found",
@@ -187,6 +192,8 @@ func keepaliveLoop() {
 	log.Printf("[续期保活] 阶段=启动 结果=已启用 续期时刻=%s 说明=到点主动刷新全部账号登录凭据，只调刷新接口，不请求模型、不消耗额度",
 		formatKeepaliveHours(cfg.KeepaliveHours))
 
+	go restoreKeepaliveResult()
+
 	go func() {
 		next := time.Now().Add(keepaliveCatchUpDelay)
 		logScheduledTask("keepalive_catchup", "scheduled", "", newTraceID(), time.Time{}, next, "启动后90秒，只检查久未续期账号")
@@ -220,6 +227,107 @@ func keepaliveLoop() {
 		<-timer.C
 		runKeepaliveOnce("定时", false)
 	}
+}
+
+const keepaliveResultFile = "keepalive-result.json"
+
+var keepaliveResultWriteMu sync.Mutex
+
+func writeKeepaliveResult(event scheduledTaskEvent) error {
+	f, err := os.CreateTemp(logDir, ".keepalive-result-*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	err = json.NewEncoder(f).Encode(event)
+	closeErr := f.Close()
+	if err != nil || closeErr != nil {
+		return errors.Join(err, closeErr)
+	}
+	return os.Rename(f.Name(), filepath.Join(logDir, keepaliveResultFile))
+}
+
+func saveKeepaliveResult(event scheduledTaskEvent) {
+	keepaliveResultWriteMu.Lock()
+	defer keepaliveResultWriteMu.Unlock()
+	if err := writeKeepaliveResult(event); err != nil {
+		log.Printf("[续期结果] traceId=%s 阶段=保存 结果=失败 原因=%s 说明=续期结果仍保留在普通日志，展示可能受扫描窗口限制",
+			event.Trace, safeDebugError(err))
+		return
+	}
+	log.Printf("[续期结果] traceId=%s 阶段=保存 结果=成功 执行结果=%s 说明=最近一次完成结果已落盘，不受网关重启或普通日志扫描窗口影响",
+		event.Trace, event.Status)
+}
+
+func readKeepaliveResult() (scheduledTaskEvent, error) {
+	data, err := os.ReadFile(filepath.Join(logDir, keepaliveResultFile))
+	if err != nil {
+		return scheduledTaskEvent{}, err
+	}
+	var event scheduledTaskEvent
+	if err := json.Unmarshal(data, &event); err != nil {
+		return scheduledTaskEvent{}, err
+	}
+	if !isKeepaliveCompletion(event) {
+		return scheduledTaskEvent{}, errors.New("最近主动续期结果格式无效")
+	}
+	return event, nil
+}
+
+func isKeepaliveCompletion(event scheduledTaskEvent) bool {
+	if event.Task != "keepalive" || event.Phase != "completed" || event.At <= 0 {
+		return false
+	}
+	switch event.Status {
+	case "success", "partial", "failed", "skipped", "cancelled":
+		return true
+	}
+	return false
+}
+
+func latestKeepaliveResult(events []scheduledTaskEvent, saved scheduledTaskEvent, latestAt int64) scheduledTaskEvent {
+	if !isKeepaliveCompletion(saved) || saved.At > latestAt {
+		saved = scheduledTaskEvent{}
+	}
+	for _, event := range events {
+		if isKeepaliveCompletion(event) && event.At <= latestAt &&
+			(event.At > saved.At || event.At == saved.At && saved.File == "") {
+			saved = event
+		}
+	}
+	return saved
+}
+
+// 升级后首次启动，可从仍保留的普通日志找回旧版本的最近一次完成记录。
+func restoreKeepaliveResult() {
+	if _, err := readKeepaliveResult(); err == nil {
+		return
+	}
+	trace := newTraceID()
+	events, scanned, _, err := readTaskEvents(true)
+	if err != nil {
+		log.Printf("[续期结果] traceId=%s 阶段=读取历史 结果=失败 原因=%s 说明=不影响续期调度",
+			trace, safeDebugError(err))
+		return
+	}
+	if len(events) == 0 {
+		log.Printf("[续期结果] traceId=%s 阶段=读取历史 结果=无完成记录 扫描字节=%d 说明=等待主动续期完成后记录", trace, scanned)
+		return
+	}
+	event := events[0]
+	// 首次扫描历史不应覆盖本进程已完成的续期。
+	keepaliveResultWriteMu.Lock()
+	defer keepaliveResultWriteMu.Unlock()
+	if _, err := readKeepaliveResult(); err == nil {
+		return
+	}
+	if err := writeKeepaliveResult(event); err != nil {
+		log.Printf("[续期结果] traceId=%s 阶段=恢复历史 结果=失败 原因=%s 说明=不影响续期调度",
+			trace, safeDebugError(err))
+		return
+	}
+	log.Printf("[续期结果] traceId=%s 阶段=恢复历史 结果=成功 原轮次=%s 执行结果=%s 扫描字节=%d 说明=从普通日志恢复完成结果，不触发续期",
+		trace, event.Trace, event.Status, scanned)
 }
 
 // runKeepaliveOnce 串行刷新账号池；onlyOverdue 为真时只处理久未续期的账号。

@@ -1167,11 +1167,11 @@
   }
 
   var STATE_TEXT = {
-    active: "可用", cooldown: "冷却", paid_exhausted: "付费耗尽",
+    active: "可用", auth_invalid: "登录失效", cooldown: "冷却", paid_exhausted: "付费耗尽",
     quota_exhausted: "付费耗尽", expired: "已过期", disabled: "失效"
   };
   var STATE_CLASS = {
-    active: "ok", cooldown: "warn", paid_exhausted: "warn",
+    active: "ok", auth_invalid: "danger", cooldown: "warn", paid_exhausted: "warn",
     quota_exhausted: "warn", expired: "warn", disabled: "danger"
   };
 
@@ -1549,7 +1549,7 @@
     var html = list.map(function (a, i) {
       var st = STATE_TEXT[a.state] || a.state || "-";
       var cls = STATE_CLASS[a.state] || "";
-      if (a.schedulingEnabled === false) {
+      if (a.schedulingEnabled === false && a.state !== "auth_invalid") {
         st = a.state === "active" ? "已停用" : "已停用 · " + st;
         cls = "warn";
       }
@@ -2170,8 +2170,9 @@
       var next = task.nextRunAt ? fmtTime(task.nextRunAt) + (task.nextEstimated ? "（推算）" : "") :
         (!task.enabled ? "未启用" : task.oneShot && task.lastFinishedAt ? "本次启动已完成" : "等待调度日志");
       var rowKey = task.id || task.name || String(idx);
+      var lastRun = fmtTime(task.lastRunAt) + (task.previousProcess ? "（重启前）" : "");
       return "<tr data-row-key='" + esc(rowKey) + "'><td data-label='任务'>" + esc(task.name) + "</td><td data-label='启用'>" + (task.enabled ? "开启" : "关闭") +
-        "</td><td data-label='执行周期' class='task-description'>" + esc(task.schedule) + "</td><td data-label='上次执行记录'>" + esc(fmtTime(task.lastRunAt)) +
+        "</td><td data-label='执行周期' class='task-description'>" + esc(task.schedule) + "</td><td data-label='上次执行记录'>" + esc(lastRun) +
         "</td><td data-label='上次完成'>" + esc(fmtTime(task.lastFinishedAt)) + "</td><td data-label='执行结果'><span class='badge " +
         (classes[task.status] || "") + "'>" + esc(labels[task.status] || "无执行记录") +
         "</span></td><td data-label='下次预计执行'>" + esc(next) + "</td><td data-label='日志说明' class='task-description'>" + esc(task.detail || "当前服务尚无该任务日志，或日志已清理") +
