@@ -26,19 +26,10 @@ import (
 
 const runtimeConfigFile = "config.json"
 
-// 只补充现有任务日志，不维护独立任务状态。管理页从 gateway 日志反向聚合这些记录。
+// 管理页从 gateway 日志聚合任务；低频的主动续期完成事件额外保留最近一条。
 func logScheduledTask(task, phase, status, trace string, started, next time.Time, detail string) {
-	record := struct {
-		Task      string `json:"task"`
-		Phase     string `json:"phase"`
-		Status    string `json:"status,omitempty"`
-		Trace     string `json:"trace"`
-		PID       int    `json:"pid"`
-		At        int64  `json:"at"`
-		StartedAt int64  `json:"startedAt,omitempty"`
-		NextAt    int64  `json:"nextAt,omitempty"`
-		Detail    string `json:"detail,omitempty"`
-	}{Task: task, Phase: phase, Status: status, Trace: trace, PID: os.Getpid(), At: time.Now().UnixMilli(), Detail: detail}
+	record := scheduledTaskEvent{Task: task, Phase: phase, Status: status, Trace: trace,
+		PID: os.Getpid(), At: time.Now().UnixMilli(), Detail: detail}
 	if !started.IsZero() {
 		record.StartedAt = started.UnixMilli()
 	}
@@ -47,6 +38,9 @@ func logScheduledTask(task, phase, status, trace string, started, next time.Time
 	}
 	raw, _ := json.Marshal(record)
 	log.Printf("[定时任务] %s", raw)
+	if task == "keepalive" && phase == "completed" {
+		saveKeepaliveResult(record)
+	}
 }
 
 func startScheduledTask(task string, next time.Time) (string, time.Time) {

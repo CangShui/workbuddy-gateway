@@ -83,18 +83,18 @@ func registerWebUIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/account-delete", handleWebUIAccountDelete)
 }
 
-// 只读日志视图：无额外调度器、任务状态文件或内存任务登记表。
+// 只读日志视图，不参与任务调度。
 type scheduledTaskEvent struct {
 	Task      string `json:"task"`
 	Phase     string `json:"phase"`
-	Status    string `json:"status"`
+	Status    string `json:"status,omitempty"`
 	Trace     string `json:"trace"`
 	PID       int    `json:"pid"`
 	At        int64  `json:"at"`
-	StartedAt int64  `json:"startedAt"`
-	NextAt    int64  `json:"nextAt"`
-	Detail    string `json:"detail"`
-	File      string `json:"-"`
+	StartedAt int64  `json:"startedAt,omitempty"`
+	NextAt    int64  `json:"nextAt,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+	File      string `json:"logFile,omitempty"`
 }
 
 type scheduledTaskView struct {
@@ -106,6 +106,7 @@ type scheduledTaskView struct {
 	OneShot         bool   `json:"oneShot,omitempty"`
 	LastRunAt       int64  `json:"lastRunAt,omitempty"`
 	LastFinishedAt  int64  `json:"lastFinishedAt,omitempty"`
+	PreviousProcess bool   `json:"previousProcess,omitempty"`
 	NextRunAt       int64  `json:"nextRunAt,omitempty"`
 	NextEstimated   bool   `json:"nextEstimated"`
 	Status          string `json:"status"`
@@ -136,14 +137,16 @@ func taskViewDefinitions() []scheduledTaskView {
 	}
 }
 
-func aggregateTaskViews(events []scheduledTaskEvent, now time.Time, pid int, bootAt int64) []scheduledTaskView {
+func aggregateTaskViews(events []scheduledTaskEvent, now time.Time, pid int, bootAt int64, savedKeepalive scheduledTaskEvent) []scheduledTaskView {
 	rows := taskViewDefinitions()
+	latestAt := now.Add(time.Minute).UnixMilli()
+	lastKeepalive := latestKeepaliveResult(events, savedKeepalive, latestAt)
 	for i := range rows {
 		row := &rows[i]
 		row.Status = "unknown"
 		var execution, schedule scheduledTaskEvent
 		for _, event := range events {
-			if event.Task != row.ID || event.PID != pid || event.At < bootAt || event.At > now.Add(time.Minute).UnixMilli() {
+			if event.Task != row.ID || event.PID != pid || event.At < bootAt || event.At > latestAt {
 				continue
 			}
 			if event.Phase == "scheduled" || event.Phase == "disabled" || event.NextAt > 0 {
@@ -165,6 +168,14 @@ func aggregateTaskViews(events []scheduledTaskEvent, now time.Time, pid int, boo
 			// 旧轮次稍后结束不能覆盖已经启动的新轮次。
 			if newStart > oldStart || newStart == oldStart && event.At >= execution.At {
 				execution = event
+			}
+		}
+		if row.ID == "keepalive" && row.Enabled && lastKeepalive.At > 0 {
+			sameRoundCompleted := execution.Phase == "started" && execution.Trace != "" &&
+				execution.Trace == lastKeepalive.Trace && lastKeepalive.At >= execution.At
+			if execution.At == 0 || sameRoundCompleted || execution.Phase == "completed" && lastKeepalive.At > execution.At {
+				execution = lastKeepalive
+				row.PreviousProcess = execution.PID != pid || execution.At < bootAt
 			}
 		}
 		if execution.At > 0 {
@@ -198,15 +209,22 @@ func aggregateTaskViews(events []scheduledTaskEvent, now time.Time, pid int, boo
 				row.NextEstimated = true
 			} else if next <= now.UnixMilli() {
 				next = 0
-				row.Detail += "；计划时间已过，等待新的调度日志"
+				if row.ID != "keepalive" {
+					row.Detail += "；计划时间已过，等待新的调度日志"
+				}
 			}
 			row.NextRunAt = next / 1000
+		}
+		if row.ID == "keepalive" && row.Enabled && row.NextRunAt == 0 {
+			row.NextRunAt = nextKeepaliveTime(now, cfg.KeepaliveHours).Unix()
+			row.NextEstimated = true
 		}
 	}
 	return rows
 }
 
-func readTaskEvents() ([]scheduledTaskEvent, int64, bool, error) {
+// keepaliveHistory 只在缺少结果文件的启动时使用；逐个查阅保留日志，找到最近一次完成即停止。
+func readTaskEvents(keepaliveHistory bool) ([]scheduledTaskEvent, int64, bool, error) {
 	entries, err := os.ReadDir(logDir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, 0, false, nil
@@ -230,9 +248,11 @@ func readTaskEvents() ([]scheduledTaskEvent, int64, bool, error) {
 	var scanned int64
 	truncated := false
 	tag := []byte("[定时任务] ")
+	var lastKeepalive scheduledTaskEvent
+	latestAt := time.Now().Add(time.Minute).UnixMilli()
 	for index, name := range names {
 		budget := taskLogReadBudget - scanned
-		if budget <= 0 {
+		if !keepaliveHistory && budget <= 0 {
 			truncated = true
 			break
 		}
@@ -245,18 +265,31 @@ func readTaskEvents() ([]scheduledTaskEvent, int64, bool, error) {
 			f.Close()
 			return nil, scanned, true, errors.New("任务日志不是可读普通文件")
 		}
-		size := min(st.Size(), budget)
+		size := st.Size()
+		if !keepaliveHistory {
+			size = min(size, budget)
+		}
 		start := st.Size() - size
 		partRead, scanErr := scanLogRangeLines(f, start, size, start > 0, func(line []byte) {
 			marker := bytes.Index(line, tag)
 			if marker < 0 {
 				return
 			}
+			raw := line[marker+len(tag):]
+			if keepaliveHistory && !bytes.Contains(raw, []byte(`"keepalive"`)) {
+				return
+			}
 			var event scheduledTaskEvent
-			if json.Unmarshal(line[marker+len(tag):], &event) != nil || event.Task == "" || event.At <= 0 {
+			if json.Unmarshal(raw, &event) != nil || event.Task == "" || event.At <= 0 {
 				return
 			}
 			event.File = name
+			if keepaliveHistory {
+				if isKeepaliveCompletion(event) && event.At <= latestAt && event.At > lastKeepalive.At {
+					lastKeepalive = event
+				}
+				return
+			}
 			events = append(events, event)
 		})
 		f.Close()
@@ -264,6 +297,12 @@ func readTaskEvents() ([]scheduledTaskEvent, int64, bool, error) {
 			return nil, scanned, true, scanErr
 		}
 		scanned += partRead
+		if keepaliveHistory {
+			if lastKeepalive.At > 0 {
+				return []scheduledTaskEvent{lastKeepalive}, scanned, false, nil
+			}
+			continue
+		}
 		if start > 0 {
 			truncated = true
 		}
@@ -777,7 +816,7 @@ func handleWebUITasks(w http.ResponseWriter, r *http.Request) {
 	}
 	taskEventsCache.Unlock()
 	if !hitCache {
-		events, scanned, truncated, err = readTaskEvents()
+		events, scanned, truncated, err = readTaskEvents(false)
 		if err == nil && stamp != "" {
 			taskEventsCache.Lock()
 			taskEventsCache.at = time.Now()
@@ -794,9 +833,13 @@ func handleWebUITasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	rows := aggregateTaskViews(events, now, os.Getpid(), taskLogBootAt)
-	log.Printf("[管理定时任务] traceId=%s 结果=读取成功 命中缓存=%t 任务数=%d 日志记录=%d 扫描字节=%d 截断=%t 说明=仅读现有日志，不触发任务或修改调度", debugTraceID(r), hitCache, len(rows), len(events), scanned, truncated)
-	writeAdminData(w, r, map[string]any{"tasks": rows, "generatedAt": now.Unix(), "timezone": now.Format("MST -07:00"), "readBytes": scanned, "readBudgetBytes": taskLogReadBudget, "truncated": truncated, "source": "gateway 日志；仅当前服务进程", "note": "高频本地任务每60秒记录最近一次执行，状态变化即时记录；下次时间按日志中的定时计划推算，事件触发可能提前。无日志时不判定成功。"})
+	saved, saveErr := readKeepaliveResult()
+	if saveErr != nil && !errors.Is(saveErr, os.ErrNotExist) {
+		log.Printf("[管理定时任务] traceId=%s 阶段=读取最近主动续期结果 结果=失败 原因=%s 说明=使用普通日志中的记录，不推断执行成功", debugTraceID(r), safeDebugError(saveErr))
+	}
+	rows := aggregateTaskViews(events, now, os.Getpid(), taskLogBootAt, saved)
+	log.Printf("[管理定时任务] traceId=%s 结果=读取成功 命中缓存=%t 任务数=%d 日志记录=%d 扫描字节=%d 截断=%t 最近主动续期完成毫秒=%d 说明=只读结果，不触发任务或修改调度", debugTraceID(r), hitCache, len(rows), len(events), scanned, truncated, saved.At)
+	writeAdminData(w, r, map[string]any{"tasks": rows, "generatedAt": now.Unix(), "timezone": now.Format("MST -07:00"), "readBytes": scanned, "readBudgetBytes": taskLogReadBudget, "truncated": truncated, "source": "gateway 日志；主动续期完成结果可跨重启", "note": "主动续期显示最近一次已完成的结果，并与启动补跑分别记录。执行中和实际调度计划只取当前进程；缺少计划时标注推算。"})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

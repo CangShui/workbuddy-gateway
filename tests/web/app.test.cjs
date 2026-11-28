@@ -2058,3 +2058,14 @@ test("登录态切换：未登录独立卡片、已登录显示退出；后台�
   assert.match(f.element("tasksTable").querySelector("tbody").innerHTML, /data-row-key=['"]config_reload['"]/);
   audit("登录态与后台节流验证通过", {login_card: true, hidden_tab_paused: true, log_scroll_preserved: true});
 });
+
+test("主动续期结果明确标记为重启前，启动补跑独立显示", () => {
+  const f = fixture();
+  f.review.renderTasks({truncated: true, tasks: [
+    {id: "keepalive", name: "主动续期保活", enabled: true, status: "partial", lastRunAt: 1791980000, previousProcess: true},
+    {id: "keepalive_catchup", name: "启动续期补跑", enabled: true, status: "skipped", lastRunAt: 1791980080}
+  ]});
+  const html = f.element("tasksTable").querySelector("tbody").innerHTML;
+  assert.match(html, /重启前[\s\S]*部分失败[\s\S]*启动续期补跑[\s\S]*跳过/);
+  assert.match(f.element("tasksInfo").textContent, /缺失记录不代表未执行/);
+});
