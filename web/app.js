@@ -1167,11 +1167,11 @@
   }
 
   var STATE_TEXT = {
-    active: "可用", cooldown: "冷却", paid_exhausted: "付费耗尽",
+    active: "可用", auth_invalid: "登录失效", cooldown: "冷却", paid_exhausted: "付费耗尽",
     quota_exhausted: "付费耗尽", expired: "已过期", disabled: "失效"
   };
   var STATE_CLASS = {
-    active: "ok", cooldown: "warn", paid_exhausted: "warn",
+    active: "ok", auth_invalid: "danger", cooldown: "warn", paid_exhausted: "warn",
     quota_exhausted: "warn", expired: "warn", disabled: "danger"
   };
 
@@ -1549,7 +1549,7 @@
     var html = list.map(function (a, i) {
       var st = STATE_TEXT[a.state] || a.state || "-";
       var cls = STATE_CLASS[a.state] || "";
-      if (a.schedulingEnabled === false) {
+      if (a.schedulingEnabled === false && a.state !== "auth_invalid") {
         st = a.state === "active" ? "已停用" : "已停用 · " + st;
         cls = "warn";
       }

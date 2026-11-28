@@ -713,11 +713,12 @@ func TestLoadDisabledMarkers(t *testing.T) {
 
 	// 构造失效标记文件
 	marker := disabledMarker{
-		Path:       authPath,
-		Reason:     "授权失效（令牌刷新失败 HTTP 401）",
-		DisabledAt: time.Now().Unix(),
-		Nickname:   "tester",
-		UID:        "uid-1",
+		Path:        authPath,
+		Reason:      "授权失效（令牌刷新失败 HTTP 401）",
+		DisabledAt:  time.Now().Unix(),
+		AuthInvalid: true,
+		Nickname:    "tester",
+		UID:         "uid-1",
 	}
 	data, _ := json.Marshal(marker)
 	if err := os.WriteFile(markerPath(authPath), data, 0600); err != nil {
@@ -744,8 +745,8 @@ func TestLoadDisabledMarkers(t *testing.T) {
 		t.Fatalf("expected 1 disabled account, got %d", len(accounts))
 	}
 	acc := accounts[0]
-	if !acc.Disabled || acc.Auth != nil {
-		t.Fatalf("expected disabled account with nil Auth, got disabled=%v authNil=%v", acc.Disabled, acc.Auth == nil)
+	if !acc.Disabled || !acc.AuthInvalid || acc.Auth != nil {
+		t.Fatalf("expected auth-invalid account with nil Auth, got disabled=%v authInvalid=%v authNil=%v", acc.Disabled, acc.AuthInvalid, acc.Auth == nil)
 	}
 	if acc.Nickname != "tester" || acc.UID != "uid-1" {
 		t.Fatalf("marker nickname/uid not restored: %+v", acc)
@@ -948,7 +949,7 @@ func TestTailLines(t *testing.T) {
 	t.Logf("tailLines(2) = %v", lines)
 }
 
-// 验证状态快照写入：含 active / cooldown / disabled 三种状态
+// 验证状态快照写入：含 active / cooldown / auth_invalid / disabled 四种状态
 func TestWriteStatusSnapshot(t *testing.T) {
 	oldDir, err := os.Getwd()
 	if err != nil {
@@ -970,6 +971,7 @@ func TestWriteStatusSnapshot(t *testing.T) {
 			Auth:    StoredTokens{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()},
 			Account: StoredAccount{Nickname: "bob", UID: "u2"},
 		}, CooldownUntil: time.Now().Add(30 * time.Minute), CooldownMsg: "频率限制"},
+		{Path: "login-invalid.json", AuthInvalid: true, Disabled: true, DisabledReason: "refresh token revoked", Nickname: "invalid", UID: "u-invalid"},
 		{Path: "c.json", Disabled: true, DisabledReason: "revoked", Nickname: "carol", UID: "u3"},
 	}
 	accountMu.Unlock()
@@ -984,15 +986,15 @@ func TestWriteStatusSnapshot(t *testing.T) {
 	if err := json.Unmarshal(data, &snap); err != nil {
 		t.Fatal(err)
 	}
-	if len(snap.Accounts) != 3 {
-		t.Fatalf("expected 3 accounts in snapshot, got %d", len(snap.Accounts))
+	if len(snap.Accounts) != 4 {
+		t.Fatalf("expected 4 accounts in snapshot, got %d", len(snap.Accounts))
 	}
 	states := map[string]bool{}
 	for _, a := range snap.Accounts {
 		states[a.State] = true
 	}
-	if !states["active"] || !states["cooldown"] || !states["disabled"] {
-		t.Fatalf("expected all three states in snapshot, got %v", states)
+	if !states["active"] || !states["cooldown"] || !states["auth_invalid"] || !states["disabled"] {
+		t.Fatalf("expected all four states in snapshot, got %v", states)
 	}
 	if snap.Accounts[0].QuotaTotal != 2000 || snap.Accounts[0].QuotaUsed != 1500 || snap.Accounts[0].QuotaRemaining != 500 || !snap.Accounts[0].IsPaidUser || !snap.Accounts[0].QuotaKnown {
 		t.Fatalf("quota fields not preserved in snapshot: %+v", snap.Accounts[0])

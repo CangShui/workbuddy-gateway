@@ -26,7 +26,7 @@ func TestAccountHealthPercentage(t *testing.T) {
 		{"empty", nil, false, "empty", nil},
 		{"all_ok", []accountSnapshot{{State: "active"}, {State: "active"}}, false, "healthy", float64p(100)},
 		{"paused_in_denominator", []accountSnapshot{{State: "active"}, {State: "active", SchedulingEnabled: &off}}, false, "degraded", float64p(50)},
-		{"no_available", []accountSnapshot{{State: "expired"}, {State: "disabled"}}, false, "unavailable", float64p(0)},
+		{"no_available", []accountSnapshot{{State: "expired"}, {State: "auth_invalid"}, {State: "disabled"}}, false, "unavailable", float64p(0)},
 		{"unknown_not_healthy", []accountSnapshot{{State: "unrecognized"}, {State: "active"}}, false, "degraded", float64p(50)},
 		{"stale_not_100", []accountSnapshot{{State: "active"}}, true, "unknown", nil},
 	} {
@@ -55,6 +55,7 @@ func TestAccountAlertParsesKnownLogsOnly(t *testing.T) {
 		{"[Quota] traceId=x 账号 a.json 额度查询成功，总额度=0；账号已冻结调度，等待额度恢复", "paid_exhausted", "a.json"},
 		{"[Quota] traceId=x 账号 a.json 企业额度计算=limitNum 100 - credit 100；分配额度已用完，收费模型暂停调度", "paid_exhausted", "a.json"},
 		{"[Auth] 账号 a.json 判定登录态失效，已停止调度并写入失效标记", "disabled", "a.json"},
+		{"[Auth] 账号 a.json 登录失效，已立即停止调度；凭据文件保留", "auth_invalid", "a.json"},
 		{`[管理开关] traceId=x 结果=成功 类型=account 目标="a b.json" 启用=false 说明=配置已保存`, "paused", "a b.json"},
 		{"[Quota] traceId=x 账号 a.json 查询额度失败，保留上一次数据", "", ""},
 		{"[Auth] 账号 a.json Token 需要续期，开始调用上游刷新接口", "", ""},

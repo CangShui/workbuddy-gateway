@@ -475,6 +475,7 @@ type Account struct {
 	CooldownUntil  time.Time                     // 冷却截止时间（429 频率限制后自动屏蔽到该时间）
 	CooldownMsg    string                        // 触发冷却的原因/上游提示
 	Disabled       bool                          // 授权失效（token 过期且无法刷新/已撤销）：禁止调度
+	AuthInvalid    bool                          // 上游明确判定刷新令牌已撤销：登录失效，优先级高于其他账号状态
 	DisabledReason string                        // 失效原因，用于控制台展示
 	Nickname       string                        // 失效标记持久化字段：昵称（Auth 为 nil 时使用）
 	UID            string                        // 失效标记持久化字段：UID
@@ -535,12 +536,13 @@ func (acc *Account) Profile() *upstreamProfile {
 
 // disabledMarker 是授权失效账号的持久化标记（凭据文件删除后用于控制台提示重新登录）。
 type disabledMarker struct {
-	Path       string `json:"path"`
-	Reason     string `json:"reason"`
-	DisabledAt int64  `json:"disabledAt"`
-	Nickname   string `json:"nickname,omitempty"`
-	UID        string `json:"uid,omitempty"`
-	Edition    string `json:"edition,omitempty"` // 站点标识（cn/intl），用于控制台展示
+	Path        string `json:"path"`
+	Reason      string `json:"reason"`
+	DisabledAt  int64  `json:"disabledAt"`
+	AuthInvalid bool   `json:"authInvalid,omitempty"`
+	Nickname    string `json:"nickname,omitempty"`
+	UID         string `json:"uid,omitempty"`
+	Edition     string `json:"edition,omitempty"` // 站点标识（cn/intl），用于控制台展示
 }
 
 // markerPath 返回与凭据文件同目录的失效标记文件路径。
@@ -1268,6 +1270,9 @@ func reloadAccountsResult() (bool, error) {
 		existing.Auth = sa
 		existing.Edition = profileForEdition(sa.Edition).Key
 		existing.Disabled = false
+		existing.AuthInvalid = false
+		existing.RefreshFailCount = 0
+		existing.LastRefreshError = ""
 		existing.DisabledReason = ""
 		existing.CooldownUntil = time.Time{}
 		existing.CooldownMsg = ""
@@ -1539,8 +1544,18 @@ func markModelQuotaBlocked(acc *Account, model, msg string) {
 // disableAccount 将账号标记为失效（授权过期/撤销），禁止调度并删除凭据文件，
 // 同时写入持久化失效标记，便于控制台提示用户重新登录。
 func disableAccount(acc *Account, reason string) {
+	stopAccount(acc, reason, false)
+}
+
+// 明确的登录失效保留凭据；其他禁用仍执行原有的删除前校验。
+func stopAccount(acc *Account, reason string, authInvalid bool) {
 	accountMu.Lock()
+	if acc.AuthInvalid {
+		accountMu.Unlock()
+		return
+	}
 	acc.Disabled = true
+	acc.AuthInvalid = authInvalid
 	acc.DisabledReason = reason
 	acc.CooldownUntil = time.Time{}
 	path := acc.Path
@@ -1562,17 +1577,24 @@ func disableAccount(acc *Account, reason string) {
 
 	// 写持久化失效标记（凭据删除后仍能在 status 中提示重新登录）
 	marker := disabledMarker{
-		Path:       path,
-		Reason:     reason,
-		DisabledAt: time.Now().Unix(),
-		Nickname:   nickname,
-		UID:        uid,
-		Edition:    edition,
+		Path:        path,
+		Reason:      reason,
+		DisabledAt:  time.Now().Unix(),
+		AuthInvalid: authInvalid,
+		Nickname:    nickname,
+		UID:         uid,
+		Edition:     edition,
 	}
 	if data, err := json.MarshalIndent(marker, "", "  "); err == nil {
 		if werr := os.WriteFile(markerPath(path), data, 0o600); werr != nil {
 			log.Printf("[Auth] 账号 %s 失效标记写入失败: %v", path, werr)
 		}
+	}
+
+	if authInvalid {
+		log.Printf("[Auth] 账号 %s 登录失效，已立即停止调度；凭据保留，请重新登录", path)
+		writeStatusSnapshot()
+		return
 	}
 
 	// 删除凭据前先做一次只读校验：删除不可逆，只有确认凭据真的不可用才销毁。
@@ -1658,6 +1680,7 @@ func loadDisabledMarkers() {
 				continue
 			}
 			a.Disabled = true
+			a.AuthInvalid = m.AuthInvalid
 			a.DisabledReason = m.Reason
 			if a.Nickname == "" {
 				a.Nickname = m.Nickname
@@ -1674,6 +1697,7 @@ func loadDisabledMarkers() {
 		accounts = append(accounts, &Account{
 			Path:           m.Path,
 			Disabled:       true,
+			AuthInvalid:    m.AuthInvalid,
 			DisabledReason: m.Reason,
 			Nickname:       m.Nickname,
 			UID:            m.UID,
@@ -1891,13 +1915,11 @@ func refreshAccountToken(acc *Account, reason string) error {
 		kind := classifyRefreshFailure(status, err.Error())
 		summary := refreshFailureSummary(kind, status, err)
 		count := recordRefreshFailure(acc, summary)
-		if count >= refreshDisableThreshold {
+		if kind == refreshFailureSessionDead {
+			stopAccount(acc, "上游拒绝续期：登录失效，请重新登录", true)
+		} else if count >= refreshDisableThreshold {
 			log.Printf("[Auth] 账号 %s 判定登录态失效，已停止调度并写入失效标记；连续失败=%d 判定依据=%s", path, count, summary)
 			disableAccount(acc, fmt.Sprintf("令牌刷新连续失败 %d 次: %s", count, summary))
-		} else if kind == refreshFailureSessionDead {
-			// 上游明确说登录态没了，但先不删凭据：保留原凭据继续重试，达到阈值才停止调度。
-			log.Printf("[Auth] 账号 %s 续期被上游判定登录态失效（连续 %d/%d 次）：%s；暂时保留凭据，达到阈值后才停止调度，建议尽快重新登录",
-				path, count, refreshDisableThreshold, summary)
 		} else {
 			log.Printf("[Auth] 账号 %s Token 刷新失败，旧凭据未覆盖；连续失败=%d/%d 判定=%s 业务影响=本次未续期，账号仍可用到访问令牌过期，稍后自动重试",
 				path, count, refreshDisableThreshold, summary)
@@ -2563,9 +2585,13 @@ func formatAccountStatus(acc *Account, idx int, now time.Time) string {
 		}
 		sb.WriteString(fmt.Sprintf("用户昵称:     %s\n", ifEmpty(nickname, "(未知)")))
 		sb.WriteString(fmt.Sprintf("用户 UID:     %s\n", ifEmpty(uid, "(未知)")))
-		sb.WriteString("账号状态:     授权失效（禁止调度）\n")
+		if acc.AuthInvalid {
+			sb.WriteString("账号状态:     登录失效（禁止调度）\n")
+		} else {
+			sb.WriteString("账号状态:     授权失效（禁止调度）\n")
+		}
 		sb.WriteString(fmt.Sprintf("失效原因:     %s\n", truncate(acc.DisabledReason, 200)))
-		sb.WriteString(fmt.Sprintf("处理建议:     凭据文件已删除，请重新执行: workbuddy-gateway login -auth %s\n", acc.Path))
+		sb.WriteString(fmt.Sprintf("处理建议:     请重新执行: workbuddy-gateway login -auth %s\n", acc.Path))
 		return sb.String()
 	}
 
@@ -2675,7 +2701,7 @@ type accountSnapshot struct {
 	Edition           string             `json:"edition,omitempty"` // 站点标识（cn/intl）
 	Nickname          string             `json:"nickname"`
 	UID               string             `json:"uid"`
-	State             string             `json:"state"` // active | cooldown | paid_exhausted | expired | disabled
+	State             string             `json:"state"` // active | cooldown | paid_exhausted | expired | auth_invalid | disabled
 	CooldownUntil     int64              `json:"cooldownUntil,omitempty"`
 	CooldownMsg       string             `json:"cooldownMsg,omitempty"`
 	DisabledReason    string             `json:"disabledReason,omitempty"`
@@ -2766,6 +2792,9 @@ func writeStatusSnapshot() error {
 		switch {
 		case acc.Disabled:
 			as.State = "disabled"
+			if acc.AuthInvalid {
+				as.State = "auth_invalid"
+			}
 			as.DisabledReason = acc.DisabledReason
 			if acc.Auth != nil {
 				as.Nickname = acc.Auth.Account.Nickname
@@ -2909,6 +2938,8 @@ func renderAccountTable(accs []accountSnapshot) string {
 			expires = time.Unix(a.TokenExpiresAt, 0).Format("2006-01-02 15:04:05")
 		}
 		switch a.State {
+		case "auth_invalid":
+			status = "登录失效"
 		case "cooldown":
 			status = "冷却"
 		case "expired":
@@ -3073,7 +3104,7 @@ func runMonitor() {
 		} else {
 			var snap statusSnapshot
 			if err := json.Unmarshal(data, &snap); err == nil {
-				active, cooldown, exhausted, expired, disabled := 0, 0, 0, 0, 0
+				active, cooldown, exhausted, expired, disabled, loginInvalid := 0, 0, 0, 0, 0, 0
 				for _, a := range snap.Accounts {
 					switch a.State {
 					case "active":
@@ -3084,12 +3115,14 @@ func runMonitor() {
 						expired++
 					case "quota_exhausted", "paid_exhausted":
 						exhausted++
+					case "auth_invalid":
+						loginInvalid++
 					case "disabled":
 						disabled++
 					}
 				}
-				fmt.Printf("账号池: 共 %d 个 | 可用 %d | 冷却 %d | 付费耗尽 %d | 过期 %d | 失效 %d\n",
-					len(snap.Accounts), active, cooldown, exhausted, expired, disabled)
+				fmt.Printf("账号池: 共 %d 个 | 可用 %d | 冷却 %d | 付费耗尽 %d | 过期 %d | 失效 %d | 登录失效 %d\n",
+					len(snap.Accounts), active, cooldown, exhausted, expired, disabled, loginInvalid)
 				fmt.Println(renderAccountTable(snap.Accounts))
 				if len(snap.Models) > 0 {
 					fmt.Printf("\n模型统计 (来源 %s):\n", modelSourceLabel(modelSourceFromSnapshots(snap.Models)))

@@ -994,9 +994,13 @@ func readStatusSnapshot() (statusSnapshot, error) {
 func summarizeAccounts(accs []accountSnapshot) map[string]int {
 	summary := map[string]int{
 		"total": len(accs), "active": 0, "cooldown": 0,
-		"paidExhausted": 0, "expired": 0, "disabled": 0, "paused": 0,
+		"paidExhausted": 0, "expired": 0, "disabled": 0, "authInvalid": 0, "paused": 0,
 	}
 	for _, a := range accs {
+		if a.State == "auth_invalid" {
+			summary["authInvalid"]++
+			continue
+		}
 		if a.SchedulingEnabled != nil && !*a.SchedulingEnabled {
 			summary["paused"]++
 			continue

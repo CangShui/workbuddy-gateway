@@ -723,6 +723,13 @@ test("清空管理Key需要额外确认，取消不发起保存", async () => {
   audit("管理Key清空额外确认通过");
 });
 
+test("登录失效优先于停用、额度和签到结果", () => {
+  const f = fixture();
+  f.review.renderAccounts([{path: "workbuddy4.json", state: "auth_invalid", schedulingEnabled: false,
+    quotaKnown: true, quotaRemaining: 0, checkin: {status: "failed"}}]);
+  assert.match(f.element("accountsTable").innerHTML, /class='badge danger'>登录失效</);
+});
+
 test("账号池筛选只保留可用且已开启调度的账号，取消后恢复全部", () => {
   const f = fixture();
   f.review.initListFilters();

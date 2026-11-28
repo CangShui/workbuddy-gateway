@@ -54,6 +54,7 @@ var sessionDeadMarkers = []string{
 	"12153",
 	"offline user session not found",
 	"invalid_grant",
+	"refresh token revoked",
 	"token is not active",
 	"refresh token failed",
 	"session not found",

@@ -78,6 +78,7 @@ func TestClassifyRefreshFailure(t *testing.T) {
 		{"上游会话失效码", `{"code":12153,"msg":"Offline user session not found"}`, 401, refreshFailureSessionDead},
 		{"invalid_grant", `{"code":12153,"msg":"invalid_grant: Token is not active"}`, 401, refreshFailureSessionDead},
 		{"普通401", `{"code":10001,"msg":"unauthorized"}`, 401, refreshFailureTransient},
+		{"单独撤销提示", `{"msg":"refresh token revoked"}`, 401, refreshFailureSessionDead},
 		{"权限拒绝403", `{"code":10002,"msg":"permission denied"}`, 403, refreshFailureTransient},
 		{"服务端5xx", `{"code":500,"msg":"internal error"}`, 500, refreshFailureTransient},
 		{"网络错误无响应体", "", 0, refreshFailureTransient},
@@ -273,7 +274,7 @@ func TestRefreshDisablesOnlyAfterConsecutiveFailures(t *testing.T) {
 	}
 }
 
-func TestSessionDeadSignalKeepsCredentialsUntilThreshold(t *testing.T) {
+func TestSessionDeadSignalImmediatelyMarksLoginInvalidAndKeepsCredentials(t *testing.T) {
 	chdirTemp(t)
 	refreshTestServer(t, func(int) (int, string) {
 		return 401, `{"code":12153,"msg":"invalid_grant: Token is not active"}`
@@ -282,8 +283,8 @@ func TestSessionDeadSignalKeepsCredentialsUntilThreshold(t *testing.T) {
 	if err := refreshAccountToken(acc, "单元测试"); err == nil {
 		t.Fatal("应返回错误")
 	}
-	if acc.Disabled {
-		t.Fatal("首次会话失效只告警，不应立即删除凭据")
+	if !acc.Disabled || !acc.AuthInvalid {
+		t.Fatal("明确会话失效应立即停止调度并标记登录失效")
 	}
 	if _, err := os.Stat(acc.Path); err != nil {
 		t.Fatalf("凭据文件应保留: %v", err)
@@ -291,11 +292,11 @@ func TestSessionDeadSignalKeepsCredentialsUntilThreshold(t *testing.T) {
 	if !strings.Contains(acc.LastRefreshError, "登录态失效") {
 		t.Fatalf("应记录判定类型: %s", acc.LastRefreshError)
 	}
-	for i := 1; i < refreshDisableThreshold; i++ {
-		_ = refreshAccountToken(acc, "单元测试")
+	if _, err := os.Stat(markerPath(acc.Path)); err != nil {
+		t.Fatalf("登录失效标记应写入: %v", err)
 	}
-	if !acc.Disabled {
-		t.Fatalf("连续 %d 次会话失效后应停止调度", refreshDisableThreshold)
+	if acc.RefreshFailCount != 1 {
+		t.Fatalf("明确会话失效只需一次失败即可标记，计数=%d", acc.RefreshFailCount)
 	}
 }
 
